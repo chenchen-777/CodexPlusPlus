@@ -8,14 +8,8 @@ use codex_plus_core::ads::{
 use serde_json::json;
 
 #[test]
-fn default_ad_urls_match_legacy_helper_sources() {
-    assert_eq!(
-        DEFAULT_AD_LIST_URLS,
-        [
-            "https://raw.githubusercontent.com/BigPizzaV3/Ad-List/main/ads.json",
-            "https://cdn.jsdelivr.net/gh/BigPizzaV3/Ad-List@main/ads.json",
-        ]
-    );
+fn default_ad_urls_are_disabled() {
+    assert_eq!(DEFAULT_AD_LIST_URLS, ["", ""]);
 }
 
 #[test]
@@ -35,23 +29,23 @@ fn cache_busted_ad_url_preserves_existing_query() {
 }
 
 #[test]
-fn normalizes_remote_ads_for_plugin_and_manager_rendering() {
+fn normalizes_ad_payload_for_legacy_callers() {
     let payload = normalize_ad_payload(json!({
         "version": 1,
         "ads": [
             {
-                "id": "sponsor",
-                "type": "sponsor",
-                "title": "赞助商",
-                "description": "推荐内容",
+                "id": "item-1",
+                "type": "normal",
+                "title": "Item 1",
+                "description": "Description",
                 "url": "https://example.test",
-                "highlights": ["稳定"]
+                "highlights": ["stable"]
             },
             {
-                "id": "normal",
+                "id": "item-2",
                 "type": "normal",
-                "title": "普通推荐",
-                "description": "推荐内容",
+                "title": "Item 2",
+                "description": "Description",
                 "url": "https://example.org"
             },
             {
@@ -66,7 +60,7 @@ fn normalizes_remote_ads_for_plugin_and_manager_rendering() {
 
     assert_eq!(payload["version"], json!(1));
     assert_eq!(payload["ads"].as_array().unwrap().len(), 2);
-    assert_eq!(payload["ads"][0]["type"], json!("sponsor"));
+    assert_eq!(payload["ads"][0]["type"], json!("normal"));
     assert_eq!(payload["ads"][1]["type"], json!("normal"));
 }
 

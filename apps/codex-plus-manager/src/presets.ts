@@ -59,7 +59,7 @@ export const PRESETS: ProviderPreset[] = [
     id: "zhipu-glm",
     name: "Zhipu GLM",
     websiteUrl: "https://open.bigmodel.cn",
-    apiKeyUrl: "https://www.bigmodel.cn/claude-code?ic=RRVJPB5SII",
+    apiKeyUrl: "https://www.bigmodel.cn/claude-code",
     category: "cn_official",
     baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4",
     protocol: "chatCompletions",
@@ -163,20 +163,10 @@ export const PRESETS: ProviderPreset[] = [
 
   // ── 聚合/中转 ──
   {
-    id: "jojocode",
-    name: "JOJO Code",
-    websiteUrl: "https://jojocode.com/",
-    apiKeyUrl: "https://jojocode.com/",
-    category: "aggregator",
-    baseUrl: "https://jojocode.com/v1",
-    protocol: "responses",
-    model: "gpt-5.5",
-  },
-  {
     id: "siliconflow",
     name: "SiliconFlow",
     websiteUrl: "https://siliconflow.cn",
-    apiKeyUrl: "https://cloud.siliconflow.cn/i/drGuwc9k",
+    apiKeyUrl: "https://cloud.siliconflow.cn",
     category: "aggregator",
     baseUrl: "https://api.siliconflow.cn/v1",
     protocol: "chatCompletions",
@@ -201,16 +191,6 @@ export const PRESETS: ProviderPreset[] = [
     protocol: "responses",
     model: "gpt-5.5",
     websiteUrl: "https://aihubmix.com",
-  },
-  {
-    id: "apikeyfun",
-    name: "APIKEY.FUN",
-    category: "aggregator",
-    baseUrl: "https://api.apikey.fun/v1",
-    protocol: "responses",
-    model: "gpt-5.5",
-    modelList: ["gpt-5.5"],
-    websiteUrl: "https://apikey.fun",
   },
   {
     id: "pateway",

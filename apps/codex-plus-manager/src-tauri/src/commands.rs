@@ -1150,30 +1150,26 @@ fn persist_provider_sync_selection(provider: &str) {
 
 #[tauri::command]
 pub async fn load_ads() -> CommandResult<AdsPayload> {
-    match codex_plus_core::ads::fetch_ad_list().await {
-        Ok(payload) => ok("推荐内容已加载。", ads_payload(payload)),
-        Err(error) => failed(
-            &format!("推荐内容加载失败：{error}"),
-            AdsPayload {
-                version: 1,
-                ads: Vec::new(),
-            },
-        ),
-    }
+    ok(
+        "远端内容已关闭。",
+        AdsPayload {
+            version: 1,
+            ads: Vec::new(),
+        },
+    )
 }
 
 #[tauri::command]
 pub async fn refresh_script_market() -> CommandResult<ScriptMarketPayload> {
-    match script_market::fetch_market_manifest(script_market::DEFAULT_MARKET_INDEX_URL).await {
-        Ok(manifest) => ok(
-            "脚本市场已刷新。",
-            script_market_payload_from_manifest(&manifest, "ok", "脚本市场已刷新。"),
-        ),
-        Err(error) => failed(
-            &format!("脚本市场加载失败：{error}"),
-            failed_script_market_payload(&format!("脚本市场加载失败：{error}")),
-        ),
-    }
+    let manifest = ScriptMarketManifest {
+        version: 1,
+        updated_at: None,
+        scripts: Vec::new(),
+    };
+    ok(
+        "远程脚本清单已关闭。",
+        script_market_payload_from_manifest(&manifest, "ok", "远程脚本清单已关闭。"),
+    )
 }
 
 #[tauri::command]
@@ -1185,16 +1181,11 @@ pub async fn install_market_script(id: String) -> CommandResult<ScriptMarketPayl
             failed_script_market_payload("脚本 id 不能为空。"),
         );
     }
-    let manifest =
-        match script_market::fetch_market_manifest(script_market::DEFAULT_MARKET_INDEX_URL).await {
-            Ok(manifest) => manifest,
-            Err(error) => {
-                return failed(
-                    &format!("脚本市场加载失败：{error}"),
-                    failed_script_market_payload(&format!("脚本市场加载失败：{error}")),
-                );
-            }
-        };
+    let manifest = ScriptMarketManifest {
+        version: 1,
+        updated_at: None,
+        scripts: Vec::new(),
+    };
     let Some(script) = manifest.scripts.iter().find(|script| script.id == trimmed) else {
         return failed(
             "市场清单中未找到该脚本。",
