@@ -3033,16 +3033,12 @@ function AboutScreen({
           <div className="metric-list">
             <Metric label="Codex++ 版本" value={overview?.current_version ?? update?.currentVersion ?? "-"} />
             <Metric label="Codex 版本" value={overview?.codex_version ?? "未检测到"} />
-            <Metric label="项目地址" value="github.com/BigPizzaV3/CodexPlusPlus" />
+            <Metric label="项目地址" value="www.777codes.codes" />
           </div>
           <Toolbar>
-            <Button onClick={() => void actions.openExternalUrl("https://github.com/BigPizzaV3/CodexPlusPlus")} variant="secondary">
+            <Button onClick={() => void actions.openExternalUrl("https://www.777codes.codes/")} variant="secondary">
               <ExternalLink className="h-4 w-4" />
-              打开项目主页
-            </Button>
-            <Button onClick={() => void actions.openExternalUrl("https://github.com/BigPizzaV3/CodexPlusPlus/issues")} variant="secondary">
-              <ExternalLink className="h-4 w-4" />
-              反馈问题
+              打开 777codes
             </Button>
           </Toolbar>
         </CardContent>
