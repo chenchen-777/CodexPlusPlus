@@ -163,6 +163,16 @@ export const PRESETS: ProviderPreset[] = [
 
   // ── 聚合/中转 ──
   {
+    id: "777codes",
+    name: "777codes",
+    websiteUrl: "https://www.777codes.codes/",
+    apiKeyUrl: "https://www.777codes.codes/",
+    category: "aggregator",
+    baseUrl: "https://www.777codes.codes/v1",
+    protocol: "responses",
+    model: "gpt-5.5",
+  },
+  {
     id: "siliconflow",
     name: "SiliconFlow",
     websiteUrl: "https://siliconflow.cn",
