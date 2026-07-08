@@ -164,7 +164,7 @@ type BackendSettings = {
 type ZedOpenStrategy = "addToFocusedWorkspace" | "reuseWindow" | "newWindow" | "default";
 type LaunchMode = "patch" | "relay";
 
-type RelayProfile = {
+export type RelayProfile = {
   id: string;
   name: string;
   model: string;
@@ -183,6 +183,7 @@ type RelayProfile = {
   contextWindow: string;
   autoCompactLimit: string;
   modelList: string;
+  modelWindows?: string;
   userAgent: string;
   aggregate?: RelayAggregateConfig | null;
 };
