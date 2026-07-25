@@ -1,4 +1,4 @@
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 pub const DEFAULT_AD_LIST_URLS: [&str; 2] = [
     "",

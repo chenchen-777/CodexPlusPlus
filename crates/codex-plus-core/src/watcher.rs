@@ -98,9 +98,21 @@ pub fn codex_process_ids<'a>(processes: impl IntoIterator<Item = (u32, &'a str)>
 
 fn is_windowsapps_codex_app_process(executable: &str) -> bool {
     let executable = executable.replace('/', "\\").to_ascii_lowercase();
-    executable.contains("\\windowsapps\\openai.codex_")
-        && executable.ends_with("\\app\\codex.exe")
-        && !executable.contains("\\app\\resources\\")
+    let Some((_, after_windows_apps)) = executable.split_once("\\windowsapps\\") else {
+        return false;
+    };
+    let Some((package_name, after_package)) = after_windows_apps.split_once('\\') else {
+        return false;
+    };
+    let supported_package = crate::app_paths::is_supported_windows_app_package_name(package_name)
+        || package_name.starts_with("openai.chatgpt-desktop_");
+    supported_package
+        && after_package.starts_with("app\\")
+        && !after_package.starts_with("app\\resources\\")
+        && after_package
+            .rsplit('\\')
+            .next()
+            .is_some_and(crate::app_paths::is_supported_app_executable_name)
 }
 
 pub fn filter_killable_launcher_processes<'a>(
@@ -179,7 +191,7 @@ pub fn uninstall_watcher() -> anyhow::Result<()> {
 pub fn find_codex_processes() -> Vec<u32> {
     let processes: Vec<_> = crate::windows_integration::enumerate_processes()
         .into_iter()
-        .filter(|process| process.exe_file.eq_ignore_ascii_case("codex.exe"))
+        .filter(|process| crate::app_paths::is_supported_app_executable_name(&process.exe_file))
         .collect();
     find_codex_processes_from_snapshot(&processes)
 }
@@ -205,7 +217,9 @@ pub fn find_codex_processes_from_snapshot(
     );
 
     // Local/portable installs use Codex.exe as the Electron main process. Do not match
-    // lowercase codex.exe here; that is commonly the CLI binary.
+    // lowercase codex.exe here; that is commonly the CLI binary. ChatGPT.exe is accepted
+    // only for packaged Store apps above, because the standalone ChatGPT app can be a
+    // normal ChatGPT session rather than Codex.
     for process in processes {
         if process.exe_file == "Codex.exe" {
             ids.push(process.process_id);
@@ -217,8 +231,67 @@ pub fn find_codex_processes_from_snapshot(
     ids
 }
 
-#[cfg(not(windows))]
+/// Return desktop processes that can write Codex task state while a destructive
+/// session-index cleanup is running. This is intentionally stricter than the
+/// watcher filter: any supported ChatGPT desktop process blocks deletion,
+/// including portable installs outside WindowsApps.
+#[cfg(windows)]
+pub fn find_session_index_cleanup_blocking_processes() -> Vec<u32> {
+    find_session_index_cleanup_blocking_processes_from_snapshot(
+        &crate::windows_integration::enumerate_processes(),
+    )
+}
+
+#[cfg(windows)]
+pub fn find_session_index_cleanup_blocking_processes_from_snapshot(
+    processes: &[crate::windows_integration::WindowsProcessInfo],
+) -> Vec<u32> {
+    let mut ids = processes
+        .iter()
+        .filter(|process| process.exe_file == "Codex.exe" || process.exe_file == "ChatGPT.exe")
+        .map(|process| process.process_id)
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+#[cfg(target_os = "macos")]
 pub fn find_codex_processes() -> Vec<u32> {
+    let mut ids = ["Codex", "ChatGPT"]
+        .into_iter()
+        .flat_map(|name| {
+            std::process::Command::new("pgrep")
+                .args(["-x", name])
+                .output()
+                .ok()
+                .into_iter()
+                .flat_map(|output| {
+                    String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+        })
+        .filter_map(|value| value.trim().parse::<u32>().ok())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+#[cfg(target_os = "macos")]
+pub fn find_session_index_cleanup_blocking_processes() -> Vec<u32> {
+    find_codex_processes()
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn find_codex_processes() -> Vec<u32> {
+    Vec::new()
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn find_session_index_cleanup_blocking_processes() -> Vec<u32> {
     Vec::new()
 }
 

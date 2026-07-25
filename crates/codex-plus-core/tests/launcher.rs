@@ -40,6 +40,34 @@ fn app_paths_find_latest_windows_package_prefers_highest_version_app_dir() {
 }
 
 #[test]
+fn app_paths_find_latest_windows_package_ignores_chatgpt_desktop_package() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temp.path().join("OpenAI.Codex_26.707.3748.0_x64__abc/app")).unwrap();
+    std::fs::create_dir_all(
+        temp.path()
+            .join("OpenAI.ChatGPT-Desktop_1.2026.133.0_x64__abc/app"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(
+        temp.path()
+            .join("OpenAI.ChatGPT-Desktop_2026.514.421.0_neutral_~_abc"),
+    )
+    .unwrap();
+
+    let latest = find_latest_codex_app_dir(temp.path()).unwrap();
+
+    assert_eq!(
+        latest,
+        temp.path().join("OpenAI.Codex_26.707.3748.0_x64__abc/app")
+    );
+    assert_eq!(codex_app_version(&latest).as_deref(), Some("26.707.3748.0"));
+    assert_eq!(
+        packaged_app_user_model_id(&latest).as_deref(),
+        Some("OpenAI.Codex_abc!App")
+    );
+}
+
+#[test]
 fn app_paths_find_latest_windows_package_detects_beta_package() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(
@@ -67,6 +95,7 @@ fn app_paths_find_latest_windows_package_returns_package_when_app_dir_missing() 
     let temp = tempfile::tempdir().unwrap();
     let package = temp.path().join("OpenAI.Codex_26.429.8261.0_x64__abc");
     std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(package.join("ChatGPT.exe"), "").unwrap();
 
     assert_eq!(find_latest_codex_app_dir(temp.path()).unwrap(), package);
 }
@@ -84,6 +113,20 @@ fn app_paths_find_latest_windows_package_checks_roots_before_fallback() {
 }
 
 #[test]
+fn app_paths_find_latest_windows_package_ignores_chatgpt_across_roots() {
+    let temp = tempfile::tempdir().unwrap();
+    let root_a = temp.path().join("WindowsAppsA");
+    let root_b = temp.path().join("WindowsAppsB");
+    std::fs::create_dir_all(root_a.join("OpenAI.Codex_26.999.0.0_x64__abc/app")).unwrap();
+    std::fs::create_dir_all(root_b.join("OpenAI.ChatGPT-Desktop_1.2026.133.0_x64__abc/app"))
+        .unwrap();
+
+    let latest = find_latest_codex_app_dir_from_roots(&[root_a, root_b]).unwrap();
+
+    assert!(latest.ends_with("OpenAI.Codex_26.999.0.0_x64__abc/app"));
+}
+
+#[test]
 fn app_paths_extracts_codex_version_from_windows_package_app_dir() {
     let app_dir =
         PathBuf::from(r"C:\Program Files\WindowsApps\OpenAI.Codex_26.513.3673.0_x64__abc\app");
@@ -91,6 +134,49 @@ fn app_paths_extracts_codex_version_from_windows_package_app_dir() {
     assert_eq!(
         codex_app_version(&app_dir).as_deref(),
         Some("26.513.3673.0")
+    );
+}
+
+#[test]
+fn app_paths_extracts_codex_version_from_portable_version_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("versions").join("current");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::write(app_dir.join("Codex.exe"), "").unwrap();
+    std::fs::write(app_dir.join("version"), "42.1.0\n").unwrap();
+
+    assert_eq!(codex_app_version(&app_dir).as_deref(), Some("42.1.0"));
+}
+
+#[test]
+fn app_paths_prefers_portable_directory_version_over_internal_version_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let app_dir = temp.path().join("versions").join("26.519.2736.0");
+    std::fs::create_dir_all(&app_dir).unwrap();
+    std::fs::write(app_dir.join("Codex.exe"), "").unwrap();
+    std::fs::write(app_dir.join("version"), "42.1.0\n").unwrap();
+
+    assert_eq!(
+        codex_app_version(&app_dir).as_deref(),
+        Some("26.519.2736.0")
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn app_paths_resolves_portable_current_link_to_directory_version() {
+    let temp = tempfile::tempdir().unwrap();
+    let versions = temp.path().join("versions");
+    let target = versions.join("26.519.2736.0");
+    let current = versions.join("current");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("Codex.exe"), "").unwrap();
+    std::fs::write(target.join("version"), "42.1.0\n").unwrap();
+    std::os::windows::fs::symlink_dir(&target, &current).unwrap();
+
+    assert_eq!(
+        codex_app_version(&current).as_deref(),
+        Some("26.519.2736.0")
     );
 }
 
@@ -128,9 +214,15 @@ fn app_paths_user_data_candidates_include_local_and_roaming_variants() {
     assert_eq!(
         candidates,
         vec![
+            local.join("OpenAI").join("ChatGPT"),
+            local.join("OpenAI.ChatGPT-Desktop"),
+            local.join("ChatGPT"),
             local.join("OpenAI").join("Codex"),
             local.join("OpenAI.Codex"),
             local.join("Codex"),
+            roaming.join("OpenAI").join("ChatGPT"),
+            roaming.join("OpenAI.ChatGPT-Desktop"),
+            roaming.join("ChatGPT"),
             roaming.join("OpenAI").join("Codex"),
             roaming.join("OpenAI.Codex"),
             roaming.join("Codex"),
@@ -240,6 +332,38 @@ fn app_paths_normalizes_executable_and_package_paths() {
     assert_eq!(
         normalize_codex_app_path(&portable).as_deref(),
         Some(app.as_path())
+    );
+}
+
+#[test]
+fn app_paths_prefers_chatgpt_entrypoint_when_portable_bundle_contains_codex_shim() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = temp.path().join("current");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(app.join("Codex.exe"), "").unwrap();
+    std::fs::write(app.join("ChatGPT.exe"), "").unwrap();
+
+    assert_eq!(build_codex_executable(&app), app.join("ChatGPT.exe"));
+}
+
+#[test]
+fn app_paths_normalizes_chatgpt_desktop_executable_and_builds_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let app = temp
+        .path()
+        .join("OpenAI.Codex_1.2026.133.0_x64__abc")
+        .join("app");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(app.join("ChatGPT.exe"), "").unwrap();
+
+    assert_eq!(
+        normalize_codex_app_path(&app.join("ChatGPT.exe")).as_deref(),
+        Some(app.as_path())
+    );
+    assert_eq!(build_codex_executable(&app), app.join("ChatGPT.exe"));
+    assert_eq!(
+        packaged_app_user_model_id(&app).as_deref(),
+        Some("OpenAI.Codex_abc!App")
     );
 }
 
