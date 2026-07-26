@@ -3,7 +3,7 @@ use codex_plus_core::assets;
 use codex_plus_core::bridge::{self, BRIDGE_BINDING_NAME};
 use codex_plus_core::cdp::{
     CdpTarget, is_avatar_overlay_page_target, is_primary_codex_page_target, list_targets,
-    pick_injectable_codex_page_target, pick_page_target,
+    pick_injectable_codex_page_target, pick_page_target, validate_cdp_websocket_url,
 };
 
 use futures_util::{SinkExt, StreamExt};
@@ -42,16 +42,28 @@ fn bridge_script_defines_expected_globals_and_binding() {
 }
 
 #[test]
-fn injection_script_prefixes_helper_url_without_promotion_links() {
+fn screenshot_command_uses_png_from_surface() {
+    assert_eq!(
+        bridge::capture_screenshot_params(),
+        json!({
+            "format": "png",
+            "fromSurface": true,
+            "captureBeyondViewport": false
+        })
+    );
+}
+
+#[test]
+fn injection_script_prefixes_helper_url_and_sponsor_images() {
     let script = assets::injection_script(57321);
 
     assert!(script.contains("window.__CODEX_SESSION_DELETE_HELPER__"));
     assert!(script.contains("http://127.0.0.1:57321"));
+    assert!(script.contains("window.__CODEX_PLUS_SPONSOR_IMAGES__"));
     assert!(script.contains("window.__CODEX_PLUS_VERSION__"));
     assert!(script.contains(codex_plus_core::version::VERSION));
-    assert!(!script.contains("window.__CODEX_PLUS_SPONSOR_IMAGES__"));
-    assert!(!script.contains(&format!("{}{}", "discord", ".gg")));
-    assert!(!script.contains("t.me/"));
+    assert!(script.contains("https://discord.gg/y96kX7A76v"));
+    assert!(script.contains("data-codex-plus-discord"));
 }
 
 #[test]
@@ -420,6 +432,7 @@ fn injection_script_exposes_image_overlay_config() {
         codex_app_image_overlay_enabled: true,
         codex_app_image_overlay_path: image_path.to_string_lossy().to_string(),
         codex_app_image_overlay_opacity: 42,
+        codex_app_image_overlay_fit_mode: "fill".to_string(),
         ..Default::default()
     };
     let script = assets::injection_script_with_settings(57321, &settings);
@@ -427,6 +440,7 @@ fn injection_script_exposes_image_overlay_config() {
     assert!(script.contains("window.__CODEX_PLUS_IMAGE_OVERLAY__"));
     assert!(script.contains("\"enabled\":true"));
     assert!(script.contains("\"opacity\":0.42"));
+    assert!(script.contains("\"fitMode\":\"fill\""));
     assert!(script.contains("\"dataUrl\":\"data:image/png;base64,"));
     assert!(script.contains("http://127.0.0.1:57321/overlay/image"));
 }
@@ -436,8 +450,196 @@ fn injection_script_installs_image_overlay_from_data_uri() {
     let script = assets::injection_script(57321);
 
     assert!(script.contains("const source = config.dataUrl || \"\""));
-    assert!(script.contains("image.src = source"));
+    assert!(script.contains("backgroundImage: `url(\"${source.replace(/\"/g, \"%22\")}\")`"));
+    assert!(script.contains(
+        "fit: { size: \"contain\", position: \"center center\", repeat: \"no-repeat\" }"
+    ));
     assert!(script.contains("image_overlay_installed"));
+}
+
+#[test]
+fn rejects_non_loopback_cdp_websocket() {
+    let error =
+        validate_cdp_websocket_url("ws://example.com:9222/devtools/page/1", 9222).unwrap_err();
+
+    assert!(error.to_string().contains("loopback"));
+}
+
+#[test]
+fn rejects_mismatched_cdp_websocket_port() {
+    let error =
+        validate_cdp_websocket_url("ws://127.0.0.1:9333/devtools/page/1", 9222).unwrap_err();
+
+    assert!(error.to_string().contains("port"));
+}
+
+#[test]
+fn validates_ipv4_and_ipv6_loopback_cdp_websockets() {
+    validate_cdp_websocket_url("ws://127.0.0.1:9222/devtools/page/1", 9222).unwrap();
+    validate_cdp_websocket_url("ws://[::1]:9222/devtools/page/1", 9222).unwrap();
+}
+
+#[test]
+fn rejects_cdp_websocket_with_wrong_scheme_or_missing_port() {
+    assert!(validate_cdp_websocket_url("http://127.0.0.1:9222/devtools/page/1", 9222).is_err());
+    assert!(validate_cdp_websocket_url("ws://127.0.0.1/devtools/page/1", 9222).is_err());
+}
+
+#[test]
+fn injection_script_installs_dream_skin_from_backend_settings() {
+    let mut settings = codex_plus_core::settings::BackendSettings {
+        codex_app_dream_skin_enabled: true,
+        codex_app_dream_skin_paused: false,
+        codex_app_dream_skin_theme_config: codex_plus_core::settings::DreamSkinThemeConfig {
+            name: "Upstream Theme".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    settings
+        .codex_app_dream_skin_theme_config
+        .extra_fields
+        .insert(
+            "companion".to_string(),
+            serde_json::json!({
+                "dataUrl": "data:image/webp;base64,UklGRg==",
+                "width": 96,
+                "side": "right"
+            }),
+        );
+    let script = assets::injection_script_with_settings(57321, &settings);
+
+    assert!(script.contains("dreamSkinEnabled: \"codexAppDreamSkinEnabled\""));
+    assert!(script.contains("dreamSkinPaused: \"codexAppDreamSkinPaused\""));
+    assert!(script.contains("dreamSkinThemeConfig: \"codexAppDreamSkinThemeConfig\""));
+    assert!(script.contains("dreamSkinImagePath: \"codexAppDreamSkinImagePath\""));
+    assert!(!script.contains("window.__CODEX_PLUS_DREAM_SKIN_STYLES__ ="));
+    assert!(!script.contains("window.__CODEX_PLUS_DREAM_SKIN_CSS__"));
+    assert!(script.contains("window.__CODEX_PLUS_DREAM_SKIN_PLATFORM__"));
+    assert!(script.contains("window.__CODEX_PLUS_DREAM_SKIN_REVISION__"));
+    assert!(script.contains("window.__CODEX_PLUS_DREAM_SKIN_ART__"));
+    assert!(script.contains(if cfg!(windows) {
+        "data:image/jpeg;base64,"
+    } else {
+        "data:image/png;base64,"
+    }));
+    assert!(script.contains("codex-dream-skin-style"));
+    assert!(script.contains("codex-dream-skin-chrome"));
+    assert!(script.contains("URL.createObjectURL(new Blob"));
+    assert!(script.contains("URL.revokeObjectURL(state.artUrl)"));
+    assert!(!script.contains("/dream-skin/image?v="));
+    assert!(script.contains("window.__CODEX_PLUS_EXTERNAL_DREAM_SKIN_RUNTIME__ = true"));
+    assert!(script.contains("window.__CODEX_PLUS_CLEAR_DREAM_SKIN__?.();"));
+    assert!(script.contains("window.__CODEX_PLUS_DREAM_SKIN_TARGET_ENGINE__"));
+    assert!(script.contains("state.version = `codex-plus:"));
+    assert!(script.contains("state.observer?.disconnect?.()"));
+    assert!(script.contains("window.__CODEX_PLUS_DREAM_SKIN_PAYLOAD_SIGNATURE__"));
+    assert!(script.contains("window.__CODEX_PLUS_DREAM_SKIN_THEME__"));
+    assert!(script.contains("data:image/webp;base64,UklGRg=="));
+    assert!(script.contains("codex-dream-skin-companion"));
+    assert!(script.contains("removeDreamSkinCompanion"));
+    if cfg!(windows) {
+        assert!(script.contains(":root.codex-dream-skin"));
+        assert!(!script.contains("薛凯琪专属定制皮肤"));
+    }
+    assert!(script.contains(".group\\\\/home-suggestions"));
+    assert!(script.contains("--dream-skin-art"));
+    assert!(script.contains("--dream-art"));
+    assert!(script.contains("function refreshDreamSkin()"));
+    assert!(script.contains(
+        "codexPlusBackendSettingsLoaded && (!settings.dreamSkinEnabled || settings.dreamSkinPaused)"
+    ));
+    assert!(script.contains("window.__CODEX_PLUS_DREAM_SKIN_RUNTIME_REVISION__"));
+    assert!(script.contains("window.__CODEX_PLUS_DREAM_SKIN_ART_SIGNATURE__"));
+    assert!(!script.contains(
+        "attributeFilter: [\"class\", \"data-theme\", \"data-appearance\", \"data-color-mode\", \"style\"]"
+    ));
+    assert!(script.contains("codexAppDreamSkinEnabled"));
+    assert!(script.contains("codexAppDreamSkinPaused"));
+    assert!(script.contains("codexAppDreamSkinThemeConfig"));
+    assert!(script.contains("Upstream Theme"));
+    assert!(script.contains("codexAppDreamSkinImagePath"));
+    assert!(script.contains("const STATE_KEY = \"__CODEX_DREAM_SKIN_STATE__\""));
+    assert!(!script.contains("artDataUrl.slice(-64)"));
+    assert!(!script.contains("luckyGod:"));
+}
+
+#[test]
+fn dream_skin_live_update_script_excludes_the_full_renderer_runtime() {
+    let settings = codex_plus_core::settings::BackendSettings {
+        codex_app_dream_skin_enabled: true,
+        codex_app_dream_skin_theme_config: codex_plus_core::settings::DreamSkinThemeConfig {
+            name: "Lightweight Theme".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let probe = assets::dream_skin_live_update_probe_script();
+    let update = assets::dream_skin_live_update_script(&settings, true);
+    let metadata_only_update = assets::dream_skin_live_update_script(&settings, false);
+    let full = assets::injection_script_with_settings(57321, &settings);
+
+    assert!(probe.contains("__CODEX_PLUS_DREAM_SKIN_RUNTIME_REVISION__"));
+    assert!(probe.contains("payloadSignature"));
+    assert!(probe.contains("__CODEX_DREAM_SKIN_STATE__"));
+    assert!(probe.contains("__CODEX_GLASS_VISION_SKIN_STATE__"));
+    assert!(update.contains("Lightweight Theme"));
+    assert!(update.contains("__CODEX_PLUS_DREAM_SKIN_ART_SIGNATURE__"));
+    assert!(update.contains(if cfg!(windows) {
+        "data:image/jpeg;base64,"
+    } else {
+        "data:image/png;base64,"
+    }));
+    assert!(!metadata_only_update.contains("base64,"));
+    assert!(!update.contains("__CODEX_PLUS_SPONSOR_IMAGES__"));
+    assert!(!update.contains("__codexSessionDeleteObserver"));
+    assert!(!update.contains("function refreshDreamSkin()"));
+    assert!(metadata_only_update.len() < full.len());
+}
+
+#[test]
+fn dream_skin_style_presets_select_their_original_target_engines() {
+    for (id, expected_engine) in [
+        ("caishen-lite", "dream-skin"),
+        ("preset-midnight-aurora", "cidala-tiger"),
+        ("codex-snow-skin", "snow"),
+        ("glass-vision", "glass-vision"),
+    ] {
+        let settings = codex_plus_core::settings::BackendSettings {
+            codex_app_dream_skin_enabled: true,
+            codex_app_dream_skin_theme_config: codex_plus_core::settings::DreamSkinThemeConfig {
+                id: id.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let script = assets::dream_skin_live_update_script(&settings, true);
+
+        assert!(
+            script.contains(&format!(
+                "window.__CODEX_PLUS_DREAM_SKIN_TARGET_ENGINE__ = \"{expected_engine}\""
+            )),
+            "wrong target engine for {id}"
+        );
+        assert!(!script.contains("__DREAM_"));
+        assert!(!script.contains("__GLASS_VISION_"));
+    }
+}
+
+#[test]
+fn dream_skin_bundles_a_real_default_image() {
+    let (content_type, image) = assets::dream_skin_default_image();
+
+    if cfg!(windows) {
+        assert_eq!(content_type, "image/jpeg");
+        assert!(image.len() > 600_000);
+        assert_eq!(&image[..3], b"\xFF\xD8\xFF");
+    } else {
+        assert_eq!(content_type, "image/png");
+        assert!(image.len() > 1_000_000);
+        assert_eq!(&image[..8], b"\x89PNG\r\n\x1a\n");
+    }
 }
 
 #[test]
@@ -451,13 +653,16 @@ fn injection_script_marks_diagnostic_build_and_reports_script_loaded() {
 }
 
 #[test]
-fn injection_script_does_not_fetch_remote_ads() {
+fn injection_script_fetches_ads_without_bridge() {
     let script = assets::injection_script(57321);
 
-    assert!(!script.contains("directFetchCodexPlusAds"));
-    assert!(!script.contains("cacheBustCodexPlusAdUrl"));
-    assert!(!script.contains(&format!("{}{}", "Ad", "-List")));
-    assert!(!script.contains("postJson(\"/ads\""));
+    assert!(script.contains("directFetchCodexPlusAds"));
+    assert!(script.contains("cacheBustCodexPlusAdUrl"));
+    assert!(script.contains("Date.now()"));
+    assert!(script.contains("BigPizzaV3/Ad-List"));
+    assert!(
+        !script.contains("codexPlusAds = normalizeCodexPlusAds(await postJson(\"/ads\", {}));")
+    );
 }
 
 #[test]
@@ -466,7 +671,7 @@ fn injection_script_times_out_backend_bridge_calls_and_falls_back_to_helper() {
 
     assert!(script.contains("bridgeWithBackendTimeout"));
     assert!(script.contains("backend_bridge_timeout"));
-    assert!(script.contains("/backend/repair"));
+    assert!(!script.contains("/backend/repair"));
     assert!(script.contains("backend_status_bridge_failed_http_fallback_ok"));
     assert!(script.contains("backend_status_bridge_and_http_failed"));
 }
@@ -479,16 +684,118 @@ fn injection_script_explains_plugin_patch_is_unneeded_in_relay_mode() {
 }
 
 #[test]
-fn injection_script_menu_exposes_three_independent_plugin_switches() {
+fn injection_script_menu_exposes_marketplace_plugin_switch_only() {
     let script = assets::injection_script(57321);
 
     assert!(script.contains("插件市场解锁"));
     assert!(script.contains("data-codex-plus-setting=\"pluginMarketplaceUnlock\""));
-    assert!(script.contains("强制解锁入口"));
-    assert!(script.contains("data-codex-plus-setting=\"pluginEntryUnlock\""));
-    assert!(script.contains("特殊插件强制安装"));
-    assert!(script.contains("data-codex-plus-setting=\"forcePluginInstall\""));
-    assert!(script.contains("恢复 1.1.9 的入口解锁方式"));
+    assert!(!script.contains("特殊插件强制安装"));
+    assert!(!script.contains("data-codex-plus-setting=\"forcePluginInstall\""));
+    assert!(!script.contains("forcePluginInstall"));
+    assert!(!script.contains("强制解锁入口"));
+    assert!(!script.contains("data-codex-plus-setting=\"pluginEntryUnlock\""));
+}
+
+#[test]
+fn injection_script_menu_exposes_stepwise_switch_and_syncs_panel() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("stepwise: false"));
+    assert!(script.contains("stepwise: \"codexAppStepwiseEnabled\""));
+    assert!(script.contains("Stepwise"));
+    assert!(script.contains("data-codex-plus-setting=\"stepwise\""));
+    assert!(script.contains("function syncStepwisePanel"));
+    assert!(script.contains("window.__codexStepwisePanel?.syncSettings"));
+    assert!(script.contains("if (key === \"stepwise\") syncStepwisePanel(value)"));
+    assert!(script.contains("if (patch?.enabled === true)"));
+    assert!(script.contains("activateRuntime();"));
+}
+
+#[test]
+fn stepwise_direct_send_targets_main_chat_composer() {
+    let script = assets::stepwise_script();
+
+    assert!(script.contains("function elementCenter("));
+    assert!(script.contains("function horizontalOverlapRatio("));
+    assert!(script.contains("function ignoredComposerContainer("));
+    assert!(script.contains("function mainComposerCandidate("));
+    assert!(script.contains("mainComposerCandidate(candidates)"));
+    assert!(!script.contains("const target = candidates[candidates.length - 1];"));
+}
+
+#[test]
+fn stepwise_scan_does_not_require_composer_for_suggestions() {
+    let script = assets::stepwise_script();
+
+    assert!(!script.contains("if (!composerCandidates().length) return false;"));
+}
+
+#[test]
+fn stepwise_assistant_detection_accepts_two_action_buttons() {
+    let script = assets::stepwise_script();
+
+    assert!(script.contains("if (count >= 2) return current;"));
+    assert!(script.contains("if (count < 2) continue;"));
+    assert!(!script.contains("if (count >= 3) return current;"));
+    assert!(!script.contains("if (count < 3) continue;"));
+}
+
+#[test]
+fn stepwise_refreshes_suggestions_for_virtualized_assistant_bubbles() {
+    let script = assets::stepwise_script();
+
+    assert!(script.contains("function assistantBubbleCandidates("));
+    assert!(script.contains("\".group.flex.min-w-0.flex-col\""));
+    assert!(script.contains("candidates.push(...assistantBubbleCandidates())"));
+    assert!(script.contains("function latestMessageByDocumentOrder("));
+    assert!(script.contains("function clearPromptsForNewAssistant("));
+    assert!(script.contains(
+        "if (state.prompts.length || state.currentHash) clearPromptsForNewAssistant(hash);"
+    ));
+    assert!(script.contains("function setScanStatus("));
+    assert!(script.contains("setScanStatus(\"not-ready\""));
+    assert!(script.contains("setScanStatus(\"no-assistant-message\""));
+    assert!(!script.contains("setScanStatus(\"surface-not-ready\""));
+    assert!(!script.contains("return fallback[fallback.length - 1] || null;"));
+}
+
+#[test]
+fn stepwise_exposes_manual_refresh_without_refreshing_busy_chats() {
+    let script = assets::stepwise_script();
+
+    assert!(script.contains("data-action=\"refresh\""));
+    assert!(script.contains("function forceRefreshStepwise("));
+    assert!(script.contains("state.bridgeStatus === \"pending\" || chatBusy()"));
+    assert!(script.contains("setScanStatus(\"manual-refresh-busy\""));
+    assert!(script.contains("state.bridgeCache.delete(bridgeKey)"));
+    assert!(script.contains("requestBridgeStepwise(bridgeKey, userText, assistantText)"));
+}
+
+#[test]
+fn injection_script_defers_backend_mapped_toggles_until_settings_load() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("const codexPlusBackendMappedSettings = new Set"));
+    assert!(
+        script
+            .contains("codexPlusBackendMappedSettings.has(key) && !codexPlusBackendSettingsLoaded")
+    );
+    assert!(script.contains("button.dataset.pending = String(waitsForBackend)"));
+    assert!(script.contains(
+        "button.disabled = waitsForBackend || button.dataset.relayUnneeded === \"true\""
+    ));
+    assert!(script.contains("toggle.disabled || toggle.dataset.pending === \"true\""));
+}
+
+#[test]
+fn injection_script_ignores_stale_backend_settings_responses() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("let codexPlusBackendSettingsSeq = 0"));
+    assert!(script.contains("const seq = codexPlusBackendSettingsSeq"));
+    assert!(script.contains("if (seq !== codexPlusBackendSettingsSeq)"));
+    assert!(script.contains("const seq = ++codexPlusBackendSettingsSeq"));
+    assert!(script.contains("if (seq === codexPlusBackendSettingsSeq)"));
 }
 
 #[test]
@@ -499,6 +806,15 @@ fn injection_script_skips_plugin_patch_work_in_relay_mode() {
     assert!(script.contains("!codexPlusBackendSettingsLoaded"));
     assert!(script.contains("if (pluginPatchDisabledInRelayMode()) return"));
     assert!(script.contains("clearPluginPatchArtifacts()"));
+}
+
+#[test]
+fn injection_script_disables_plugin_auto_expand_in_relay_mode() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("settings.pluginAutoExpand = false"));
+    assert!(script.contains("if (pluginPatchDisabledInRelayMode()) return"));
+    assert!(script.contains("if (!codexPlusSettings().pluginAutoExpand) return"));
 }
 
 #[test]
@@ -518,29 +834,23 @@ fn injection_script_gates_legacy_and_modern_plugin_unlock_by_codex_version() {
     let script = assets::injection_script(57321);
 
     assert!(script.contains("const pluginUnlockStrategy = codexPluginUnlockStrategy()"));
-    assert!(script.contains("if ((pluginUnlockStrategy === \"legacy\" || pluginUnlockStrategy === \"unknown\") && settings.pluginEntryUnlock)"));
     assert!(script.contains("if ((pluginUnlockStrategy === \"modern\" || pluginUnlockStrategy === \"unknown\") && settings.pluginMarketplaceUnlock)"));
     assert!(script.contains("plugin_unlock_strategy_selected"));
     assert!(script.contains("window.__codexPluginUnlockStrategyLogged"));
 }
 
 #[test]
-fn injection_script_restores_legacy_plugin_sidebar_entry_unlock() {
+fn injection_script_removes_legacy_plugin_sidebar_entry_unlock() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("pluginEntryUnlock: true"));
-    assert!(script.contains("pluginEntryUnlock: \"codexAppPluginEntryUnlock\""));
-    assert!(script.contains("function reactFiberFrom(element)"));
-    assert!(script.contains("function authContextValueFrom(element)"));
-    assert!(script.contains("function spoofChatGPTAuthMethod(element)"));
-    assert!(script.contains("auth.setAuthMethod(\"chatgpt\")"));
-    assert!(script.contains("function pluginEntryButton()"));
-    assert!(script.contains("function enablePluginEntry()"));
-    assert!(script.contains("if (!codexPlusSettings().pluginEntryUnlock) return"));
-    assert!(script.contains("pluginButton.addEventListener(\"click\", () => {"));
-    assert!(script.contains("spoofChatGPTAuthMethod(pluginButton);"));
-    assert!(script.contains("插件 - 已解锁"));
-    assert!(script.contains("Plugins - Unlocked"));
+    assert!(!script.contains("pluginEntryUnlock"));
+    assert!(!script.contains("codexAppPluginEntryUnlock"));
+    assert!(!script.contains("function spoofChatGPTAuthMethod(element)"));
+    assert!(!script.contains("auth.setAuthMethod(\"chatgpt\")"));
+    assert!(!script.contains("function pluginEntryButton()"));
+    assert!(!script.contains("function enablePluginEntry()"));
+    assert!(!script.contains("插件 - 已解锁"));
+    assert!(!script.contains("Plugins - Unlocked"));
 }
 
 #[test]
@@ -555,16 +865,34 @@ fn injection_script_keeps_plugin_marketplace_unlock_separate_from_entry_unlock()
 }
 
 #[test]
-fn injection_script_unlocks_nested_disabled_plugin_install_buttons() {
+fn injection_script_localizes_codex_menu_commands() {
+    let script = assets::injection_script(57321);
+
+    assert!(script.contains("const codexMenuLocalizationMap = new Map"));
+    assert!(script.contains("[\"Toggle Sidebar\", \"切换侧边栏\"]"));
+    assert!(script.contains("[\"Toggle Bottom Panel\", \"切换底部面板\"]"));
+    assert!(script.contains("[\"Toggle Pinned Summary\", \"切换置顶摘要\"]"));
+    assert!(script.contains("[\"Open Terminal\", \"打开终端\"]"));
+    assert!(script.contains("[\"Open Browser Tab\", \"打开浏览器标签页\"]"));
+    assert!(script.contains("[\"Focus Browser Address Bar\", \"聚焦浏览器地址栏\"]"));
+    assert!(script.contains("[\"Reload Browser Page\", \"重新加载浏览器页面\"]"));
+    assert!(script.contains("[\"Toggle Side Panel\", \"切换侧边面板\"]"));
+    assert!(script.contains("[\"Actual Size\", \"实际大小\"]"));
+    assert!(script.contains("function localizeCodexMenus"));
+    assert!(script.contains("localizeCodexMenus();"));
+}
+
+#[test]
+fn injection_script_does_not_unlock_disabled_plugin_install_buttons() {
     let script = assets::injection_script(57321);
 
     assert!(script.contains("button[aria-disabled=\"true\"]"));
     assert!(script.contains("[role=\"button\"][data-disabled]"));
-    assert!(script.contains("installButtonUnlockNodes"));
-    assert!(script.contains("patchReactDisabledProps"));
-    assert!(script.contains("props[\"data-disabled\"] = undefined"));
-    assert!(script.contains("button.querySelectorAll?.(\"button, [role='button'], [disabled], [aria-disabled], [data-disabled]"));
-    assert!(script.contains("button.dataset.codexForceInstallUnlocked"));
+    assert!(!script.contains("installButtonUnlockNodes"));
+    assert!(!script.contains("patchReactDisabledProps"));
+    assert!(!script.contains("props[\"data-disabled\"] = undefined"));
+    assert!(!script.contains("button.querySelectorAll?.(\"button, [role='button'], [disabled], [aria-disabled], [data-disabled]"));
+    assert!(!script.contains("button.dataset.codexForceInstallUnlocked"));
 }
 
 #[test]
@@ -615,11 +943,15 @@ fn injection_script_expands_api_key_plugin_marketplace_requests() {
     assert!(script.contains("message.type === \"fetch\""));
     assert!(script.contains("data?.type === \"fetch-response\""));
     assert!(script.contains("__codexPluginMarketplaceFetchRequestIds"));
-    assert!(script.contains("delete next.marketplaceKinds"));
+    assert!(script.contains("const nextKinds = Array.isArray(next.marketplaceKinds)"));
+    assert!(script.contains("if (!nextKinds.includes(\"vertical\")) nextKinds.push(\"vertical\")"));
+    assert!(script.contains("next.marketplaceKinds = Array.from(new Set(nextKinds))"));
     assert!(script.contains("patchPluginMarketplaceResult"));
     assert!(script.contains("__CODEX_PLUS_PLUGIN_MARKETPLACES__"));
     assert!(script.contains("mergeLocalPluginMarketplaces(result)"));
     assert!(script.contains("plugin_marketplace_local_merged"));
+    assert!(script.contains("cloned.marketplaceName = marketplaceName"));
+    assert!(script.contains("cloned.marketplacePath = marketplaceName"));
     assert!(script.contains("restorePluginMarketplaceName"));
     assert!(script.contains(
         "next.remoteMarketplaceName = restorePluginMarketplaceName(next.remoteMarketplaceName)"
@@ -629,6 +961,14 @@ fn injection_script_expands_api_key_plugin_marketplace_requests() {
     assert!(
         script.contains("if (name === \"openai-primary-runtime\") return \"OpenAI插件3(Codex++)\"")
     );
+    assert!(script.contains("restored === \"openai-api-curated\""));
+    assert!(script.contains("restored === \"openai-curated-remote\""));
+    assert!(
+        script.contains("if (name === \"openai-curated-remote\") return \"OpenAI插件5(Codex++)\"")
+    );
+    assert!(script.contains(
+        "if (name === \"codex-plus-openai-curated-remote\") return \"openai-curated-remote\""
+    ));
     assert!(script.contains("OpenAI插件1(Codex++)"));
     assert!(script.contains("OpenAI插件2(Codex++)"));
     assert!(script.contains("OpenAI插件3(Codex++)"));
@@ -643,14 +983,14 @@ fn injection_script_expands_api_key_plugin_marketplace_requests() {
 }
 
 #[test]
-fn injection_script_deletes_marketplace_kinds_to_request_default_catalog() {
+fn injection_script_preserves_vertical_marketplace_kind_for_official_plugins() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("delete next.marketplaceKinds"));
     assert!(script.contains("plugin_marketplace_request_expanded"));
+    assert!(script.contains("if (!nextKinds.includes(\"vertical\")) nextKinds.push(\"vertical\")"));
     assert!(!script.contains("codexPluginAllowedMarketplaceKinds"));
     assert!(!script.contains("codexPluginExpandedMarketplaceKinds"));
-    assert!(!script.contains("next.marketplaceKinds = Array.from(new Set"));
+    assert!(!script.contains("delete next.marketplaceKinds"));
 }
 
 #[test]
@@ -664,13 +1004,13 @@ fn injection_script_logs_marketplace_grouping_diagnostics() {
 }
 
 #[test]
-fn injection_script_keeps_force_install_unlock_visual_state_sticky() {
+fn injection_script_omits_force_install_unlock_loop() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("codex-force-install-unlocked"));
-    assert!(script.contains("codexForcePluginInstallRefreshIntervalMs"));
-    assert!(script.contains("refreshForcePluginInstallUnlockLoop"));
-    assert!(script.contains("setInterval(() => {"));
+    assert!(!script.contains("codex-force-install-unlocked"));
+    assert!(!script.contains("codexForcePluginInstallRefreshIntervalMs"));
+    assert!(!script.contains("refreshForcePluginInstallUnlockLoop"));
+    assert!(!script.contains("__codexForcePluginInstallRefreshTimer"));
 }
 
 #[test]
@@ -783,11 +1123,6 @@ fn injection_script_unlocks_custom_model_catalog() {
     assert!(script.contains("patchStatsigModelDynamicConfig"));
     assert!(script.contains("patchModelJsonResponse"));
     assert!(script.contains("installAppServerModelRequestPatch"));
-    assert!(script.contains("loadAppServerRequestCandidates"));
-    assert!(script.contains("appServerFallbackAssetUrls"));
-    assert!(script.contains("collectAppServerRequestCandidatesFromModule"));
-    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"3\""));
-
     assert!(script.contains("list-models-for-host"));
     assert!(script.contains("appServerModelRequestMethod"));
     assert!(script.contains("send-cli-request-for-host"));
@@ -815,6 +1150,9 @@ fn injection_script_exposes_fast_service_tier_control() {
     assert!(script.contains("codexServiceTierSupportedFastModels"));
     assert!(script.contains("\"gpt-5.4\""));
     assert!(script.contains("\"gpt-5.5\""));
+    assert!(script.contains("\"gpt-5.6-sol\""));
+    assert!(script.contains("\"gpt-5.6-terra\""));
+    assert!(script.contains("\"gpt-5.6-luna\""));
     assert!(script.contains("codexServiceTierFastSupportedForModel"));
     assert!(script.contains("codexServiceTierModelForRequest"));
     assert!(script.contains("codexServiceTierMaybeLoadModelCatalog"));
@@ -871,6 +1209,17 @@ fn injection_script_exposes_fast_service_tier_control() {
     assert!(script.contains("当前 thread"));
     assert!(script.contains("standard"));
     assert!(script.contains("fast"));
+    assert!(script.contains("[\"setting-storage-\", \"app-initial-\"]"));
+    assert!(script.contains("[\"setting-storage-\", \"vscode-api-\", \"app-initial-\"]"));
+    assert!(script.contains("[\"vscode-api-\", \"app-initial-\"]"));
+    assert!(script.contains("codexSettingStorageFromModule"));
+    assert!(script.contains("codexStateApiFromModule"));
+    assert!(script.contains("message.type === \"fetch\""));
+    assert!(script.contains("vscode://codex/"));
+    assert!(script.contains("./(?:assets/)?"));
+    assert!(script.contains("dispatcher export unavailable"));
+    assert!(!script.contains("data-codex-max-reasoning-control"));
+    assert!(!script.contains("codexAppMaxReasoningOverride"));
 }
 
 #[test]
@@ -894,21 +1243,6 @@ fn injection_script_discovers_vscode_api_asset_without_hardcoded_hash() {
     assert!(script.contains("fetch(src"));
     assert!(!script.contains("vscode-api-Dc9pX2Bc.js"));
     assert!(!script.contains("import(\"./assets/vscode-api-"));
-}
-
-
-#[test]
-fn injection_script_discovers_app_server_request_clients_without_hardcoded_hash() {
-    let script = assets::injection_script(57321);
-
-    assert!(script.contains("loadAppServerRequestCandidates"));
-    assert!(script.contains("appServerFallbackAssetUrls"));
-    assert!(script.contains("[\"use-host-config-\", \"app-server-manager-signals-\"]"));
-    assert!(script.contains("loadOptionalCodexAppModule(assetPrefix)"));
-    assert!(script.contains("candidateCount: candidates.length"));
-    assert!(script.contains("discovery:"));
-    // Keep legacy lookup as first attempt, but never hardcode the old hashed filename.
-    assert!(!script.contains("app-server-manager-signals-C1h8B-R-.js") || script.contains("refreshRecentConversationsForHost"));
 }
 
 #[test]
@@ -955,6 +1289,33 @@ fn injection_script_applies_fast_service_tier_contract() {
     );
 
     assert_eq!(cases["startConversation"]["serviceTier"], "priority");
+    assert_eq!(cases["fetchStartConversation"]["serviceTier"], "priority");
+    assert_eq!(
+        cases["fetchSendCliRequest"]["params"]["serviceTier"],
+        "priority"
+    );
+    assert_eq!(
+        cases["fetchSendCliRequest"]["params"]["service_tier"],
+        "priority"
+    );
+    assert_eq!(cases["solFastAvailability"]["supported"], true);
+    assert_eq!(cases["solDescriptor"]["defaultReasoningEffort"], "low");
+    assert_eq!(
+        cases["solDescriptor"]["supportedReasoningEfforts"][4]["reasoningEffort"],
+        "max"
+    );
+    assert_eq!(
+        cases["solDescriptor"]["supportedReasoningEfforts"][5]["reasoningEffort"],
+        "ultra"
+    );
+    assert_eq!(cases["dispatcherFromSingleton"], true);
+    assert_eq!(cases["dispatcherFromCurrentSingleton"], true);
+    assert_eq!(cases["dispatcherFromClass"], true);
+    assert_eq!(cases["legacySettingStorage"], true);
+    assert_eq!(cases["currentSettingStorage"], true);
+    assert_eq!(cases["capabilitySettingStorage"], true);
+    assert_eq!(cases["legacyStateApi"], true);
+    assert_eq!(cases["currentStateApi"], true);
 }
 
 fn run_service_tier_contract_harness() -> serde_json::Value {
@@ -1051,6 +1412,120 @@ const startConversation = api.requestOverride({{
   threadId: "thread-12345678",
   model: "gpt-5.5",
 }});
+const fetchStartConversationEnvelope = api.requestOverride({{
+  type: "fetch",
+  url: "vscode://codex/start-conversation",
+  body: JSON.stringify({{
+    threadId: "thread-12345678",
+    model: "gpt-5.5",
+    serviceTier: null,
+  }}),
+}});
+const fetchStartConversation = JSON.parse(fetchStartConversationEnvelope.body);
+const fetchSendCliRequestEnvelope = api.requestOverride({{
+  type: "fetch",
+  url: "vscode://codex/send-cli-request-for-host",
+  body: {{
+    hostId: "local",
+    method: "thread/start",
+    params: {{
+      threadId: "thread-12345678",
+      model: "gpt-5.5",
+      service_tier: null,
+    }},
+  }},
+}});
+const fetchSendCliRequest = fetchSendCliRequestEnvelope.body;
+
+api.setModelCatalog({{
+  status: "ok",
+  model: "gpt-5.6-sol",
+  default_model: "gpt-5.6-sol",
+  models: ["gpt-5.6-sol"],
+  modelMetadata: {{
+    "gpt-5.6-sol": {{
+      displayName: "GPT-5.6-Sol",
+      description: "Latest frontier agentic coding model.",
+      defaultReasoningEffort: "low",
+      supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"].map((reasoningEffort) => ({{ reasoningEffort }})),
+      additionalSpeedTiers: ["fast"],
+      serviceTiers: [{{ id: "priority", name: "Fast" }}],
+    }},
+  }},
+}});
+const solFastAvailability = api.fastAvailability("gpt-5.6-sol");
+api.setModelCatalog({{
+  status: "ok",
+  model: "gpt-5.6-sol",
+  default_model: "gpt-5.6-sol",
+  models: ["gpt-5.6-sol"],
+  modelMetadata: {{
+    "gpt-5.6-sol": {{
+      displayName: "GPT-5.6-Sol",
+      description: "Latest frontier agentic coding model.",
+      defaultReasoningEffort: "low",
+      supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"].map((reasoningEffort) => ({{ reasoningEffort }})),
+    }},
+  }},
+}});
+const solDescriptor = api.modelDescriptor("gpt-5.6-sol");
+const singletonDispatcher = {{ dispatchMessage() {{}}, subscribe() {{}} }};
+const dispatcherFromSingleton = api.dispatcherFromModule({{ current: singletonDispatcher }}) === singletonDispatcher;
+const currentSingletonDispatcher = {{ dispatchMessage() {{}}, subscribe() {{}} }};
+const dispatcherFromCurrentSingleton = api.dispatcherFromModule({{
+  decoy: singletonDispatcher,
+  idt: currentSingletonDispatcher,
+}}) === currentSingletonDispatcher;
+class DispatcherClass {{
+  static instance = new DispatcherClass();
+  static getInstance() {{ return this.instance; }}
+  dispatchMessage() {{}}
+}}
+const dispatcherFromClass = api.dispatcherFromModule({{ current: DispatcherClass }}) === DispatcherClass.instance;
+const legacyGetSetting = async () => "legacy-get";
+const legacySetSetting = async () => "legacy-set";
+const legacySettingStorageValue = api.settingStorageFromModule({{
+  n: legacyGetSetting,
+  s: legacySetSetting,
+}}, "setting-storage-");
+const legacySettingStorage = legacySettingStorageValue.n === legacyGetSetting
+  && legacySettingStorageValue.s === legacySetSetting;
+const wrongCurrentGetSetting = async () => "wrong-current-get";
+const wrongCurrentSetSetting = async () => "wrong-current-set";
+const currentGetSetting = async (setting) => {{
+  const marker = "get-setting";
+  const params = {{ key: setting.key }};
+  return marker && params && "current-get";
+}};
+const currentSetSetting = async (setting, value) => {{
+  const marker = "set-setting";
+  const params = {{ key: setting.key, value }};
+  return marker && params && "current-set";
+}};
+const currentSettingStorageValue = api.settingStorageFromModule({{
+  n: wrongCurrentGetSetting,
+  s: wrongCurrentSetSetting,
+  jut: currentGetSetting,
+  Put: currentSetSetting,
+}}, "app-initial-");
+const currentSettingStorage = currentSettingStorageValue.n === currentGetSetting
+  && currentSettingStorageValue.s === currentSetSetting;
+const capabilitySettingStorageValue = api.settingStorageFromModule({{
+  randomGetter: currentGetSetting,
+  randomSetter: currentSetSetting,
+}}, "app-initial-");
+const capabilitySettingStorage = capabilitySettingStorageValue.n === currentGetSetting
+  && capabilitySettingStorageValue.s === currentSetSetting;
+const legacyStateCall = async () => "legacy-state";
+const currentStateCall = async () => "current-state";
+const legacyStateApi = api.stateApiFromModule({{
+  n: legacyStateCall,
+  qut: currentStateCall,
+}}, "vscode-api-") === legacyStateCall;
+const currentStateApi = api.stateApiFromModule({{
+  n: legacyStateCall,
+  qut: currentStateCall,
+}}, "app-initial-") === currentStateCall;
 
 process.stdout.write(JSON.stringify({{
   supportedFast,
@@ -1059,6 +1534,18 @@ process.stdout.write(JSON.stringify({{
   turnWithoutModelDiagnosticModel,
   customInheritUnsupported,
   startConversation,
+  fetchStartConversation,
+  fetchSendCliRequest,
+  solFastAvailability,
+  solDescriptor,
+  dispatcherFromSingleton,
+  dispatcherFromCurrentSingleton,
+  dispatcherFromClass,
+  legacySettingStorage,
+  currentSettingStorage,
+  capabilitySettingStorage,
+  legacyStateApi,
+  currentStateApi,
 }}));
 "#,
         script_path = serde_json::to_string(&script_path.to_string_lossy().to_string())
@@ -1071,6 +1558,241 @@ process.stdout.write(JSON.stringify({{
         .arg(&harness_path)
         .output()
         .expect("node should run service-tier harness");
+    assert!(
+        output.status.success(),
+        "node harness failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("harness stdout should be JSON")
+}
+
+#[test]
+fn injection_script_applies_projectless_main_window_contract() {
+    let script = assets::injection_script(57321);
+    assert!(script.contains("installCodexProjectlessNewTaskButtons"));
+    assert!(script.contains("codexProjectlessMainWindowVersion = \"5\""));
+    assert!(script.contains("generic-new-task-button"));
+    assert!(script.contains("loadCodexAppModule(\"projectless-thread-\")"));
+    assert!(script.contains("projectless_thread_start_overridden"));
+    assert!(script.contains("projectless_app_server_start_overridden"));
+    assert!(script.contains("projectless_main_window_home_route_cleared"));
+    assert!(script.contains("dispatcher.dispatchHostMessage"));
+    assert!(script.contains("[\"use-host-config-\", \"app-server-manager-signals-\"]"));
+    assert!(script.contains("codexProjectlessMainWindowRetryDelaysMs = [0, 250, 750, 1500, 3000]"));
+    let cases = run_projectless_main_window_contract_harness();
+
+    assert_eq!(cases["englishNewTask"], "generic");
+    assert_eq!(cases["chineseNewTask"], "generic");
+    assert_eq!(cases["compactChineseNewTask"], "generic");
+    assert_eq!(cases["quickChat"], "generic");
+    assert_eq!(cases["explicitProject"], "project");
+    assert_eq!(cases["projectRow"], "project");
+    assert_eq!(cases["unrelated"], "");
+    assert_eq!(cases["genericEnabled"], true);
+    assert_eq!(cases["projectRequestNeedsOverride"], true);
+    assert_eq!(cases["nativeProjectlessNeedsOverride"], false);
+    assert_eq!(cases["patchedWorkspaceKind"], "projectless");
+    assert_eq!(cases["patchedCwd"], "C:/generated/work");
+    assert_eq!(cases["patchedOutputDirectory"], "C:/generated/outputs");
+    assert_eq!(cases["patchedWorkspaceRoots"], json!(["C:/generated/work"]));
+    assert_eq!(
+        cases["patchedPermissionRoots"],
+        json!(["C:/generated/work"])
+    );
+    assert_eq!(cases["patchedWritableRoots"], json!(["C:/generated/work"]));
+    assert_eq!(cases["patchedHasProjectAssignment"], false);
+    assert_eq!(cases["dispatchResult"], "sent");
+    assert_eq!(cases["dispatchedCount"], 1);
+    assert_eq!(cases["dispatchedType"], "start-conversation");
+    assert_eq!(cases["dispatchedWorkspaceKind"], "projectless");
+    assert_eq!(cases["dispatchedCwd"], "C:/generated/work");
+    assert_eq!(cases["appServerRequestNeedsOverride"], true);
+    assert_eq!(cases["appServerPatchedWorkspaceKind"], "projectless");
+    assert_eq!(cases["appServerPatchedCwd"], "C:/generated/work");
+    assert_eq!(cases["appServerPatchedHasProjectAssignment"], false);
+    assert_eq!(cases["nestedAppServerWorkspaceKind"], "projectless");
+    assert_eq!(cases["nestedAppServerCwd"], "C:/generated/work");
+    assert_eq!(cases["appServerSentCount"], 1);
+    assert_eq!(cases["appServerSentMethod"], "start-conversation");
+    assert_eq!(cases["appServerSentWorkspaceKind"], "projectless");
+    assert_eq!(cases["appServerSentCwd"], "C:/generated/work");
+    assert_eq!(cases["explicitProjectWins"], false);
+    assert_eq!(cases["explicitProjectRequestIsUntouched"], false);
+    assert_eq!(cases["disabledIsNoop"], false);
+}
+
+fn run_projectless_main_window_contract_harness() -> serde_json::Value {
+    let temp = tempfile::tempdir().expect("temp dir should be created");
+    let script_path = temp.path().join("renderer-inject.js");
+    let harness_path = temp.path().join("projectless-main-window-harness.cjs");
+    std::fs::write(&script_path, assets::injection_script(57321))
+        .expect("injection script should be written");
+    let mut harness = std::fs::File::create(&harness_path).expect("harness should be created");
+    write!(
+        harness,
+        r#"
+const scriptPath = {script_path};
+const store = new Map();
+function node() {{
+  return {{
+    appendChild() {{}}, prepend() {{}}, remove() {{}}, setAttribute() {{}}, removeAttribute() {{}},
+    addEventListener() {{}}, querySelector() {{ return null; }}, querySelectorAll() {{ return []; }},
+    closest() {{ return null; }},
+    classList: {{ add() {{}}, remove() {{}}, toggle() {{}}, contains() {{ return false; }} }},
+    dataset: {{}}, style: {{}}, children: [], isConnected: true, textContent: "", innerHTML: "",
+  }};
+}}
+function trigger(label, kind = "generic") {{
+  const value = {{
+    textContent: label,
+    getAttribute(name) {{ return name === "aria-label" ? label : null; }},
+    closest(selector) {{
+      if (selector.includes('Start new chat in') || selector.includes('data-app-action-sidebar-project-row')) {{
+        return kind === "project-button" || kind === "project-row" ? value : null;
+      }}
+      if (selector === 'button, a, [role="button"], [role="menuitem"]') return value;
+      return null;
+    }},
+  }};
+  return value;
+}}
+globalThis.window = globalThis;
+window.__CODEX_PLUS_TEST_PROJECTLESS__ = true;
+window.addEventListener = () => {{}};
+window.removeEventListener = () => {{}};
+window.dispatchEvent = () => true;
+globalThis.Element = class Element {{}};
+globalThis.HTMLElement = class HTMLElement extends Element {{}};
+globalThis.HTMLAnchorElement = class HTMLAnchorElement extends HTMLElement {{}};
+globalThis.MutationObserver = class MutationObserver {{ observe() {{}} disconnect() {{}} }};
+globalThis.ResizeObserver = class ResizeObserver {{ observe() {{}} disconnect() {{}} }};
+globalThis.requestAnimationFrame = () => 0;
+globalThis.cancelAnimationFrame = () => {{}};
+globalThis.document = {{
+  scripts: [], documentElement: node(), body: node(), createElement: () => node(),
+  getElementById: () => null, querySelector: () => null, querySelectorAll: () => [],
+  addEventListener() {{}}, removeEventListener() {{}},
+}};
+globalThis.localStorage = {{
+  getItem: (key) => store.has(key) ? store.get(key) : null,
+  setItem: (key, value) => store.set(key, String(value)), removeItem: (key) => store.delete(key),
+}};
+store.set("codexPlusSettings", JSON.stringify({{ modelWhitelistUnlock: false }}));
+globalThis.sessionStorage = globalThis.localStorage;
+globalThis.location = {{ href: "https://codex.test/index.html", pathname: "/index.html", search: "", hash: "" }};
+window.location = globalThis.location;
+globalThis.navigator = {{ userAgent: "node-test" }};
+globalThis.performance = {{ getEntriesByType: () => [] }};
+require(scriptPath);
+void (async () => {{
+const api = window.__codexPlusProjectlessTest;
+const englishNewTask = api.triggerKind(trigger("New task"));
+const chineseNewTask = api.triggerKind(trigger("新建任务\nCtrl+N"));
+const compactChineseNewTask = api.triggerKind(trigger("新建任务Ctrl+N"));
+const quickChat = api.triggerKind(trigger("Quick Chat"));
+const explicitProject = api.triggerKind(trigger("Start new chat in Demo", "project-button"));
+const projectRow = api.triggerKind(trigger("Demo", "project-row"));
+const unrelated = api.triggerKind(trigger("Settings"));
+api.setEnabled(true);
+api.setIntent("generic", "test");
+const genericEnabled = api.shouldEnforce();
+const context = {{ cwd: "C:/generated/work", projectlessOutputDirectory: "C:/generated/outputs", workspaceRoots: ["C:/generated/work"] }};
+const projectRequest = {{
+  type: "start-conversation",
+  cwd: "C:/recent-project",
+  workspaceRoots: ["C:/recent-project"],
+  workspaceKind: "project",
+  projectAssignment: {{ projectKind: "local", projectId: "C:/recent-project" }},
+  permissions: {{
+    runtimeWorkspaceRoots: ["C:/recent-project"],
+    sandboxPolicy: {{ type: "workspaceWrite", writableRoots: ["C:/recent-project"] }},
+  }},
+}};
+const projectRequestNeedsOverride = api.requestNeedsOverride(projectRequest);
+const patchedRequest = api.applyRequestOverride(projectRequest, context);
+const nativeProjectlessNeedsOverride = api.requestNeedsOverride({{
+  type: "start-conversation",
+  cwd: "C:/native/work",
+  workspaceRoots: ["C:/native/work"],
+  workspaceKind: "projectless",
+  projectlessOutputDirectory: "C:/native/outputs",
+}});
+const dispatched = [];
+const dispatcher = {{
+  __codexServiceTierOriginalDispatchMessage(type, payload) {{
+    dispatched.push({{ type, payload }});
+    return "sent";
+  }},
+}};
+api.setDraftContext(context);
+const dispatchResult = await api.dispatchMessage(dispatcher, "start-conversation", projectRequest);
+const appServerProjectRequest = {{ ...projectRequest }};
+delete appServerProjectRequest.type;
+const appServerRequestNeedsOverride = api.appServerRequestNeedsOverride("start-conversation", appServerProjectRequest);
+const appServerPatchedRequest = api.applyAppServerRequestOverride("start-conversation", appServerProjectRequest, context);
+const nestedAppServerPatchedRequest = api.applyAppServerRequestOverride("send-cli-request-for-host", {{
+  method: "thread/start",
+  params: appServerProjectRequest,
+}}, context);
+const appServerSent = [];
+const appServerClient = {{
+  async sendRequest(method, params) {{
+    appServerSent.push({{ method, params }});
+    return {{ ok: true }};
+  }},
+}};
+api.patchAppServerClient(appServerClient);
+await appServerClient.sendRequest("start-conversation", appServerProjectRequest);
+api.setIntent("project", "test");
+const explicitProjectWins = api.shouldEnforce();
+const explicitProjectRequestIsUntouched = api.requestNeedsOverride(projectRequest);
+api.setEnabled(false);
+api.setIntent("generic", "test");
+const disabledIsNoop = api.shouldEnforce();
+process.stdout.write(JSON.stringify({{
+  englishNewTask, chineseNewTask, compactChineseNewTask, quickChat, explicitProject, projectRow, unrelated,
+  genericEnabled, projectRequestNeedsOverride, nativeProjectlessNeedsOverride,
+  patchedWorkspaceKind: patchedRequest.workspaceKind,
+  patchedCwd: patchedRequest.cwd,
+  patchedOutputDirectory: patchedRequest.projectlessOutputDirectory,
+  patchedWorkspaceRoots: patchedRequest.workspaceRoots,
+  patchedPermissionRoots: patchedRequest.permissions.runtimeWorkspaceRoots,
+  patchedWritableRoots: patchedRequest.permissions.sandboxPolicy.writableRoots,
+  patchedHasProjectAssignment: Object.hasOwn(patchedRequest, "projectAssignment"),
+  dispatchResult,
+  dispatchedCount: dispatched.length,
+  dispatchedType: dispatched[0]?.type,
+  dispatchedWorkspaceKind: dispatched[0]?.payload?.workspaceKind,
+  dispatchedCwd: dispatched[0]?.payload?.cwd,
+  appServerRequestNeedsOverride,
+  appServerPatchedWorkspaceKind: appServerPatchedRequest.workspaceKind,
+  appServerPatchedCwd: appServerPatchedRequest.cwd,
+  appServerPatchedHasProjectAssignment: Object.hasOwn(appServerPatchedRequest, "projectAssignment"),
+  nestedAppServerWorkspaceKind: nestedAppServerPatchedRequest.params.workspaceKind,
+  nestedAppServerCwd: nestedAppServerPatchedRequest.params.cwd,
+  appServerSentCount: appServerSent.length,
+  appServerSentMethod: appServerSent[0]?.method,
+  appServerSentWorkspaceKind: appServerSent[0]?.params?.workspaceKind,
+  appServerSentCwd: appServerSent[0]?.params?.cwd,
+  explicitProjectWins, explicitProjectRequestIsUntouched, disabledIsNoop,
+}}));
+process.exit(0);
+}})().catch((error) => {{
+  console.error(error);
+  process.exit(1);
+}});
+"#,
+        script_path = serde_json::to_string(&script_path.to_string_lossy().to_string())
+            .expect("script path should serialize")
+    )
+    .expect("harness should be written");
+    drop(harness);
+
+    let output = Command::new("node")
+        .arg(&harness_path)
+        .output()
+        .expect("node should run projectless main-window harness");
     assert!(
         output.status.success(),
         "node harness failed\nstdout:\n{}\nstderr:\n{}",
@@ -1186,6 +1908,19 @@ fn manager_ui_exposes_pure_api_relay_mode_button() {
     assert!(source.contains("纯 API"));
     assert!(source.contains("apply_pure_api_injection"));
     assert!(commands.contains("commands::apply_pure_api_injection"));
+}
+
+#[test]
+fn manager_ui_disables_plugin_auto_expand_in_compatible_mode() {
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("core crate should live under crates/codex-plus-core");
+    let source = std::fs::read_to_string(repo.join("apps/codex-plus-manager/src/App.tsx")).unwrap();
+
+    assert!(source.contains(
+        "checked={form.codexAppPluginAutoExpand} disabled={!masterEnabled || !patchMode}"
+    ));
 }
 
 #[test]
