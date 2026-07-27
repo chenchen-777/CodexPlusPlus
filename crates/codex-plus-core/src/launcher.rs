@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -275,9 +276,21 @@ where
     let mut keep_launched_on_error = false;
 
     let result: anyhow::Result<LaunchHandle> = async {
+        let home = crate::relay_config::default_codex_home_dir();
         if settings.provider_sync_enabled {
+            crate::codex_app_state::capture_app_state_snapshot_nonfatal(&home, "launcher.before");
             hooks.run_provider_sync().await?;
+            crate::codex_app_state::sync_app_state_after_provider_switch_nonfatal(
+                &home,
+                "launcher.after_provider_sync",
+            );
         }
+        crate::dream_skin::sync_default_dream_skin_base_theme(
+            settings.enhancements_enabled
+                && settings.codex_app_dream_skin_enabled
+                && !settings.codex_app_dream_skin_paused,
+            &settings.codex_app_dream_skin_theme_config,
+        )?;
         if let Err(error) = hooks.ensure_plugin_marketplace_config(&settings).await {
             let _ = crate::diagnostic_log::append_diagnostic_log(
                 "launcher.plugin_marketplace_config_failed_nonfatal",
@@ -289,7 +302,6 @@ where
         if settings.computer_use_guard_enabled {
             hooks.ensure_computer_use_config(&settings).await?;
         }
-        let home = crate::relay_config::default_codex_home_dir();
         match crate::codex_sqlite::sanitize_historical_model_suffixes(&home) {
             Ok(result) if result.updated > 0 => {
                 let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -310,7 +322,8 @@ where
                 );
             }
         }
-        let protocol_proxy_enabled = relay_protocol_proxy_enabled(&settings);
+        let protocol_proxy_enabled = relay_protocol_proxy_enabled(&settings)
+            || remote_control_provider_proxy_enabled(&settings);
         if protocol_proxy_enabled {
             helper_port = crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT;
         }
@@ -402,6 +415,11 @@ where
 
 fn relay_protocol_proxy_enabled(settings: &BackendSettings) -> bool {
     settings.active_relay_uses_protocol_proxy()
+}
+
+fn remote_control_provider_proxy_enabled(settings: &BackendSettings) -> bool {
+    let profile = settings.active_relay_profile();
+    profile.relay_mode == crate::settings::RelayMode::Official && profile.official_mix_api_key
 }
 
 fn select_native_menu_inspector_port(debug_port: u16) -> u16 {
@@ -676,6 +694,13 @@ impl LaunchHooks for DefaultLaunchHooks {
         settings: &BackendSettings,
         extra_args: &[String],
     ) -> anyhow::Result<CodexLaunch> {
+        if settings.enhancements_enabled {
+            let home = crate::relay_config::default_codex_home_dir();
+            crate::codex_app_state::prepare_projectless_main_window_nonfatal(
+                &home,
+                "launcher.prelaunch",
+            );
+        }
         let native_menu_localization_enabled = settings.codex_app_native_menu_localization;
         let native_menu_inspector_port =
             native_menu_localization_enabled.then(|| select_native_menu_inspector_port(debug_port));
@@ -999,15 +1024,33 @@ async fn handle_helper_connection(
     mut stream: tokio::net::TcpStream,
     remote_addr: Option<SocketAddr>,
 ) -> anyhow::Result<()> {
-    let request_bytes = read_http_request(&mut stream).await?;
-    let request = String::from_utf8_lossy(&request_bytes);
-    let request_line = request.lines().next().unwrap_or_default();
+    let request = match read_http_request(&mut stream).await {
+        Ok(request) => request,
+        Err(error) => {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "status": "failed",
+                "message": error.to_string()
+            }))?;
+            write_http_response(
+                &mut stream,
+                error.status(),
+                "application/json; charset=utf-8",
+                &body,
+            )
+            .await?;
+            stream.shutdown().await?;
+            return Ok(());
+        }
+    };
+    let request_headers = String::from_utf8_lossy(&request.headers);
+    let request_line = request_headers.lines().next().unwrap_or_default();
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default();
     let raw_path = parts.next().unwrap_or_default();
     let path = raw_path.split('?').next().unwrap_or(raw_path);
-    let request_body = http_request_body(&request);
-    let request_user_agent = header_value_from_request(&request, "user-agent");
+    let request_user_agent = header_value_from_headers(&request_headers, "user-agent");
+    let request_content_type = header_value_from_headers(&request_headers, "content-type");
+    let request_content_encoding = header_value_from_headers(&request_headers, "content-encoding");
     let remote_addr_text = remote_addr.map(|addr| addr.to_string());
 
     let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -1017,14 +1060,15 @@ async fn handle_helper_connection(
             "path": path,
             "request_line": request_line,
             "remote_addr": remote_addr_text,
-            "body_bytes": request_body.len()
+            "body_bytes": request.body.len()
         }),
     );
 
-    if crate::protocol_proxy::is_responses_proxy_path(path) && method == "POST" {
-        return handle_protocol_proxy_connection(
+    if crate::protocol_proxy::is_audio_transcriptions_proxy_path(path) && method == "POST" {
+        return handle_audio_transcriptions_proxy_connection(
             &mut stream,
-            request_body,
+            &request.body,
+            request_content_type.as_deref(),
             request_user_agent.as_deref(),
             method,
             path,
@@ -1032,10 +1076,72 @@ async fn handle_helper_connection(
         )
         .await;
     }
+    if crate::protocol_proxy::is_responses_proxy_path(path) && method == "GET" {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "status": "upgrade_required",
+            "message": "WebSocket transport is not supported by the local protocol proxy; retry with HTTP."
+        }))?;
+        write_http_response(
+            &mut stream,
+            "426 Upgrade Required",
+            "application/json; charset=utf-8",
+            &body,
+        )
+        .await?;
+        log_helper_response(
+            "helper.responses_websocket_upgrade_required",
+            method,
+            path,
+            "426 Upgrade Required",
+            remote_addr_text,
+        );
+        stream.shutdown().await?;
+        return Ok(());
+    }
+    if crate::protocol_proxy::is_responses_proxy_path(path) && method == "POST" {
+        let request_body = match decode_protocol_proxy_request_body(
+            &request.body,
+            request_content_encoding.as_deref(),
+        ) {
+            Ok(body) => body,
+            Err(error) => {
+                let body = serde_json::to_vec(&serde_json::json!({
+                    "status": "failed",
+                    "message": error.to_string()
+                }))?;
+                write_http_response(
+                    &mut stream,
+                    "400 Bad Request",
+                    "application/json; charset=utf-8",
+                    &body,
+                )
+                .await?;
+                log_helper_response(
+                    "helper.protocol_proxy_decode_failed",
+                    method,
+                    path,
+                    "400 Bad Request",
+                    remote_addr_text,
+                );
+                stream.shutdown().await?;
+                return Ok(());
+            }
+        };
+        return handle_protocol_proxy_connection(
+            &mut stream,
+            &request_body,
+            request_user_agent.as_deref(),
+            method,
+            path,
+            remote_addr_text,
+        )
+        .await;
+    }
+    let request_body = String::from_utf8_lossy(&request.body);
     if crate::protocol_proxy::is_chat_completions_proxy_path(path) && method == "POST" {
         return handle_chat_completions_proxy_connection(
             &mut stream,
-            request_body,
+            &request_body,
             request_user_agent.as_deref(),
             method,
             path,
@@ -1071,7 +1177,7 @@ async fn handle_helper_connection(
     } else if path == "/diagnostics/log" && matches!(method, "POST" | "OPTIONS") {
         if method == "POST" {
             let detail =
-                serde_json::from_str::<serde_json::Value>(request_body).unwrap_or_else(|error| {
+                serde_json::from_str::<serde_json::Value>(&request_body).unwrap_or_else(|error| {
                     serde_json::json!({
                         "parse_error": error.to_string(),
                         "raw": request_body
@@ -1104,6 +1210,17 @@ async fn handle_helper_connection(
             )
         } else {
             overlay_image_response()
+        }
+    } else if path == "/dream-skin/image" && matches!(method, "GET" | "OPTIONS") {
+        if method == "OPTIONS" {
+            (
+                "200 OK".to_string(),
+                Vec::new(),
+                "application/octet-stream".to_string(),
+                "helper.dream_skin_image_options",
+            )
+        } else {
+            dream_skin_image_response()
         }
     } else {
         (
@@ -1143,6 +1260,30 @@ async fn handle_helper_connection(
     Ok(())
 }
 
+fn decode_protocol_proxy_request_body(
+    body: &[u8],
+    content_encoding: Option<&str>,
+) -> anyhow::Result<String> {
+    let encoding = content_encoding.unwrap_or_default().trim();
+    let decoded = if encoding.is_empty() || encoding.eq_ignore_ascii_case("identity") {
+        body.to_vec()
+    } else if encoding.eq_ignore_ascii_case("zstd") {
+        let decoder = zstd::stream::read::Decoder::new(std::io::Cursor::new(body))?;
+        let mut limited = decoder.take((MAX_HTTP_BODY_BYTES + 1) as u64);
+        let mut decoded = Vec::new();
+        limited.read_to_end(&mut decoded)?;
+        if decoded.len() > MAX_HTTP_BODY_BYTES {
+            anyhow::bail!("解压后的请求体超过大小限制");
+        }
+        decoded
+    } else {
+        anyhow::bail!("不支持的 Content-Encoding：{encoding}");
+    };
+
+    String::from_utf8(decoded)
+        .map_err(|error| anyhow::anyhow!("Responses 请求体不是 UTF-8：{error}"))
+}
+
 fn overlay_image_response() -> (String, Vec<u8>, String, &'static str) {
     let not_found = || {
         (
@@ -1173,6 +1314,47 @@ fn overlay_image_response() -> (String, Vec<u8>, String, &'static str) {
             bytes,
             content_type.to_string(),
             "helper.overlay_image_ok",
+        ),
+        Err(_) => not_found(),
+    }
+}
+
+fn dream_skin_image_response() -> (String, Vec<u8>, String, &'static str) {
+    let not_found = || {
+        (
+            "404 Not Found".to_string(),
+            serde_json::to_vec(&serde_json::json!({
+                "status": "failed",
+                "message": "皮肤图片未启用或图片不可用"
+            }))
+            .unwrap_or_default(),
+            "application/json; charset=utf-8".to_string(),
+            "helper.dream_skin_image_not_found",
+        )
+    };
+    let settings = SettingsStore::default().load().unwrap_or_default();
+    if !settings.codex_app_dream_skin_enabled {
+        return not_found();
+    }
+    let image_path = PathBuf::from(settings.codex_app_dream_skin_image_path.trim());
+    if image_path.as_os_str().is_empty() || !image_path.is_file() {
+        let (content_type, image) = crate::assets::dream_skin_default_image();
+        return (
+            "200 OK".to_string(),
+            image.to_vec(),
+            content_type.to_string(),
+            "helper.dream_skin_default_image_ok",
+        );
+    }
+    let Some(content_type) = overlay_image_content_type(&image_path) else {
+        return not_found();
+    };
+    match std::fs::read(&image_path) {
+        Ok(bytes) => (
+            "200 OK".to_string(),
+            bytes,
+            content_type.to_string(),
+            "helper.dream_skin_image_ok",
         ),
         Err(_) => not_found(),
     }
@@ -1290,9 +1472,10 @@ async fn handle_protocol_proxy_connection(
     remote_addr_text: Option<String>,
 ) -> anyhow::Result<()> {
     let request_json = serde_json::from_str::<serde_json::Value>(request_body).ok();
-    let upstream = match crate::protocol_proxy::open_responses_proxy_request(
+    let upstream = match crate::protocol_proxy::open_responses_proxy_request_for_path(
         request_body,
         request_user_agent,
+        path,
     )
     .await
     {
@@ -1445,6 +1628,70 @@ async fn handle_protocol_proxy_connection(
     stream.shutdown().await?;
     Ok(())
 }
+async fn handle_audio_transcriptions_proxy_connection(
+    stream: &mut tokio::net::TcpStream,
+    request_body: &[u8],
+    request_content_type: Option<&str>,
+    request_user_agent: Option<&str>,
+    method: &str,
+    path: &str,
+    remote_addr_text: Option<String>,
+) -> anyhow::Result<()> {
+    let upstream = match crate::protocol_proxy::open_audio_transcriptions_proxy_request(
+        request_body,
+        request_content_type.unwrap_or_default(),
+        request_user_agent,
+    )
+    .await
+    {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "status": "failed",
+                "message": error.to_string()
+            }))?;
+            write_http_response(
+                stream,
+                "502 Bad Gateway",
+                "application/json; charset=utf-8",
+                &body,
+            )
+            .await?;
+            log_helper_response(
+                "helper.audio_transcriptions_proxy_failed",
+                method,
+                path,
+                "502 Bad Gateway",
+                remote_addr_text,
+            );
+            stream.shutdown().await?;
+            return Ok(());
+        }
+    };
+    let status = upstream.status();
+    let is_success = upstream.is_success();
+    let content_type = if upstream.content_type.is_empty() {
+        "application/json; charset=utf-8".to_string()
+    } else {
+        upstream.content_type.clone()
+    };
+    let body = upstream.response.bytes().await?.to_vec();
+    write_http_response(stream, &status, &content_type, &body).await?;
+    log_helper_response(
+        if is_success {
+            "helper.audio_transcriptions_proxy_ok"
+        } else {
+            "helper.audio_transcriptions_proxy_upstream_error"
+        },
+        method,
+        path,
+        &status,
+        remote_addr_text,
+    );
+    stream.shutdown().await?;
+    Ok(())
+}
+
 async fn handle_chat_completions_proxy_connection(
     stream: &mut tokio::net::TcpStream,
     request_body: &str,
@@ -1569,7 +1816,7 @@ fn log_helper_response(
 
 #[cfg(test)]
 mod computer_use_tests {
-    use super::{header_value_from_request, overlay_image_content_type};
+    use super::{header_value_from_headers, overlay_image_content_type};
     use std::path::Path;
 
     #[test]
@@ -1594,17 +1841,167 @@ mod computer_use_tests {
         let request = "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: Codex/26.614\r\nContent-Length: 2\r\n\r\n{}";
 
         assert_eq!(
-            header_value_from_request(request, "user-agent").as_deref(),
+            header_value_from_headers(request, "user-agent").as_deref(),
             Some("Codex/26.614")
         );
     }
 }
 
-async fn read_http_request(stream: &mut tokio::net::TcpStream) -> anyhow::Result<Vec<u8>> {
+const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
+const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
+const MAX_HTTP_ENCODED_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+struct HttpRequest {
+    headers: Vec<u8>,
+    body: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct HttpRequestReadError {
+    status: &'static str,
+    message: String,
+}
+
+impl HttpRequestReadError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: "400 Bad Request",
+            message: message.into(),
+        }
+    }
+
+    fn payload_too_large() -> Self {
+        Self {
+            status: "413 Payload Too Large",
+            message: format!("HTTP 请求体超过 {MAX_HTTP_BODY_BYTES} 字节限制"),
+        }
+    }
+
+    fn status(&self) -> &'static str {
+        self.status
+    }
+}
+
+impl std::fmt::Display for HttpRequestReadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for HttpRequestReadError {}
+
+impl From<std::io::Error> for HttpRequestReadError {
+    fn from(error: std::io::Error) -> Self {
+        Self::bad_request(format!("读取 HTTP 请求失败: {error}"))
+    }
+}
+
+#[derive(Debug)]
+enum HttpBodyFraming {
+    Empty,
+    ContentLength(usize),
+    Chunked,
+}
+
+#[derive(Debug)]
+enum ChunkedBody {
+    Incomplete,
+    Complete(Vec<u8>),
+}
+
+#[derive(Debug)]
+enum ChunkedBodyScan {
+    Incomplete,
+    Complete,
+}
+
+#[derive(Default)]
+struct ChunkedScanState {
+    position: usize,
+    decoded_len: usize,
+    complete: bool,
+}
+
+impl ChunkedScanState {
+    fn advance(&mut self, encoded: &[u8]) -> Result<ChunkedBodyScan, HttpRequestReadError> {
+        if self.complete {
+            return Ok(ChunkedBodyScan::Complete);
+        }
+        loop {
+            let chunk_start = self.position;
+            let Some(line_end_offset) = encoded[chunk_start..]
+                .windows(2)
+                .position(|window| window == b"\r\n")
+            else {
+                if encoded.len().saturating_sub(chunk_start) > MAX_HTTP_HEADER_BYTES {
+                    return Err(HttpRequestReadError::bad_request("chunk size 行过大"));
+                }
+                return Ok(ChunkedBodyScan::Incomplete);
+            };
+            if line_end_offset > MAX_HTTP_HEADER_BYTES {
+                return Err(HttpRequestReadError::bad_request("chunk size 行过大"));
+            }
+            let line_end = chunk_start + line_end_offset;
+            let size_text = std::str::from_utf8(&encoded[chunk_start..line_end])
+                .map_err(|_| HttpRequestReadError::bad_request("chunk size 不是有效 ASCII"))?;
+            let size_token = size_text.split(';').next().unwrap_or_default().trim();
+            let chunk_size = usize::from_str_radix(size_token, 16)
+                .map_err(|_| HttpRequestReadError::bad_request("chunk size 无效"))?;
+            let data_start = line_end + 2;
+
+            if chunk_size == 0 {
+                let mut trailer_start = data_start;
+                loop {
+                    let Some(trailer_end_offset) = encoded[trailer_start..]
+                        .windows(2)
+                        .position(|window| window == b"\r\n")
+                    else {
+                        if encoded.len().saturating_sub(data_start) > MAX_HTTP_HEADER_BYTES {
+                            return Err(HttpRequestReadError::bad_request("chunk trailer 过大"));
+                        }
+                        return Ok(ChunkedBodyScan::Incomplete);
+                    };
+                    if trailer_start + trailer_end_offset - data_start > MAX_HTTP_HEADER_BYTES {
+                        return Err(HttpRequestReadError::bad_request("chunk trailer 过大"));
+                    }
+                    if trailer_end_offset == 0 {
+                        self.position = trailer_start + 2;
+                        self.complete = true;
+                        return Ok(ChunkedBodyScan::Complete);
+                    }
+                    trailer_start += trailer_end_offset + 2;
+                }
+            }
+            let next_decoded_len = self
+                .decoded_len
+                .checked_add(chunk_size)
+                .ok_or_else(HttpRequestReadError::payload_too_large)?;
+            if next_decoded_len > MAX_HTTP_BODY_BYTES {
+                return Err(HttpRequestReadError::payload_too_large());
+            }
+            let chunk_end = data_start
+                .checked_add(chunk_size)
+                .ok_or_else(HttpRequestReadError::payload_too_large)?;
+            if encoded.len() < chunk_end + 2 {
+                return Ok(ChunkedBodyScan::Incomplete);
+            }
+            if &encoded[chunk_end..chunk_end + 2] != b"\r\n" {
+                return Err(HttpRequestReadError::bad_request("chunk 数据后缺少 CRLF"));
+            }
+            self.decoded_len = next_decoded_len;
+            self.position = chunk_end + 2;
+        }
+    }
+}
+
+async fn read_http_request(
+    stream: &mut tokio::net::TcpStream,
+) -> Result<HttpRequest, HttpRequestReadError> {
     let mut buffer = Vec::new();
     let mut chunk = vec![0_u8; 4096];
     let mut header_end = None;
-    let mut content_length = 0_usize;
+    let mut framing = HttpBodyFraming::Empty;
+    let mut chunked_scan = ChunkedScanState::default();
 
     loop {
         let read = stream.read(&mut chunk).await?;
@@ -1615,50 +2012,192 @@ async fn read_http_request(stream: &mut tokio::net::TcpStream) -> anyhow::Result
         if header_end.is_none() {
             header_end = find_header_end(&buffer);
             if let Some(end) = header_end {
-                content_length = content_length_from_headers(&buffer[..end]).unwrap_or(0);
+                if end > MAX_HTTP_HEADER_BYTES {
+                    return Err(HttpRequestReadError::bad_request("HTTP 请求头过大"));
+                }
+                framing = http_body_framing(&buffer[..end])?;
+            } else if buffer.len() > MAX_HTTP_HEADER_BYTES {
+                return Err(HttpRequestReadError::bad_request("HTTP 请求头过大"));
             }
         }
         if let Some(end) = header_end {
-            if buffer.len() >= end + 4 + content_length {
-                break;
+            let body = &buffer[end + 4..];
+            if body.len() > MAX_HTTP_ENCODED_BODY_BYTES {
+                return Err(HttpRequestReadError::payload_too_large());
             }
-        }
-        if buffer.len() > 32 * 1024 * 1024 {
-            anyhow::bail!("HTTP 请求过大");
+            match framing {
+                HttpBodyFraming::Empty => break,
+                HttpBodyFraming::ContentLength(content_length) => {
+                    if content_length > MAX_HTTP_BODY_BYTES {
+                        return Err(HttpRequestReadError::payload_too_large());
+                    }
+                    if body.len() >= content_length {
+                        break;
+                    }
+                }
+                HttpBodyFraming::Chunked => match chunked_scan.advance(body)? {
+                    ChunkedBodyScan::Incomplete => {}
+                    ChunkedBodyScan::Complete => break,
+                },
+            }
         }
     }
 
-    Ok(buffer)
+    let header_end =
+        header_end.ok_or_else(|| HttpRequestReadError::bad_request("HTTP 请求头不完整"))?;
+    let headers = buffer[..header_end].to_vec();
+    let encoded_body = &buffer[header_end + 4..];
+    let body = match framing {
+        HttpBodyFraming::Empty => Vec::new(),
+        HttpBodyFraming::ContentLength(content_length) => {
+            content_length_body(encoded_body, content_length)?
+        }
+        HttpBodyFraming::Chunked => match decode_chunked_body(encoded_body)? {
+            ChunkedBody::Complete(body) => body,
+            ChunkedBody::Incomplete => {
+                return Err(HttpRequestReadError::bad_request(
+                    "chunked HTTP 请求体不完整",
+                ));
+            }
+        },
+    };
+
+    Ok(HttpRequest { headers, body })
 }
 
 fn find_header_end(buffer: &[u8]) -> Option<usize> {
     buffer.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
-fn content_length_from_headers(headers: &[u8]) -> Option<usize> {
+fn http_body_framing(headers: &[u8]) -> Result<HttpBodyFraming, HttpRequestReadError> {
     let text = String::from_utf8_lossy(headers);
-    text.lines().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
+    let mut content_length = None;
+    let mut transfer_encoding: Option<String> = None;
+    for line in text.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
         if name.trim().eq_ignore_ascii_case("content-length") {
-            value.trim().parse().ok()
-        } else {
-            None
+            let parsed = value
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| HttpRequestReadError::bad_request("Content-Length 无效"))?;
+            if content_length
+                .replace(parsed)
+                .is_some_and(|existing| existing != parsed)
+            {
+                return Err(HttpRequestReadError::bad_request(
+                    "存在冲突的 Content-Length 请求头",
+                ));
+            }
+        } else if name.trim().eq_ignore_ascii_case("transfer-encoding") {
+            let value = value.trim().to_ascii_lowercase();
+            if let Some(existing) = transfer_encoding.as_mut() {
+                existing.push(',');
+                existing.push_str(&value);
+            } else {
+                transfer_encoding = Some(value);
+            }
         }
-    })
+    }
+
+    if transfer_encoding.is_some() && content_length.is_some() {
+        return Err(HttpRequestReadError::bad_request(
+            "Transfer-Encoding 与 Content-Length 不能同时使用",
+        ));
+    }
+    match transfer_encoding.as_deref() {
+        Some("chunked") => Ok(HttpBodyFraming::Chunked),
+        Some(_) => Err(HttpRequestReadError::bad_request(
+            "仅支持 Transfer-Encoding: chunked",
+        )),
+        None => Ok(content_length
+            .map(HttpBodyFraming::ContentLength)
+            .unwrap_or(HttpBodyFraming::Empty)),
+    }
 }
 
-fn http_request_body(request: &str) -> &str {
-    request
-        .split_once("\r\n\r\n")
-        .map(|(_, body)| body)
-        .unwrap_or_default()
+fn content_length_body(
+    encoded: &[u8],
+    content_length: usize,
+) -> Result<Vec<u8>, HttpRequestReadError> {
+    if content_length > MAX_HTTP_BODY_BYTES {
+        return Err(HttpRequestReadError::payload_too_large());
+    }
+    if encoded.len() < content_length {
+        return Err(HttpRequestReadError::bad_request("HTTP 请求体不完整"));
+    }
+    Ok(encoded[..content_length].to_vec())
 }
 
-fn header_value_from_request(request: &str, header_name: &str) -> Option<String> {
-    request
-        .split_once("\r\n\r\n")
-        .map(|(headers, _)| headers)
-        .unwrap_or(request)
+fn decode_chunked_body(encoded: &[u8]) -> Result<ChunkedBody, HttpRequestReadError> {
+    let mut decoded = Vec::new();
+    let mut position = 0;
+    loop {
+        let Some(line_end_offset) = encoded[position..]
+            .windows(2)
+            .position(|window| window == b"\r\n")
+        else {
+            if encoded.len().saturating_sub(position) > MAX_HTTP_HEADER_BYTES {
+                return Err(HttpRequestReadError::bad_request("chunk size 行过大"));
+            }
+            return Ok(ChunkedBody::Incomplete);
+        };
+        if line_end_offset > MAX_HTTP_HEADER_BYTES {
+            return Err(HttpRequestReadError::bad_request("chunk size 行过大"));
+        }
+        let line_end = position + line_end_offset;
+        let size_text = std::str::from_utf8(&encoded[position..line_end])
+            .map_err(|_| HttpRequestReadError::bad_request("chunk size 不是有效 ASCII"))?;
+        let size_token = size_text.split(';').next().unwrap_or_default().trim();
+        let chunk_size = usize::from_str_radix(size_token, 16)
+            .map_err(|_| HttpRequestReadError::bad_request("chunk size 无效"))?;
+        position = line_end + 2;
+
+        if chunk_size == 0 {
+            loop {
+                let Some(trailer_end_offset) = encoded[position..]
+                    .windows(2)
+                    .position(|window| window == b"\r\n")
+                else {
+                    if encoded.len().saturating_sub(line_end + 2) > MAX_HTTP_HEADER_BYTES {
+                        return Err(HttpRequestReadError::bad_request("chunk trailer 过大"));
+                    }
+                    return Ok(ChunkedBody::Incomplete);
+                };
+                if position + trailer_end_offset - (line_end + 2) > MAX_HTTP_HEADER_BYTES {
+                    return Err(HttpRequestReadError::bad_request("chunk trailer 过大"));
+                }
+                if trailer_end_offset == 0 {
+                    return Ok(ChunkedBody::Complete(decoded));
+                }
+                position += trailer_end_offset + 2;
+            }
+        }
+        if decoded.len().saturating_add(chunk_size) > MAX_HTTP_BODY_BYTES {
+            return Err(HttpRequestReadError::payload_too_large());
+        }
+        let chunk_end = position
+            .checked_add(chunk_size)
+            .ok_or_else(HttpRequestReadError::payload_too_large)?;
+        if encoded.len() < chunk_end + 2 {
+            return Ok(ChunkedBody::Incomplete);
+        }
+        if &encoded[chunk_end..chunk_end + 2] != b"\r\n" {
+            return Err(HttpRequestReadError::bad_request("chunk 数据后缺少 CRLF"));
+        }
+        decoded.extend_from_slice(&encoded[position..chunk_end]);
+        position = chunk_end + 2;
+    }
+}
+
+#[cfg(test)]
+fn scan_chunked_body(encoded: &[u8]) -> Result<ChunkedBodyScan, HttpRequestReadError> {
+    ChunkedScanState::default().advance(encoded)
+}
+
+fn header_value_from_headers(headers: &str, header_name: &str) -> Option<String> {
+    headers
         .lines()
         .skip(1)
         .find_map(|line| {
@@ -1866,7 +2405,8 @@ async fn check_and_reinject_bridge_inner(
         "bridge.reinject_start",
         serde_json::json!({
             "debug_port": debug_port,
-            "helper_port": helper_port
+            "helper_port": helper_port,
+            "browser_identity_changed": browser_identity_changed
         }),
     );
     let default_reinjector: BridgeReinjector =
@@ -2623,6 +3163,355 @@ mod tests {
             .unwrap();
 
         assert_eq!(default_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn http_body_framing_rejects_ambiguous_or_unsupported_headers() {
+        let conflict = http_body_framing(
+            b"POST / HTTP/1.1\r\nContent-Length: 4\r\nTransfer-Encoding: chunked",
+        )
+        .unwrap_err();
+        assert_eq!(conflict.status(), "400 Bad Request");
+
+        let unsupported =
+            http_body_framing(b"POST / HTTP/1.1\r\nTransfer-Encoding: gzip").unwrap_err();
+        assert_eq!(unsupported.status(), "400 Bad Request");
+
+        let multiple = http_body_framing(
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked",
+        )
+        .unwrap_err();
+        assert_eq!(multiple.status(), "400 Bad Request");
+    }
+
+    #[test]
+    fn chunked_decoder_accepts_exact_body_limit_and_rejects_one_byte_more() {
+        let mut exact = format!("{:X}\r\n", MAX_HTTP_BODY_BYTES).into_bytes();
+        exact.resize(exact.len() + MAX_HTTP_BODY_BYTES, b'a');
+        exact.extend_from_slice(b"\r\n0\r\n\r\n");
+        let ChunkedBody::Complete(decoded) = decode_chunked_body(&exact).unwrap() else {
+            panic!("expected complete chunked body");
+        };
+        assert_eq!(decoded.len(), MAX_HTTP_BODY_BYTES);
+
+        let oversized = format!("{:X}\r\n", MAX_HTTP_BODY_BYTES + 1).into_bytes();
+        let error = decode_chunked_body(&oversized).unwrap_err();
+        assert_eq!(error.status(), "413 Payload Too Large");
+    }
+
+    #[test]
+    fn chunked_decoder_handles_extensions_trailers_and_every_partial_prefix() {
+        let encoded = b"3;name=value\r\n\x00\x80\xff\r\n2\r\nAB\r\n0\r\nX-Trace: yes\r\n\r\n";
+        for prefix_len in 0..encoded.len() {
+            assert!(matches!(
+                scan_chunked_body(&encoded[..prefix_len]).unwrap(),
+                ChunkedBodyScan::Incomplete
+            ));
+        }
+
+        assert!(matches!(
+            scan_chunked_body(encoded).unwrap(),
+            ChunkedBodyScan::Complete
+        ));
+        let ChunkedBody::Complete(decoded) = decode_chunked_body(encoded).unwrap() else {
+            panic!("expected complete chunked body");
+        };
+        assert_eq!(decoded, [0x00, 0x80, 0xff, b'A', b'B']);
+    }
+
+    #[test]
+    fn chunked_decoder_rejects_oversized_size_lines_and_trailers() {
+        let oversized_size_line = vec![b'f'; MAX_HTTP_HEADER_BYTES + 1];
+        let error = scan_chunked_body(&oversized_size_line).unwrap_err();
+        assert_eq!(error.status(), "400 Bad Request");
+
+        let mut oversized_trailer = b"0\r\nX-Large: ".to_vec();
+        oversized_trailer.resize(MAX_HTTP_HEADER_BYTES + 16, b'a');
+        let error = scan_chunked_body(&oversized_trailer).unwrap_err();
+        assert_eq!(error.status(), "400 Bad Request");
+    }
+
+    #[test]
+    fn content_length_body_accepts_exact_limit_and_rejects_one_byte_more() {
+        let exact = vec![b'a'; MAX_HTTP_BODY_BYTES];
+        assert_eq!(
+            content_length_body(&exact, MAX_HTTP_BODY_BYTES)
+                .unwrap()
+                .len(),
+            MAX_HTTP_BODY_BYTES
+        );
+
+        let error = content_length_body(&[], MAX_HTTP_BODY_BYTES + 1).unwrap_err();
+        assert_eq!(error.status(), "413 Payload Too Large");
+    }
+
+    #[tokio::test]
+    async fn helper_returns_400_for_ambiguous_body_framing() {
+        let response = send_raw_helper_request(
+            b"POST /v1/audio/transcriptions HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=x\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        )
+        .await;
+
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 400 Bad Request"));
+    }
+
+    #[tokio::test]
+    async fn helper_returns_413_before_reading_oversized_content_length_body() {
+        let request = format!(
+            "POST /v1/audio/transcriptions HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=x\r\nContent-Length: {}\r\n\r\n",
+            MAX_HTTP_BODY_BYTES + 1
+        );
+        let response = send_raw_helper_request(request.as_bytes()).await;
+
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 413 Payload Too Large"));
+    }
+
+    #[tokio::test]
+    async fn helper_returns_400_for_oversized_headers() {
+        let mut request = b"GET /backend/status HTTP/1.1\r\nX-Large: ".to_vec();
+        request.resize(MAX_HTTP_HEADER_BYTES + 1, b'a');
+        request.extend_from_slice(b"\r\n\r\n");
+        let response = send_raw_helper_request(&request).await;
+
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 400 Bad Request"));
+    }
+
+    #[tokio::test]
+    async fn helper_returns_426_for_responses_websocket_upgrade() {
+        let response = send_raw_helper_request(
+            b"GET /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+        )
+        .await;
+
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 426 Upgrade Required"));
+    }
+
+    #[test]
+    fn protocol_proxy_request_body_decodes_zstd() {
+        let body = br#"{"model":"gpt-5.6-sol","input":"probe","stream":false}"#;
+        let compressed = zstd::stream::encode_all(std::io::Cursor::new(body), 3).unwrap();
+
+        let decoded = decode_protocol_proxy_request_body(&compressed, Some("zstd")).unwrap();
+
+        assert_eq!(decoded.as_bytes(), body);
+        assert!(decode_protocol_proxy_request_body(body, Some("gzip")).is_err());
+    }
+
+    #[tokio::test]
+    async fn helper_replaces_chatgpt_auth_when_proxying_zstd_responses_request() {
+        let _settings_guard = crate::paths::settings_path_test_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let settings_path = temp.path().join("settings.json");
+        let previous_settings_path =
+            crate::paths::set_settings_path_for_tests(Some(settings_path.clone()));
+        let upstream_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let settings = serde_json::json!({
+            "relayProfilesEnabled": true,
+            "relayProfiles": [{
+                "id": "remote-control",
+                "name": "Remote Control Relay",
+                "baseUrl": format!("http://{upstream_addr}/v1"),
+                "upstreamBaseUrl": format!("http://{upstream_addr}/v1"),
+                "apiKey": "sk-upstream",
+                "protocol": "responses",
+                "relayMode": "official",
+                "officialMixApiKey": true
+            }],
+            "activeRelayId": "remote-control"
+        });
+        std::fs::write(settings_path, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
+
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = upstream_listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let mut expected_len = None;
+            loop {
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert!(read > 0, "upstream request ended before body completed");
+                request.extend_from_slice(&buffer[..read]);
+                if expected_len.is_none() {
+                    if let Some(header_end) = find_header_end(&request) {
+                        let headers = String::from_utf8_lossy(&request[..header_end]);
+                        let content_length = header_value_from_headers(&headers, "content-length")
+                            .unwrap()
+                            .parse::<usize>()
+                            .unwrap();
+                        expected_len = Some(header_end + 4 + content_length);
+                    }
+                }
+                if expected_len.is_some_and(|length| request.len() >= length) {
+                    break;
+                }
+            }
+            let response_body = br#"{"id":"resp_remote","object":"response"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response_body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(response_body).await.unwrap();
+            request
+        });
+
+        let body = br#"{"model":"gpt-5.6-sol","input":"probe","stream":false}"#;
+        let compressed = zstd::stream::encode_all(std::io::Cursor::new(body), 3).unwrap();
+        let helper_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let helper_addr = helper_listener.local_addr().unwrap();
+        let helper = tokio::spawn(async move {
+            let (stream, remote_addr) = helper_listener.accept().await.unwrap();
+            handle_helper_connection(stream, Some(remote_addr))
+                .await
+                .unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(helper_addr).await.unwrap();
+        let headers = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: {helper_addr}\r\nAuthorization: Bearer chatgpt-secret\r\nContent-Type: application/json\r\nContent-Encoding: zstd\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            compressed.len()
+        );
+        client.write_all(headers.as_bytes()).await.unwrap();
+        client.write_all(&compressed).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK"));
+
+        helper.await.unwrap();
+        let upstream_request = upstream.await.unwrap();
+        let header_end = find_header_end(&upstream_request).unwrap();
+        let upstream_headers =
+            String::from_utf8_lossy(&upstream_request[..header_end]).to_ascii_lowercase();
+        assert!(upstream_headers.starts_with("post /v1/responses http/1.1"));
+        assert!(upstream_headers.contains("authorization: bearer sk-upstream"));
+        assert!(!upstream_headers.contains("chatgpt-secret"));
+        let upstream_body: serde_json::Value =
+            serde_json::from_slice(&upstream_request[header_end + 4..]).unwrap();
+        assert_eq!(upstream_body["model"], "gpt-5.6-sol");
+        crate::paths::set_settings_path_for_tests(previous_settings_path);
+    }
+
+    async fn send_raw_helper_request(request: &[u8]) -> Vec<u8> {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let helper = tokio::spawn(async move {
+            let (stream, remote_addr) = listener.accept().await.unwrap();
+            handle_helper_connection(stream, Some(remote_addr))
+                .await
+                .unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client.write_all(request).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        helper.await.unwrap();
+        response
+    }
+
+    #[tokio::test]
+    async fn helper_decodes_fragmented_chunked_binary_multipart_body() {
+        let _settings_guard = crate::paths::settings_path_test_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let settings_path = temp.path().join("settings.json");
+        let previous_settings_path =
+            crate::paths::set_settings_path_for_tests(Some(settings_path.clone()));
+        let upstream_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let settings = serde_json::json!({
+            "relayProfiles": [{
+                "id": "audio",
+                "name": "Audio",
+                "baseUrl": format!("http://{upstream_addr}/v1"),
+                "upstreamBaseUrl": format!("http://{upstream_addr}/v1"),
+                "apiKey": "sk-test",
+                "protocol": "chatCompletions",
+                "relayMode": "mixedApi"
+            }],
+            "activeRelayId": "audio"
+        });
+        std::fs::write(settings_path, serde_json::to_vec_pretty(&settings).unwrap()).unwrap();
+
+        let boundary = "codex-binary-boundary";
+        let mut multipart = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngpt-4o-mini-transcribe\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"binary.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
+        )
+        .into_bytes();
+        multipart.extend_from_slice(&[0x00, 0x80, 0xff, b'A', b'B']);
+        multipart.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let expected_body = multipart.clone();
+
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = upstream_listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            let mut expected_len = None;
+            loop {
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert!(read > 0, "upstream request ended before body completed");
+                request.extend_from_slice(&buffer[..read]);
+                if expected_len.is_none() {
+                    if let Some(header_end) = find_header_end(&request) {
+                        let headers = String::from_utf8_lossy(&request[..header_end]);
+                        let content_length = header_value_from_headers(&headers, "content-length")
+                            .unwrap()
+                            .parse::<usize>()
+                            .unwrap();
+                        expected_len = Some(header_end + 4 + content_length);
+                    }
+                }
+                if expected_len.is_some_and(|length| request.len() >= length) {
+                    break;
+                }
+            }
+            let header_end = find_header_end(&request).unwrap();
+            let body = request[header_end + 4..].to_vec();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 13\r\nConnection: close\r\n\r\n{\"text\":\"ok\"}",
+                )
+                .await
+                .unwrap();
+            body
+        });
+
+        let helper_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let helper_addr = helper_listener.local_addr().unwrap();
+        let helper = tokio::spawn(async move {
+            let (stream, remote_addr) = helper_listener.accept().await.unwrap();
+            handle_helper_connection(stream, Some(remote_addr))
+                .await
+                .unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(helper_addr).await.unwrap();
+        let headers = format!(
+            "POST /v1/audio/transcriptions HTTP/1.1\r\nHost: {helper_addr}\r\nContent-Type: multipart/form-data; boundary={boundary}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        );
+        for fragment in headers.as_bytes().chunks(7) {
+            client.write_all(fragment).await.unwrap();
+        }
+        for fragment in multipart.chunks(11) {
+            let chunk_header = format!("{:X}\r\n", fragment.len());
+            client.write_all(chunk_header.as_bytes()).await.unwrap();
+            client.write_all(fragment).await.unwrap();
+            client.write_all(b"\r\n").await.unwrap();
+        }
+        client.write_all(b"0\r\n\r\n").await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK"));
+
+        helper.await.unwrap();
+        assert_eq!(upstream.await.unwrap(), expected_body);
+        crate::paths::set_settings_path_for_tests(previous_settings_path);
     }
 
     #[test]
