@@ -530,10 +530,12 @@ impl LauncherDataService {
     }
 
     fn storage_adapter(&self) -> codex_plus_data::SQLiteStorageAdapter {
+        let allowed_db_paths = self.candidate_db_paths();
         codex_plus_data::SQLiteStorageAdapter::new(
             self.db_path.clone(),
             codex_plus_data::BackupStore::new(self.backup_dir.clone()),
         )
+        .with_allowed_db_paths(allowed_db_paths)
     }
 }
 
@@ -616,6 +618,18 @@ impl BridgeRuntimeService for LauncherRuntimeService {
         let target = codex_plus_core::install::spawn_companion(
             codex_plus_core::install::MANAGER_BINARY,
             std::iter::empty::<&str>(),
+        )
+        .map_err(|error| anyhow::anyhow!("启动管理工具失败：{error}"))?;
+        Ok(json!({
+            "status": "ok",
+            "path": target
+        }))
+    }
+
+    async fn open_transient_manager(&self) -> anyhow::Result<Value> {
+        let target = codex_plus_core::install::spawn_companion(
+            codex_plus_core::install::MANAGER_BINARY,
+            ["--transient"],
         )
         .map_err(|error| anyhow::anyhow!("启动管理工具失败：{error}"))?;
         Ok(json!({

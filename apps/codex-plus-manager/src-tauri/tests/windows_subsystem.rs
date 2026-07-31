@@ -62,6 +62,8 @@ fn manager_close_minimizes_to_tray_without_confirmation() {
     assert!(!lib_rs.contains(".dialog()"));
     assert!(!lib_rs.contains("manager://close-requested"));
     assert!(lib_rs.contains("let _ = close_event_window.hide();"));
+    assert!(lib_rs.contains("startup_is_transient()"));
+    assert!(lib_rs.contains("arg == \"--transient\""));
     assert!(!app_tsx.contains("CloseConfirmDialog"));
     assert!(app_tsx.contains("manager_exit_app"));
     assert!(app_tsx.contains("manager_hide_to_tray"));
@@ -315,6 +317,18 @@ fn relay_preview_deduplicates_root_keys_when_merging_common_config() {
     assert!(app_tsx.contains("dedupeTomlRootLines"));
     assert!(app_tsx.contains("rootSeen.add(key)"));
     assert!(app_tsx.contains("joinTomlSectionsRootFirst"));
+}
+
+#[test]
+fn provider_presets_include_runapi() {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let presets = manifest_dir.parent().unwrap().join("src/presets.ts");
+    let presets = std::fs::read_to_string(&presets).expect("read manager presets.ts");
+
+    assert!(presets.contains("id: \"runapi\""));
+    assert!(presets.contains("name: \"RunAPI\""));
+    assert!(presets.contains("category: \"aggregator\""));
+    assert!(presets.contains("baseUrl: \"https://runapi.co/v1\""));
 }
 
 #[test]
