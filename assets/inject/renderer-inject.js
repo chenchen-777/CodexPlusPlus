@@ -582,7 +582,7 @@
   const selectors = {
     sidebarThread: "[data-app-action-sidebar-thread-id]",
     threadTitle: "[data-thread-title]",
-    appHeader: ".app-header-tint",
+    appHeader: '[class*="ApplicationMenuTopBar"], .app-header-tint',
     nativeMenuBar: "[class*=\"ms-auto\"][class*=\"flex\"][class*=\"items-center\"]",
     headerContextMenuSurface: '[data-testid="app-shell-header-context-menu-surface"]',
     archiveNav: 'button[aria-label="已归档对话"], button[aria-label="Archived conversations"]',
@@ -3742,7 +3742,7 @@
 
   function updateFloatingCodexPlusMenuPosition(menu) {
     if (!menu?.classList?.contains(codexPlusMenuFloatingClass)) return;
-    const header = document.querySelector(selectors.appHeader) || document.querySelector("header");
+    const header = document.querySelector(selectors.appHeader);
     if (!header) return;
     const toolbarButtons = Array.from(header.querySelectorAll("button"))
       .map((button) => ({ button, rect: button.getBoundingClientRect() }))
@@ -3761,8 +3761,9 @@
 
     const headerRect = header.getBoundingClientRect();
     if (headerRect.height) {
-      setCssPropIfChanged(menu, "--codex-plus-menu-top", `${headerRect.top}px`);
-      setCssPropIfChanged(menu, "--codex-plus-menu-height", `${headerRect.height}px`);
+      const isApplicationMenuTopBar = header.matches?.('[class*="ApplicationMenuTopBar"]');
+      setCssPropIfChanged(menu, "--codex-plus-menu-top", `${isApplicationMenuTopBar ? Math.max(4, headerRect.top) : headerRect.top}px`);
+      setCssPropIfChanged(menu, "--codex-plus-menu-height", `${isApplicationMenuTopBar ? 28 : headerRect.height}px`);
     }
     menu.style.removeProperty("--codex-plus-menu-right");
   }
