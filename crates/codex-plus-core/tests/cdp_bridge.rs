@@ -55,16 +55,16 @@ fn screenshot_command_uses_png_from_surface() {
 }
 
 #[test]
-fn injection_script_prefixes_helper_url_and_sponsor_images() {
+fn injection_script_prefixes_helper_url_without_promotional_content() {
     let script = assets::injection_script(57321);
 
     assert!(script.contains("window.__CODEX_SESSION_DELETE_HELPER__"));
     assert!(script.contains("http://127.0.0.1:57321"));
-    assert!(script.contains("window.__CODEX_PLUS_SPONSOR_IMAGES__"));
     assert!(script.contains("window.__CODEX_PLUS_VERSION__"));
     assert!(script.contains(codex_plus_core::version::VERSION));
-    assert!(script.contains("https://discord.gg/y96kX7A76v"));
-    assert!(script.contains("data-codex-plus-discord"));
+    assert!(!script.contains("window.__CODEX_PLUS_SPONSOR_IMAGES__"));
+    assert!(!script.contains("discord.gg"));
+    assert!(!script.contains("t.me/"));
 }
 
 #[test]
@@ -654,16 +654,13 @@ fn injection_script_marks_diagnostic_build_and_reports_script_loaded() {
 }
 
 #[test]
-fn injection_script_fetches_ads_without_bridge() {
+fn injection_script_does_not_fetch_promotional_content() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("directFetchCodexPlusAds"));
-    assert!(script.contains("cacheBustCodexPlusAdUrl"));
-    assert!(script.contains("Date.now()"));
-    assert!(script.contains("BigPizzaV3/Ad-List"));
-    assert!(
-        !script.contains("codexPlusAds = normalizeCodexPlusAds(await postJson(\"/ads\", {}));")
-    );
+    assert!(!script.contains("directFetchCodexPlusAds"));
+    assert!(!script.contains("cacheBustCodexPlusAdUrl"));
+    assert!(!script.contains("BigPizzaV3/Ad-List"));
+    assert!(!script.contains("postJson(\"/ads\""));
 }
 
 #[test]

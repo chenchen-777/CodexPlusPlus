@@ -3,9 +3,14 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const DEFAULT_REPOSITORY: &str = "BigPizzaV3/CodexPlusPlus";
+pub const DEFAULT_REPOSITORY: &str = "chenchen-777/CodexPlusPlus";
 pub const DEFAULT_LATEST_JSON_URL: &str =
-    "https://github.com/BigPizzaV3/CodexPlusPlus/releases/latest/download/latest.json";
+    "https://github.com/chenchen-777/CodexPlusPlus/releases/latest/download/latest.json";
+pub const FALLBACK_MIRROR_PREFIX: &str = "https://gh-proxy.com/";
+pub const FALLBACK_LATEST_JSON_URL: &str =
+    "https://gh-proxy.com/https://github.com/chenchen-777/CodexPlusPlus/releases/latest/download/latest.json";
+pub const SELF_HOSTED_LATEST_JSON_URL: &str =
+    "https://www.777codes.codes/codexplusplus/releases/latest/download/latest.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReleaseAsset {
@@ -180,8 +185,31 @@ pub async fn fetch_latest_release(latest_json_url: &str) -> anyhow::Result<Relea
     release_from_latest_json_payload(&payload)
 }
 
+pub fn fallback_mirror_url(url: &str) -> Option<String> {
+    const RELEASE_PREFIX: &str =
+        "https://github.com/chenchen-777/CodexPlusPlus/releases/";
+    url.starts_with(RELEASE_PREFIX)
+        .then(|| format!("{FALLBACK_MIRROR_PREFIX}{url}"))
+}
+
+pub async fn fetch_latest_release_from_default_channels() -> anyhow::Result<Release> {
+    match fetch_latest_release(DEFAULT_LATEST_JSON_URL).await {
+        Ok(release) => Ok(release),
+        Err(primary_error) => match fetch_latest_release(FALLBACK_LATEST_JSON_URL).await {
+            Ok(release) => Ok(release),
+            Err(mirror_error) => fetch_latest_release(SELF_HOSTED_LATEST_JSON_URL)
+                .await
+                .map_err(|self_hosted_error| {
+                    anyhow::anyhow!(
+                        "更新检查失败；主地址：{primary_error}；备用镜像：{mirror_error}；777codes：{self_hosted_error}"
+                    )
+                }),
+        },
+    }
+}
+
 pub async fn check_for_update(current_version: &str) -> anyhow::Result<UpdateCheck> {
-    let release = fetch_latest_release(DEFAULT_LATEST_JSON_URL).await?;
+    let release = fetch_latest_release_from_default_channels().await?;
     let update_available = is_newer_version(&release.version, current_version)?;
     Ok(UpdateCheck {
         current_version: current_version.to_string(),
@@ -201,14 +229,22 @@ pub async fn perform_update(
         .asset_url
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("没有可下载的 Release asset"))?;
-    let bytes =
-        crate::http_client::proxied_client(&format!("Codex++/{}", crate::version::VERSION))?
-            .get(url)
-            .send()
-            .await?
-            .error_for_status()?
-            .bytes()
-            .await?;
+    let client =
+        crate::http_client::proxied_client(&format!("Codex++/{}", crate::version::VERSION))?;
+    let bytes = match fetch_update_asset(&client, url).await {
+        Ok(bytes) => bytes,
+        Err(primary_error) => {
+            let fallback_url = fallback_mirror_url(url)
+                .ok_or_else(|| anyhow::anyhow!("下载安装包失败：{primary_error}"))?;
+            fetch_update_asset(&client, &fallback_url)
+                .await
+                .map_err(|fallback_error| {
+                    anyhow::anyhow!(
+                        "下载安装包失败；主地址：{primary_error}；备用镜像：{fallback_error}"
+                    )
+                })?
+        }
+    };
     let installer_path = download_asset_to(release, &bytes, download_dir)?;
     launch_installer(&installer_path)?;
     Ok(UpdateInstall {
@@ -216,6 +252,17 @@ pub async fn perform_update(
         installer_path,
         launched: true,
     })
+}
+
+async fn fetch_update_asset(client: &reqwest::Client, url: &str) -> anyhow::Result<Vec<u8>> {
+    Ok(client
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?
+        .to_vec())
 }
 
 pub fn download_asset_to(
