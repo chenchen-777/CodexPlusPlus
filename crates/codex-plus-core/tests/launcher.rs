@@ -812,6 +812,7 @@ async fn default_helper_serves_backend_status_over_http() {
     let payload: serde_json::Value = response.json().await.unwrap();
     assert_eq!(payload["status"], "ok");
     assert_eq!(payload["transport"], "http-helper");
+    assert!(payload["hideOfficialUsageAlert"].is_boolean());
 
     let repair_response = client
         .post(format!("http://127.0.0.1:{port}/backend/repair"))
@@ -1159,6 +1160,7 @@ async fn official_mix_responses_profile_starts_fixed_protocol_proxy_without_enha
             id: "official-mix".to_string(),
             relay_mode: RelayMode::Official,
             official_mix_api_key: true,
+            hide_official_usage_alert: false,
             protocol: RelayProtocol::Responses,
             ..RelayProfile::default()
         }],
@@ -1232,6 +1234,7 @@ async fn official_mix_responses_profile_keeps_proxy_when_profile_switching_is_di
             id: "official-mix".to_string(),
             relay_mode: RelayMode::Official,
             official_mix_api_key: true,
+            hide_official_usage_alert: false,
             protocol: RelayProtocol::Responses,
             ..RelayProfile::default()
         }],
@@ -1470,6 +1473,7 @@ async fn launch_starts_helper_when_chat_protocol_proxy_is_enabled() {
             protocol: RelayProtocol::ChatCompletions,
             relay_mode: codex_plus_core::settings::RelayMode::MixedApi,
             official_mix_api_key: false,
+            hide_official_usage_alert: false,
             test_model: String::new(),
             config_contents: String::new(),
             auth_contents: String::new(),
