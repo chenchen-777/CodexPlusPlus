@@ -405,6 +405,14 @@ fn launcher_does_not_override_codex_app_environment() {
 }
 
 #[test]
+fn launcher_does_not_prepare_projectless_main_window() {
+    let source = include_str!("../src/launcher.rs");
+
+    assert!(!source.contains("prepare_projectless_main_window_nonfatal"));
+    assert!(!source.contains("launcher.prelaunch"));
+}
+
+#[test]
 fn launcher_windows_process_wait_uses_platform_cfg_guards() {
     let source = include_str!("../src/launcher.rs").replace("\r\n", "\n");
 
