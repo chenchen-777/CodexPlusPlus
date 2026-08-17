@@ -779,6 +779,7 @@
         pointer-events: none;
         white-space: nowrap;
       }
+      [data-codex-plus-usage-alert-hidden="true"] { display: none !important; }
       .codex-archive-delete-all {
         border: 1px solid #ef4444;
         border-radius: 7px;
@@ -2071,6 +2072,7 @@
   let codexPlusBackendSettingsSeq = 0;
   const codexPluginLegacyEntryUnlockBeforeVersion = "26.601.2237";
   const codexPluginBridgeRequestUnlockFromVersion = "26.616.0";
+  const codexPluginBroadCatalogKindsFromVersion = "26.803.0";
 
   function parseCodexVersionParts(version) {
     const raw = String(version || "").trim();
@@ -2121,6 +2123,12 @@
     const comparison = compareCodexVersions(version, codexPluginBridgeRequestUnlockFromVersion);
     if (comparison == null) return "unknown";
     return comparison >= 0 ? "bridge" : "client";
+  }
+
+  function codexPluginUsesBroadCatalogKinds() {
+    const version = String(codexPlusBackendSettings.codexAppVersion || "").trim();
+    const comparison = compareCodexVersions(version, codexPluginBroadCatalogKindsFromVersion);
+    return comparison != null && comparison >= 0;
   }
 
   let codexPlusBackendSettingsLoaded = false;
@@ -4050,10 +4058,24 @@
       next.cwds = [...window.__codexPluginMarketplaceLastCwds];
     }
     const hadMarketplaceKinds = Object.prototype.hasOwnProperty.call(next, "marketplaceKinds");
+    const broadCatalogRequest = codexPluginUsesBroadCatalogKinds()
+      && (!hadMarketplaceKinds || next.marketplaceKinds == null);
+    const remoteCatalogUnavailable = window.__codexPluginMarketplaceRemoteCatalogUnavailable === true;
+    if (broadCatalogRequest && !remoteCatalogUnavailable) {
+      sendCodexPlusDiagnostic("plugin_marketplace_request_expanded", {
+        hadMarketplaceKinds,
+        marketplaceKinds: hadMarketplaceKinds ? next.marketplaceKinds : null,
+        broadCatalogPreserved: true,
+        cwdCount: Array.isArray(next.cwds) ? next.cwds.length : 0,
+        cwdRestored: requestCwds.length === 0 && Array.isArray(next.cwds) && next.cwds.length > 0,
+        remoteCatalogUnavailable,
+        remoteOnly: requestProfile.remoteOnly,
+      });
+      return next;
+    }
     let nextKinds = Array.isArray(next.marketplaceKinds)
       ? next.marketplaceKinds.map((kind) => restorePluginMarketplaceName(kind))
       : ["local"];
-    const remoteCatalogUnavailable = window.__codexPluginMarketplaceRemoteCatalogUnavailable === true;
     if (!requestProfile.remoteOnly && remoteCatalogUnavailable) {
       nextKinds = nextKinds.filter((kind) => kind !== "created-by-me-remote" && kind !== "shared-with-me");
     }
@@ -4065,6 +4087,7 @@
     sendCodexPlusDiagnostic("plugin_marketplace_request_expanded", {
       hadMarketplaceKinds,
       marketplaceKinds: next.marketplaceKinds,
+      broadCatalogPreserved: false,
       cwdCount: Array.isArray(next.cwds) ? next.cwds.length : 0,
       cwdRestored: requestCwds.length === 0 && Array.isArray(next.cwds) && next.cwds.length > 0,
       remoteCatalogUnavailable,
@@ -4671,6 +4694,9 @@
       localFallback: localPluginMarketplaceFallbackResult,
       remoteOnlyFallback: remoteOnlyPluginMarketplaceFallbackResult,
       requestProfile: pluginMarketplaceRequestProfile,
+      setCodexAppVersion: (version) => {
+        codexPlusBackendSettings.codexAppVersion = String(version || "");
+      },
       remoteCatalogUnavailable: () => window.__codexPluginMarketplaceRemoteCatalogUnavailable === true,
       reset: () => {
         delete window.__codexPluginMarketplaceLastCwds;

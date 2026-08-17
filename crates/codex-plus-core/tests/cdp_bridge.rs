@@ -65,8 +65,8 @@ fn injection_script_prefixes_helper_url_and_metadata() {
     assert!(!script.contains("window.__CODEX_PLUS_SPONSOR_IMAGES__"));
     assert!(script.contains("window.__CODEX_PLUS_VERSION__"));
     assert!(script.contains(codex_plus_core::version::VERSION));
-    assert!(script.contains("https://discord.gg/y96kX7A76v"));
-    assert!(script.contains("data-codex-plus-discord"));
+    assert!(!script.contains("discord.gg"));
+    assert!(!script.contains("data-codex-plus-discord"));
 }
 
 #[test]
@@ -816,12 +816,12 @@ fn injection_script_skips_plugin_patch_work_in_relay_mode() {
 }
 
 #[test]
-fn injection_script_omits_plugin_auto_expand() {
+fn injection_script_disables_plugin_auto_expand_in_relay_mode() {
     let script = assets::injection_script(57321);
 
-    assert!(!script.contains("pluginAutoExpand"));
-    assert!(!script.contains("codexPluginAutoExpand"));
-    assert!(!script.contains("plugin_auto_expand"));
+    assert!(script.contains("settings.pluginAutoExpand = false"));
+    assert!(script.contains("if (pluginPatchDisabledInRelayMode()) return"));
+    assert!(script.contains("if (!codexPlusSettings().pluginAutoExpand) return"));
 }
 
 #[test]
@@ -921,7 +921,6 @@ fn injection_script_does_not_bypass_plugin_marketplace_search_filters() {
     assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"15\""));
     assert!(script.contains("isCodexPluginBuildFlavorFilter"));
     assert!(script.contains("source.includes(\"!u(e.marketplaceName)||e.marketplaceName===r\")"));
-    assert!(script.contains("source.includes(\"!Eu(e.marketplaceName)||e.marketplaceName===n\")"));
     assert!(script.contains("source.includes(\"!t.includes(e.name)\")"));
     assert!(!script.contains("if (!source.includes(\"marketplaceName\")) return false"));
     assert!(!script.contains("if (!source.includes(\"name\")) return false"));
@@ -1359,7 +1358,7 @@ fn injection_script_unlocks_custom_model_catalog() {
     assert!(script.contains("loadAppServerRequestCandidates"));
     assert!(script.contains("appServerFallbackAssetUrls"));
     assert!(script.contains("collectAppServerRequestCandidatesFromModule"));
-    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"4\""));
+    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"5\""));
 
     assert!(script.contains("list-models-for-host"));
     assert!(script.contains("appServerModelRequestMethod"));
@@ -1525,18 +1524,12 @@ fn injection_script_refreshes_sidebar_after_undo_without_stale_asset_exports() {
 }
 
 #[test]
-fn injection_script_clears_project_state_when_moving_to_projectless() {
+fn injection_script_omits_removed_project_move_state_handlers() {
     let script = assets::injection_script(57321);
 
-    assert!(script.contains("async function clearThreadWorkspaceHints"));
-    assert!(script.contains("async function clearThreadWritableRoots"));
-    assert!(script.contains("async function clearThreadProjectlessOutputDirectories"));
-    assert!(script.contains("thread-workspace-root-hints"));
-    assert!(script.contains("thread-writable-roots"));
-    assert!(script.contains("thread-projectless-output-directories"));
-    assert!(script.contains("await clearThreadWorkspaceHints(ref)"));
-    assert!(script.contains("await clearThreadWritableRoots(ref)"));
-    assert!(script.contains("await clearThreadProjectlessOutputDirectories(ref)"));
+    assert!(!script.contains("async function clearThreadWorkspaceHints"));
+    assert!(!script.contains("async function clearThreadWritableRoots"));
+    assert!(!script.contains("async function clearThreadProjectlessOutputDirectories"));
 }
 
 #[test]
@@ -1966,7 +1959,7 @@ fn injection_script_leaves_new_threads_to_the_codex_app() {
     assert!(!script.contains("hotkey-window-projectless-default-enabled"));
     assert!(script.contains("installCodexServiceTierDispatcherPatch"));
     assert!(script.contains("installAppServerModelRequestPatch"));
-    assert!(script.contains("originalSendRequest(method, params, options)"));
+    assert!(script.contains("originalSendRequest(method, nextParams, options)"));
 }
 
 #[test]
@@ -2084,15 +2077,16 @@ fn manager_ui_exposes_pure_api_relay_mode_button() {
 }
 
 #[test]
-fn manager_ui_omits_plugin_auto_expand() {
+fn manager_ui_disables_plugin_auto_expand_in_compatible_mode() {
     let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(std::path::Path::parent)
         .expect("core crate should live under crates/codex-plus-core");
     let source = std::fs::read_to_string(repo.join("apps/codex-plus-manager/src/App.tsx")).unwrap();
 
-    assert!(!source.contains("codexAppPluginAutoExpand"));
-    assert!(!source.contains("插件列表全量展示"));
+    assert!(source.contains(
+        "checked={form.codexAppPluginAutoExpand} disabled={!masterEnabled || !patchMode}"
+    ));
 }
 
 #[test]
