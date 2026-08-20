@@ -1,8 +1,38 @@
 use codex_plus_core::update::{
-    Release, download_asset_to, is_newer_version, parse_version_tag, release_from_github_payload,
-    release_from_latest_json_payload, safe_asset_name, select_update_asset,
+    DEFAULT_LATEST_JSON_URL, DEFAULT_REPOSITORY, FALLBACK_LATEST_JSON_URL,
+    FALLBACK_MIRROR_PREFIX, Release, download_asset_to, fallback_mirror_url, is_newer_version,
+    parse_version_tag, release_from_github_payload, release_from_latest_json_payload,
+    safe_asset_name, select_update_asset,
 };
 use serde_json::json;
+
+#[test]
+fn default_update_channel_stays_on_the_777_fork() {
+    assert_eq!(DEFAULT_REPOSITORY, "chenchen-777/CodexPlusPlus");
+    assert_eq!(
+        DEFAULT_LATEST_JSON_URL,
+        "https://github.com/chenchen-777/CodexPlusPlus/releases/latest/download/latest.json"
+    );
+    assert!(!DEFAULT_LATEST_JSON_URL.contains("BigPizzaV3"));
+    assert_eq!(
+        FALLBACK_LATEST_JSON_URL,
+        "https://gh-proxy.com/https://github.com/chenchen-777/CodexPlusPlus/releases/latest/download/latest.json"
+    );
+    assert!(!FALLBACK_LATEST_JSON_URL.contains("BigPizzaV3"));
+}
+
+#[test]
+fn fallback_mirror_only_wraps_777_release_urls() {
+    let asset = "https://github.com/chenchen-777/CodexPlusPlus/releases/download/v1.2.44.7771/CodexPlusPlus-1.2.44.7771-windows-x64-setup.exe";
+    assert_eq!(
+        fallback_mirror_url(asset).as_deref(),
+        Some(
+            "https://gh-proxy.com/https://github.com/chenchen-777/CodexPlusPlus/releases/download/v1.2.44.7771/CodexPlusPlus-1.2.44.7771-windows-x64-setup.exe"
+        )
+    );
+    assert!(fallback_mirror_url("https://github.com/BigPizzaV3/CodexPlusPlus/releases/download/v1.2.44/file.exe").is_none());
+    assert!(FALLBACK_MIRROR_PREFIX.starts_with("https://"));
+}
 
 #[test]
 fn parse_version_tag_accepts_prefix_and_suffix() {

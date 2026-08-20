@@ -208,6 +208,7 @@ type BackendSettings = {
   relayProfilesEnabled: boolean;
   enhancementsEnabled: boolean;
   codexAppPluginMarketplaceUnlock: boolean;
+  codexAppPluginAutoExpand: boolean;
   codexAppModelWhitelistUnlock: boolean;
   codexAppSessionDelete: boolean;
   codexAppMarkdownExport: boolean;
@@ -708,22 +709,6 @@ type UpdateResult = CommandResult<{
   progress?: number;
 }>;
 
-type AdItem = {
-  id?: string;
-  type: "sponsor" | "normal" | string;
-  title: string;
-  description: string;
-  url: string;
-  image?: string;
-  highlights?: string[];
-  expires_at?: string;
-};
-
-type AdsResult = CommandResult<{
-  version: number;
-  ads: AdItem[];
-}>;
-
 type ScriptMarketItem = {
   id: string;
   name: string;
@@ -817,7 +802,7 @@ type StartupResult = CommandResult<{
   showUpdate: boolean;
 }>;
 
-type Route = "overview" | "relay" | "relayEnvironment" | "sessions" | "context" | "weixin" | "enhance" | "dreamSkin" | "zedRemote" | "userScripts" | "recommendations" | "maintenance" | "about" | "settings";
+type Route = "overview" | "relay" | "relayEnvironment" | "sessions" | "context" | "weixin" | "enhance" | "dreamSkin" | "zedRemote" | "userScripts" | "maintenance" | "about" | "settings";
 type Theme = "dark" | "light";
 
 const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string }> = [
@@ -830,7 +815,6 @@ const routes: Array<{ id: Route; label: string; icon: LucideIcon; badge?: string
   { id: "dreamSkin", label: t("皮肤管理"), icon: Palette },
   { id: "zedRemote", label: t("Zed 远程项目"), icon: ExternalLink },
   { id: "userScripts", label: t("脚本市场"), icon: FileCode2 },
-  { id: "recommendations", label: t("推荐内容"), icon: ExternalLink },
   { id: "maintenance", label: t("安装维护"), icon: Wrench },
   { id: "about", label: t("关于"), icon: Info },
   { id: "settings", label: t("设置"), icon: Settings },
@@ -848,7 +832,7 @@ const navigationSections: Array<{ label: string; routes: Route[]; placement?: "b
   },
   {
     label: t("系统"),
-    routes: ["recommendations", "maintenance", "about", "settings"],
+    routes: ["maintenance", "about", "settings"],
     placement: "bottom",
   },
 ];
@@ -863,6 +847,7 @@ const defaultSettings: BackendSettings = {
   relayProfilesEnabled: true,
   enhancementsEnabled: true,
   codexAppPluginMarketplaceUnlock: true,
+  codexAppPluginAutoExpand: true,
   codexAppModelWhitelistUnlock: true,
   codexAppSessionDelete: true,
   codexAppMarkdownExport: true,
@@ -1002,7 +987,6 @@ export function App() {
     percent: 0,
     message: t("尚未运行安装包更新。"),
   });
-  const [ads, setAds] = useState<AdsResult | null>(null);
   const [scriptMarket, setScriptMarket] = useState<ScriptMarketResult | null>(null);
   const [launchForm, setLaunchForm] = useState({
     appPath: "",
@@ -1860,7 +1844,6 @@ export function App() {
       await refreshScriptMarket(true);
       await refreshUserScriptInventory();
     }
-    if (next === "recommendations") await refreshAds(true);
     if (next === "about") {
       await refreshOverview(true);
       await refreshLogs(true);
@@ -2255,14 +2238,6 @@ export function App() {
       setSettings(result);
       setSettingsForm(normalizeSettings(result.settings));
       showNotice(t("图片覆盖层"), result.message, result.status);
-    }
-  };
-
-  const refreshAds = async (silent = false) => {
-    const result = await run(() => call<AdsResult>("load_ads"));
-    if (result) {
-      setAds(result);
-      if (!silent) showResultNotice(t("推荐内容"), result, { silentSuccess: true });
     }
   };
 
@@ -3006,7 +2981,6 @@ export function App() {
       importCcsProviders,
       refreshLiveContextEntries,
       syncLiveContextEntries,
-      refreshAds,
       refreshScriptMarket,
       refreshUserScriptInventory,
       installMarketScript,
@@ -3234,7 +3208,6 @@ export function App() {
             <ZedRemoteScreen projects={zedRemoteProjects} form={settingsForm} onFormChange={setSettingsForm} actions={actions} />
           ) : null}
           {route === "userScripts" ? <UserScriptsScreen settings={settings} market={scriptMarket} actions={actions} /> : null}
-          {route === "recommendations" ? <RecommendationsScreen ads={ads} actions={actions} /> : null}
           {route === "maintenance" ? (
             <MaintenanceScreen
               overview={overview}
@@ -3396,7 +3369,6 @@ type Actions = {
   importCcsProviders: () => Promise<void>;
   refreshLiveContextEntries: () => Promise<LiveContextEntriesResult | null>;
   syncLiveContextEntries: (settings: BackendSettings, silent?: boolean) => Promise<LiveContextEntriesResult | null>;
-  refreshAds: () => Promise<void>;
   refreshScriptMarket: () => Promise<void>;
   refreshUserScriptInventory: () => Promise<SettingsResult | null>;
   installMarketScript: (id: string) => Promise<void>;
@@ -3907,40 +3879,6 @@ function OverviewScreen({
   const health = healthItems(overview);
   return (
     <>
-      <Panel className="jojocode-overview">
-        <CardContent>
-          <div className="jojocode-overview-layout">
-            <div className="jojocode-overview-main">
-              <div className="jojocode-overview-mark">
-                <Network className="h-5 w-5" />
-              </div>
-              <div>
-                <span className="eyebrow">{t("项目赞助商")}</span>
-                <h2>JOJO Code</h2>
-                <p>
-                  {t("JOJO Code 提供稳定、价格合理的 API 中转服务，支持 GPT-5.6 全系列、Fable 5、Sonnet 5、GPT-5.5、GPT-5.4、Claude Opus 4.8、Claude Opus 4.7、gpt-image-2 等模型与图像能力。")}
-                </p>
-              </div>
-            </div>
-            <div className="jojocode-overview-side">
-              <div className="jojocode-model-tags">
-                <span>GPT-5.6 全系列</span>
-                <span>Fable 5</span>
-                <span>Sonnet 5</span>
-                <span>GPT-5.5</span>
-                <span>GPT-5.4</span>
-                <span>Opus 4.8</span>
-                <span>Opus 4.7</span>
-                <span>gpt-image-2</span>
-              </div>
-              <Button onClick={() => void actions.openExternalUrl("https://jojocode.com/")}>
-                <ExternalLink className="h-4 w-4" />
-                {t("打开 JOJO Code")}
-              </Button>
-            </div>
-          </div>
-        </CardContent>
-      </Panel>
       <Panel>
         <CardHead title={t("健康检查")} detail={t("概览只展示关键问题，具体配置在对应页面处理")} />
         <CardContent>
@@ -4361,6 +4299,7 @@ function EnhanceScreen({
           <div className="enhance-feature-groups">
             <FeatureGroup title={t("插件与模型")} detail={t("管理插件市场、模型列表和服务档位相关增强。")}>
               <FeatureToggle title={t("插件市场解锁")} detail={t("API Key 模式下扩展插件市场请求，尽量显示完整插件列表；官方/混合模式通常不需要。")} checked={form.codexAppPluginMarketplaceUnlock} disabled={!masterEnabled || !patchMode} onChange={(value) => setEnhanceFlag("codexAppPluginMarketplaceUnlock", value)} />
+              <FeatureToggle title={t("插件列表全量展示")} detail={t("进入插件页后自动连续展开“更多”，尽量一次显示完整插件列表。")} checked={form.codexAppPluginAutoExpand} disabled={!masterEnabled || !patchMode} onChange={(value) => setEnhanceFlag("codexAppPluginAutoExpand", value)} />
               <FeatureToggle title={t("模型白名单解锁")} detail={t("从环境变量和 config.toml 的 /v1/models 拉取模型并补进模型列表。")} checked={form.codexAppModelWhitelistUnlock} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppModelWhitelistUnlock", value)} />
               <FeatureToggle title={t("Fast 按钮")} detail={t("显示服务模式切换按钮；Fast 仅支持 gpt-5.4 / gpt-5.5，其他模型按 Standard 发送。")} checked={form.codexAppServiceTierControls} disabled={!masterEnabled} onChange={(value) => setEnhanceFlag("codexAppServiceTierControls", value)} />
               <div className="feature-action-row">
@@ -5930,43 +5869,6 @@ function SessionsScreen({
   );
 }
 
-function RecommendationsScreen({ ads, actions }: { ads: AdsResult | null; actions: Actions }) {
-  const items = (ads?.ads ?? []).filter((ad) => !isExpiredAd(ad));
-  const sponsors = items.filter((ad) => ad.type === "sponsor");
-  const normal = items.filter((ad) => ad.type === "normal");
-  return (
-    <>
-      <Panel>
-        <CardHead title={t("推荐内容")} detail={t("与 Codex 内插件菜单使用同一个远端广告源")} />
-        <CardContent>
-          <div className="recommend-hero">
-            <div>
-              <strong>{ads ? tf("已加载 {0} 条推荐", [items.length]) : t("尚未加载推荐内容")}</strong>
-              <span>{t("内容来自 BigPizzaV3/Ad-List，分为赞助商推荐和普通推荐。")}</span>
-            </div>
-            <Button onClick={() => void actions.refreshAds()}>
-              <RefreshCw className="h-4 w-4" />
-              {t("刷新推荐")}
-            </Button>
-          </div>
-        </CardContent>
-      </Panel>
-      <Panel>
-        <CardHead title={t("赞助商推荐")} detail={tf("{0} 条", [sponsors.length])} />
-        <CardContent>
-          <AdGrid actions={actions} ads={sponsors} empty={t("暂无赞助商推荐。")} />
-        </CardContent>
-      </Panel>
-      <Panel>
-        <CardHead title={t("普通推荐")} detail={tf("{0} 条", [normal.length])} />
-        <CardContent>
-          <AdGrid actions={actions} ads={normal} empty={t("暂无普通推荐。")} />
-        </CardContent>
-      </Panel>
-    </>
-  );
-}
-
 function MaintenanceScreen({
   overview,
   watcher,
@@ -6109,24 +6011,12 @@ function AboutScreen({
           <div className="metric-list">
             <Metric label={t("Codex++ 版本")} value={overview?.current_version ?? update?.currentVersion ?? "-"} />
             <Metric label={t("Codex 版本")} value={overview?.codex_version ?? t("未检测到")} />
-            <Metric label={t("项目地址")} value="github.com/BigPizzaV3/CodexPlusPlus" />
+            <Metric label={t("项目地址")} value="github.com/chenchen-777/CodexPlusPlus" />
           </div>
           <Toolbar>
-            <Button onClick={() => void actions.openExternalUrl("https://github.com/BigPizzaV3/CodexPlusPlus")} variant="secondary">
+            <Button onClick={() => void actions.openExternalUrl("https://github.com/chenchen-777/CodexPlusPlus")} variant="secondary">
               <ExternalLink className="h-4 w-4" />
-              {t("打开项目主页")}
-            </Button>
-            <Button onClick={() => void actions.openExternalUrl("https://github.com/BigPizzaV3/CodexPlusPlus/issues")} variant="secondary">
-              <ExternalLink className="h-4 w-4" />
-              {t("反馈问题")}
-            </Button>
-            <Button onClick={() => void actions.openExternalUrl("https://discord.gg/y96kX7A76v")} variant="secondary">
-              <MessageCircle className="h-4 w-4" />
-              Discord
-            </Button>
-            <Button onClick={() => void actions.openExternalUrl("https://t.me/CodexPlusPlus")} variant="secondary">
-              <MessageCircle className="h-4 w-4" />
-              Telegram
+              {t("打开项目仓库")}
             </Button>
           </Toolbar>
         </CardContent>
@@ -6679,9 +6569,6 @@ function RelayProfileDetail({
   const [modelWindowRows, setModelWindowRows] = useState<ModelWindowRow[]>(
     modelWindowRowsFromProfile(profile.modelList, profile.modelWindows || "", profile.modelVlm),
   );
-  const [doctorResult, setDoctorResult] = useState<ProviderDoctorResult | null>(null);
-  const [doctorOpen, setDoctorOpen] = useState(false);
-  const [doctorRunning, setDoctorRunning] = useState(false);
   const isActive = !isNew && profile.id === form.activeRelayId;
   const profileUsesLiveFiles = relayProfileUsesLiveFiles(profile);
   useEffect(() => {
@@ -6759,68 +6646,21 @@ function RelayProfileDetail({
     });
     void actions.switchRelayProfile(next, previousActiveRelayId);
   };
-  const runProviderDoctor = async () => {
-    setDoctorOpen(true);
-    setDoctorRunning(true);
-    setDoctorResult(null);
-    const draftWithWindows = draftWithModelRows();
-    const result = await actions.diagnoseRelayProfile(deriveRelayProfileFromFiles(draftWithWindows));
-    setDoctorResult(result);
-    setDoctorRunning(false);
-  };
-  const aggregateProfile = isAggregateRelayProfile(draft);
-  const showDoctor = !aggregateProfile && (draft.relayMode !== "official" || draft.officialMixApiKey);
-  const detailStatus = aggregateProfile
-    ? isNew
-      ? t("选择已有供应商作为成员，保存后写入 settings payload")
-      : t("聚合配置只引用已有供应商，不复制 Key 和配置文件")
-    : relayProfileEditorStatus(draft, form, isNew);
   return (
     <div className="relay-detail-page" key={profile.id}>
       <div className="relay-detail-sticky">
-        <div className="relay-editor-heading">
-          <Button aria-label={t("返回列表")} onClick={onBack} size="icon" title={t("返回列表")} type="button" variant="ghost">
+        <Toolbar>
+          <Button onClick={onBack} variant="secondary">
             <ArrowLeft className="h-4 w-4" />
+            {t("返回列表")}
           </Button>
-          <div className="relay-editor-heading-copy">
-            <strong>{draft.name || (aggregateProfile ? t("未命名聚合供应商") : t("未命名供应商"))}</strong>
-            <span>{detailStatus}</span>
-          </div>
-        </div>
-        <div className="relay-editor-actions">
-          {showDoctor ? (
-            <Button disabled={doctorRunning} onClick={() => void runProviderDoctor()} type="button" variant="secondary">
-              <Stethoscope className="h-4 w-4" />
-              {doctorRunning ? t("诊断中") : t("诊断供应商")}
-            </Button>
-          ) : null}
-          {aggregateProfile ? (
-            <UiBadge variant="secondary">{t("聚合")}</UiBadge>
-          ) : isNew ? null : (
-            <Button
-              disabled={!form.relayProfilesEnabled || actions.relaySwitching}
-              onClick={switchDraft}
-              title={!form.relayProfilesEnabled ? t("供应商配置总开关已关闭") : actions.relaySwitching ? t("供应商切换中") : undefined}
-              variant={draft.id === form.activeRelayId ? "secondary" : "default"}
-            >
-              {actions.relaySwitching ? t("切换中") : draft.id === form.activeRelayId ? t("使用中") : t("设为当前")}
-            </Button>
-          )}
-          <Button disabled={!!validationError} onClick={() => void saveDraft()} title={validationError || t("保存")} type="button">
+          <Button disabled={!!validationError} onClick={() => void saveDraft()} title={validationError || t("保存")}>
             <Save className="h-4 w-4" />
             {t("保存")}
           </Button>
-        </div>
+        </Toolbar>
       </div>
-      <RelayProfileEditor
-        profile={draft}
-        form={form}
-        isNew={isNew}
-        onProfileChange={setDraft}
-        actions={actions}
-        modelWindowRows={modelWindowRows}
-        setModelWindowRows={setModelWindowRows}
-      />
+        <RelayProfileEditor profile={draft} form={form} isNew={isNew} onProfileChange={setDraft} onSwitch={switchDraft} actions={actions} modelWindowRows={modelWindowRows} setModelWindowRows={setModelWindowRows} />
       {isAggregateRelayProfile(draft) ? null : (
       <RelayFileEditors
         contextProfile={profile}
@@ -6833,15 +6673,6 @@ function RelayProfileDetail({
         actions={actions}
       />
       )}
-      {doctorOpen ? (
-        <ProviderDoctorModal
-          result={doctorResult}
-          running={doctorRunning}
-          onClose={() => {
-            if (!doctorRunning) setDoctorOpen(false);
-          }}
-        />
-      ) : null}
     </div>
   );
 }
@@ -6880,6 +6711,7 @@ function RelayProfileEditor({
   form,
   isNew = false,
   onProfileChange,
+  onSwitch,
   actions,
   modelWindowRows,
   setModelWindowRows,
@@ -6888,11 +6720,15 @@ function RelayProfileEditor({
   form: BackendSettings;
   isNew?: boolean;
   onProfileChange: (value: RelayProfile) => void;
+  onSwitch: () => void;
   actions: Actions;
   modelWindowRows: ModelWindowRow[];
   setModelWindowRows: (value: ModelWindowRow[]) => void;
 }) {
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [doctorResult, setDoctorResult] = useState<ProviderDoctorResult | null>(null);
+  const [doctorOpen, setDoctorOpen] = useState(false);
+  const [doctorRunning, setDoctorRunning] = useState(false);
   // VLM/Strip 对 Chat Completions 与 Responses 协议均可用(注入块类型已按协议适配)。
   const vlmUnsupportedProtocol = false;
   if (isAggregateRelayProfile(profile)) {
@@ -6900,6 +6736,7 @@ function RelayProfileEditor({
       <AggregateRelayProfileEditor
         profile={profile}
         form={form}
+        isNew={isNew}
         onProfileChange={onProfileChange}
       />
     );
@@ -6937,6 +6774,21 @@ function RelayProfileEditor({
   const addModelWindowRows = (rows: ModelWindowRow[]) => {
     setModelWindowRows(mergeModelWindowRows(modelWindowRows, rows));
   };
+  const runProviderDoctor = async () => {
+    setDoctorOpen(true);
+    setDoctorRunning(true);
+    setDoctorResult(null);
+    const serializedRows = serializeModelWindowRows(modelWindowRows);
+    const result = await actions.diagnoseRelayProfile(
+      deriveRelayProfileFromFiles({
+        ...profile,
+        modelList: serializedRows.modelList,
+        modelWindows: serializedRows.modelWindows,
+      }),
+    );
+    setDoctorResult(result);
+    setDoctorRunning(false);
+  };
   const fetchSub2ApiRate = async () => {
     const result = await actions.fetchSub2ApiBilling(deriveRelayProfileFromFiles(profile));
     if (!result) return;
@@ -6947,6 +6799,22 @@ function RelayProfileEditor({
   };
   return (
     <div className="relay-profile-editor">
+      <div className="relay-editor-head">
+        <div>
+          <strong>{profile.name || t("未命名供应商")}</strong>
+          <span>{relayProfileEditorStatus(profile, form, isNew)}</span>
+        </div>
+        {isNew ? null : (
+          <Button
+            disabled={!form.relayProfilesEnabled || actions.relaySwitching}
+            onClick={onSwitch}
+            title={!form.relayProfilesEnabled ? t("供应商配置总开关已关闭") : actions.relaySwitching ? t("供应商切换中") : undefined}
+            variant={profile.id === form.activeRelayId ? "secondary" : "default"}
+          >
+            {actions.relaySwitching ? t("切换中") : profile.id === form.activeRelayId ? t("使用中") : t("设为当前")}
+          </Button>
+        )}
+      </div>
       {isNew ? (
         <ProviderPresetSelector
           onSelect={(patch: PresetPatch) => {
@@ -7300,6 +7168,22 @@ function RelayProfileEditor({
                 </div>
               ))}
             </div>
+            <div className="relay-model-list-tools">
+              <Button
+                disabled={modelRouteTargets.length === 0}
+                onClick={() => updateDraft({ modelRoutes: [...modelRoutes, { model: "", targetRelayId: "", targetModel: "" }] })}
+                size="sm"
+                title={modelRouteTargets.length === 0 ? t("请先创建一个 Responses API 目标供应商") : t("添加模型路由")}
+                type="button"
+                variant="secondary"
+              >
+                <Plus className="h-4 w-4" />
+                {t("添加模型路由")}
+              </Button>
+            </div>
+            <p className="field-hint">
+              {t("仅在当前供应商启用时生效；精确匹配模型名并使用目标供应商的 URL 与 Key。目标必须是 Responses API，且需要从 Codex++ 启动。")}
+            </p>
           </section>
         ) : null}
         {showApiFields && modelWindowRows.some((row) => row.imageHandling === "vlm") ? (
@@ -7357,6 +7241,15 @@ function RelayProfileEditor({
         <ShieldCheck className="h-4 w-4" />
         <span>{relayProfileModeHelp(profile)}</span>
       </div>
+      {doctorOpen ? (
+        <ProviderDoctorModal
+          result={doctorResult}
+          running={doctorRunning}
+          onClose={() => {
+            if (!doctorRunning) setDoctorOpen(false);
+          }}
+        />
+      ) : null}
     </div>
   );
 }
@@ -7364,10 +7257,12 @@ function RelayProfileEditor({
 function AggregateRelayProfileEditor({
   profile,
   form,
+  isNew = false,
   onProfileChange,
 }: {
   profile: RelayProfile;
   form: BackendSettings;
+  isNew?: boolean;
   onProfileChange: (value: RelayProfile) => void;
 }) {
   const candidates = aggregateMemberCandidates(form, profile.id);
@@ -7394,6 +7289,13 @@ function AggregateRelayProfileEditor({
 
   return (
     <div className="relay-profile-editor aggregate-editor">
+      <div className="relay-editor-head">
+        <div>
+          <strong>{profile.name || t("未命名聚合供应商")}</strong>
+          <span>{isNew ? t("选择已有供应商作为成员，保存后写入 settings payload") : t("聚合配置只引用已有供应商，不复制 Key 和配置文件")}</span>
+        </div>
+        <UiBadge variant="secondary">{t("聚合")}</UiBadge>
+      </div>
       <div className="relay-fields aggregate-fields">
         <Field className="relay-field-name" label={t("名称")}>
           <Input
@@ -7505,18 +7407,10 @@ function RelayContextManager({
   const visibleEntries = contextEntriesByKind(entries, activeKind);
   const label = contextKindLabel(activeKind);
 
-  const syncContextEntries = async (next: BackendSettings) => {
-    const syncResult = await actions.syncLiveContextEntries(next, true);
-    if (!syncResult || !isSuccessStatus(syncResult.status)) return false;
-    await actions.refreshRelayFiles();
-    return true;
-  };
-
   const saveEntry = async (kind: ContextKind, id: string, tomlBody: string) => {
     const next = await actions.upsertContextEntry(form, kind, id, tomlBody);
     if (!next) return;
     onFormChange(next);
-    if (!(await syncContextEntries(next))) return;
     setEditor(null);
   };
 
@@ -7525,14 +7419,16 @@ function RelayContextManager({
     const next = await actions.upsertContextEntry(form, entry.kind, entry.id, nextBody);
     if (!next) return;
     onFormChange(next);
-    await syncContextEntries(next);
+    const syncResult = await actions.syncLiveContextEntries(next, true);
+    if (syncResult && isSuccessStatus(syncResult.status)) {
+      void actions.refreshRelayFiles();
+    }
   };
 
   const deleteEntry = async (entry: CodexContextEntry) => {
     const next = await actions.deleteContextEntry(form, entry.kind, entry.id);
     if (!next) return;
     onFormChange(next);
-    await syncContextEntries(next);
   };
 
   return (
@@ -8475,44 +8371,6 @@ function ScriptRow({ script, actions }: { script: NonNullable<UserScriptInventor
   );
 }
 
-function AdGrid({ ads, empty, actions }: { ads: AdItem[]; empty: string; actions: Actions }) {
-  if (!ads.length) return <div className="empty">{empty}</div>;
-  return (
-    <div className="ad-grid">
-      {ads.map((ad) => (
-        <button className="ad-card" key={ad.id || `${ad.type}-${ad.title}`} onClick={() => void actions.openExternalUrl(ad.url)} type="button">
-          {ad.image ? <img alt="" className="ad-image" src={ad.image} /> : null}
-          <div className="ad-content">
-            <strong>{formatAdTitle(ad.title)}</strong>
-            <p>{ad.description}</p>
-          </div>
-          {ad.highlights?.length ? (
-            <div className="ad-tags">
-              {ad.highlights.map((item) => (
-                <span key={item}>{item}</span>
-              ))}
-            </div>
-          ) : null}
-          <span className="ad-link">
-            {t("打开")}
-            <ExternalLink className="h-4 w-4" />
-          </span>
-        </button>
-      ))}
-    </div>
-  );
-}
-
-function formatAdTitle(title: string) {
-  return title.split(/[｜|]/, 1)[0].trim() || title;
-}
-
-function isExpiredAd(ad: AdItem) {
-  if (!ad.expires_at) return false;
-  const expiresAt = Date.parse(ad.expires_at);
-  return Number.isFinite(expiresAt) && expiresAt < Date.now();
-}
-
 function routeTitle(route: Route) {
   return routes.find((item) => item.id === route)?.label ?? t("概览");
 }
@@ -8529,7 +8387,6 @@ function routeSubtitle(route: Route) {
     dreamSkin: t("Codex-Dream-Skin 风格主题和换图"),
     zedRemote: t("管理 Codex SSH 项目并加入 Zed workspace"),
     userScripts: t("内置和用户自定义脚本清单"),
-    recommendations: t("赞助商推荐与普通推荐"),
     maintenance: t("入口安装、修复、Watcher 与手动启动"),
     about: t("版本信息、项目链接、GitHub Release 更新、日志与诊断"),
     settings: t("主题和启动参数"),
@@ -9199,7 +9056,7 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
     relayCommonConfigContents,
     relayContextConfigContents,
   });
-  const profiles =
+  const loadedProfiles =
     settings.relayProfiles?.length
       ? settings.relayProfiles.map((profile) =>
           normalizeRelayProfile(hydrateAggregateRelayProfile(profile, backendAggregates.get(profile.id)), defaultContextSelection),
@@ -9235,6 +9092,7 @@ function normalizeSettings(settings: BackendSettings): BackendSettings {
             sub2apiMultiplier: "",
           },
         ];
+  const profiles = loadedProfiles;
   const activeRelayId = profiles.some((profile) => profile.id === settings.activeRelayId)
     ? settings.activeRelayId
     : profiles[0]?.id || "default";

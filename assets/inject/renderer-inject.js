@@ -469,6 +469,9 @@
   const codexAppServerModelRequestPatchVersion = "5";
   const codexRemoteSessionRecoveryVersion = "4";
   const codexPluginMarketplaceUnlockVersion = "15";
+  const codexPluginAutoExpandVersion = "1";
+  const codexPluginAutoExpandMaxClicks = 80;
+  const codexPluginAutoExpandClickDelayMs = 90;
   const codexThreadScrollMaxEntries = 120;
   const codexThreadScrollSaveThrottleMs = 120;
   const codexThreadScrollRestoreWindowMs = 3200;
@@ -991,6 +994,7 @@
         pointer-events: auto;
         -webkit-app-region: no-drag;
       }
+      .codex-plus-modal-content[data-codex-plus-active-tab="support"] { width: min(820px, calc(100vw - 48px)); }
       .codex-plus-modal-header {
         display: flex;
         align-items: center;
@@ -1173,30 +1177,17 @@
       .codex-plus-user-script-error { margin-top: 2px; color: #f87171; font-size: 11px; word-break: break-all; }
       .codex-plus-user-script-actions { display: grid; justify-items: end; gap: 8px; min-width: 120px; }
       .codex-plus-user-script-reload { border: 1px solid rgba(255,255,255,.18); border-radius: 7px; background: #3f3f46; color: #f3f4f6; font: 12px system-ui, sans-serif; padding: 6px 8px; }
-      .codex-plus-sponsor-text { color: #d1d5db; font-size: 13px; line-height: 1.55; margin: 4px 0 12px; }
-      .codex-plus-ad-section { display: grid; gap: 10px; margin-top: 12px; }
-      .codex-plus-ad-section:first-of-type { margin-top: 0; }
-      .codex-plus-ad-section-title { color: #f8fafc; font-size: 15px; margin: 0; }
-      .codex-plus-ad-list { display: grid; gap: 14px; }
-      .codex-plus-ad-card { border: 1px solid rgba(96,165,250,.26); border-radius: 16px; background: linear-gradient(135deg, rgba(37,99,235,.18), rgba(255,255,255,.05)); box-shadow: 0 14px 36px rgba(0,0,0,.22); }
-      .codex-plus-ad-image { display: block; width: calc(100% - 28px); aspect-ratio: 16 / 5; margin: 14px 14px 0; border: 1px solid rgba(255,255,255,.14); border-radius: 10px; background: #080808; object-fit: cover; }
-      .codex-plus-ad-content { padding: 14px; }
-      .codex-plus-ad-title { margin: 0; overflow: hidden; color: #f8fafc; font-size: 17px; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
-      .codex-plus-ad-description { display: -webkit-box; margin: 6px 0 10px; overflow: hidden; color: #dbeafe; font-size: 13px; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-height: 1.55; }
-      .codex-plus-ad-highlights { display: flex; flex-wrap: wrap; gap: 6px; max-height: 56px; margin-bottom: 12px; overflow: hidden; }
-      .codex-plus-ad-highlights span { border: 1px solid rgba(255,255,255,.14); border-radius: 999px; background: rgba(255,255,255,.08); color: #f3f4f6; font-size: 12px; padding: 4px 8px; }
-      .codex-plus-ad-link { display: inline-flex; align-items: center; justify-content: center; border-radius: 9px; background: #2563eb; color: #ffffff; font-size: 13px; font-weight: 650; text-decoration: none; padding: 8px 12px; }
-      .codex-plus-ad-empty { border: 1px dashed rgba(255,255,255,.16); border-radius: 12px; color: #9ca3af; font-size: 13px; padding: 12px; text-align: center; }
     `;
     document.documentElement.appendChild(style);
   }
 
   function defaultCodexPlusSettings() {
-    return { pluginMarketplaceUnlock: true, modelWhitelistUnlock: true, sessionDelete: true, markdownExport: true, pasteFix: false, threadIdBadge: false, conversationView: false, conversationViewMaxWidth: conversationViewDefaultWidth, threadScrollRestore: true, zedRemoteOpen: true, upstreamWorktreeCreate: true, nativeMenuPlacement: true, serviceTierControls: false, petRealMouseLook: false, stepwise: false, dreamSkinEnabled: false, dreamSkinPaused: false, dreamSkinThemeConfig: window.__CODEX_PLUS_DREAM_SKIN_THEME__ || {}, dreamSkinImagePath: "" };
+    return { pluginMarketplaceUnlock: true, pluginAutoExpand: true, modelWhitelistUnlock: true, sessionDelete: true, markdownExport: true, pasteFix: false, threadIdBadge: false, conversationView: false, conversationViewMaxWidth: conversationViewDefaultWidth, threadScrollRestore: true, zedRemoteOpen: true, upstreamWorktreeCreate: true, nativeMenuPlacement: true, serviceTierControls: false, petRealMouseLook: false, stepwise: false, dreamSkinEnabled: false, dreamSkinPaused: false, dreamSkinThemeConfig: window.__CODEX_PLUS_DREAM_SKIN_THEME__ || {}, dreamSkinImagePath: "" };
   }
 
   const codexPlusBackendSettingMap = {
     pluginMarketplaceUnlock: "codexAppPluginMarketplaceUnlock",
+    pluginAutoExpand: "codexAppPluginAutoExpand",
     modelWhitelistUnlock: "codexAppModelWhitelistUnlock",
     sessionDelete: "codexAppSessionDelete",
     markdownExport: "codexAppMarkdownExport",
@@ -1233,6 +1224,7 @@
     if (codexPlusBackendSettings.enhancementsEnabled === false) {
       return {
         pluginMarketplaceUnlock: false,
+        pluginAutoExpand: false,
         modelWhitelistUnlock: false,
         sessionDelete: false,
         markdownExport: false,
@@ -1257,12 +1249,14 @@
       const settings = { ...defaultCodexPlusSettings(), ...JSON.parse(localStorage.getItem(codexPlusSettingsKey) || "{}"), ...backendCodexPlusSettings() };
       if (relayPatchDisabled) {
         settings.pluginMarketplaceUnlock = false;
+        settings.pluginAutoExpand = false;
       }
       return settings;
     } catch {
       const settings = { ...defaultCodexPlusSettings(), ...backendCodexPlusSettings() };
       if (relayPatchDisabled) {
         settings.pluginMarketplaceUnlock = false;
+        settings.pluginAutoExpand = false;
       }
       return settings;
     }
@@ -1677,9 +1671,6 @@
       "--dream-skin-project-label",
     ].forEach((name) => root?.style.removeProperty(name));
     document.querySelectorAll(".dream-home").forEach((node) => node.classList.remove("dream-home"));
-    document.querySelectorAll('[role="main"][data-dream-home-layout]').forEach((node) => {
-      node.removeAttribute("data-dream-home-layout");
-    });
     document.querySelectorAll(".dream-home-shell").forEach((node) => node.classList.remove("dream-home-shell"));
     document.querySelectorAll(".dream-skin-home").forEach((node) => node.classList.remove("dream-skin-home"));
     document.querySelectorAll(".dream-skin-home-shell").forEach((node) => node.classList.remove("dream-skin-home-shell"));
@@ -1857,41 +1848,21 @@
       ensureDreamSkinCompanion(theme);
 
       const homeIndicator = document.querySelector('[data-testid="home-icon"]');
-      const homeCandidate = homeIndicator?.closest('[role="main"]')
+      const home = homeIndicator?.closest('[role="main"]')
         || [...document.querySelectorAll('[role="main"]')].find((candidate) =>
           candidate.querySelector('[data-feature="game-source"]')
           && candidate.querySelector('.group\\/home-suggestions'))
         || null;
-      const homeHasClassicChrome = !!(
-        homeCandidate
-        && homeCandidate.querySelector('[data-feature="game-source"]')
-        && (
-          homeCandidate.querySelector('.group\\/home-suggestions')
-          || homeCandidate.querySelector('[class*="home-suggestions"]')
-          || homeCandidate.querySelector('[class*="_homeUtilityBar_"]')
-        )
-      );
-      const home = homeHasClassicChrome ? homeCandidate : null;
       for (const candidate of document.querySelectorAll(`[role="main"].${descriptor.homeClass}`)) {
-        if (candidate !== home && candidate !== homeCandidate) candidate.classList.remove(descriptor.homeClass);
+        if (candidate !== home) candidate.classList.remove(descriptor.homeClass);
       }
       if (home) home.classList.add(descriptor.homeClass);
-      else if (homeCandidate && descriptor.homeClass) homeCandidate.classList.add(descriptor.homeClass);
       if (descriptor.taskClass) {
         for (const candidate of document.querySelectorAll('[role="main"]')) {
-          candidate.classList.toggle(descriptor.taskClass, candidate !== home && candidate !== homeCandidate);
+          candidate.classList.toggle(descriptor.taskClass, candidate !== home);
         }
       }
-      for (const candidate of document.querySelectorAll('[role="main"]')) {
-        if (candidate === home) {
-          const hero = candidate.querySelector(':scope > div > div > div');
-          const structured = !!(hero && hero.querySelector('[data-feature="game-source"], [data-testid="home-icon"]'));
-          candidate.setAttribute('data-dream-home-layout', structured ? 'structured' : 'soft');
-        } else {
-          candidate.setAttribute('data-dream-home-layout', 'soft');
-        }
-      }
-      shellMain.classList.toggle(descriptor.shellClass, Boolean(homeCandidate));
+      shellMain.classList.toggle(descriptor.shellClass, Boolean(home));
       if (descriptor.taskShellClass) shellMain.classList.toggle(descriptor.taskShellClass, !home);
 
       let chrome = document.getElementById(descriptor.chromeId);
@@ -2048,6 +2019,12 @@
         removeCodexServiceTierBadges();
         refreshCodexServiceTierControls();
       }
+    }
+    if (key === "pluginAutoExpand" && !value) {
+      clearTimeout(window.__codexPluginAutoExpandTimer);
+      window.__codexPluginAutoExpandTimer = null;
+      window.__codexPluginAutoExpandRunning = false;
+      window.__codexPluginAutoExpandLastSignature = "";
     }
     if (key === "stepwise") syncStepwisePanel(value);
     renderCodexPlusMenu();
@@ -3595,114 +3572,6 @@
     }
   }
 
-  const codexPlusAdsUrl = "/ads";
-  let codexPlusAds = [];
-  let codexPlusAdsLoaded = false;
-
-  function isCodexPlusAdExpired(ad) {
-    if (!ad.expires_at) return false;
-    const expiresAt = Date.parse(ad.expires_at);
-    return Number.isFinite(expiresAt) && expiresAt < Date.now();
-  }
-
-  function normalizeCodexPlusAds(payload) {
-    if (!payload || !Array.isArray(payload.ads)) return [];
-    return payload.ads.filter((ad) => {
-      return ad && ["sponsor", "normal"].includes(ad.type) && ad.title && ad.description && ad.url && !isCodexPlusAdExpired(ad);
-    }).map((ad) => ({
-      id: String(ad.id || ad.title),
-      type: ad.type,
-      title: String(ad.title),
-      description: String(ad.description),
-      url: String(ad.url),
-      image: ad.image ? String(ad.image) : "",
-      expires_at: ad.expires_at ? String(ad.expires_at) : "",
-      highlights: Array.isArray(ad.highlights) ? ad.highlights.map((item) => String(item)).filter(Boolean) : [],
-    }));
-  }
-
-  function formatCodexPlusAdTitle(title) {
-    const value = String(title || "");
-    return value.split(/[｜|]/, 1)[0].trim() || value;
-  }
-
-  function renderCodexPlusAdGroup(type, emptyText) {
-    const ads = codexPlusAds.filter((ad) => ad.type === type);
-    if (!ads.length) return `<div class="codex-plus-ad-empty">${escapeHtml(emptyText)}</div>`;
-    return ads.map((ad) => `
-      <article class="codex-plus-ad-card">
-        ${ad.image ? `<img class="codex-plus-ad-image" src="${escapeHtml(ad.image)}" alt="">` : ""}
-        <div class="codex-plus-ad-content">
-          <h3 class="codex-plus-ad-title">${escapeHtml(formatCodexPlusAdTitle(ad.title))}</h3>
-          <p class="codex-plus-ad-description">${escapeHtml(ad.description)}</p>
-          <div class="codex-plus-ad-highlights">
-            ${ad.highlights.map((item) => `<span>${escapeHtml(item)}</span>`).join("")}
-          </div>
-          <a class="codex-plus-ad-link" href="${escapeHtml(ad.url)}" target="_blank" rel="noreferrer">访问 ${escapeHtml(new URL(ad.url).hostname)}</a>
-        </div>
-      </article>
-    `).join("");
-  }
-
-  function renderCodexPlusAds() {
-    if (!codexPlusAdsLoaded) return `<div class="codex-plus-ad-empty">推荐内容加载中…</div>`;
-    if (!codexPlusAds.length) return `<div class="codex-plus-ad-empty">暂无推荐内容。</div>`;
-    return `
-      <section class="codex-plus-ad-section">
-        <h3 class="codex-plus-ad-section-title">赞助商推荐</h3>
-        <div class="codex-plus-ad-list">${renderCodexPlusAdGroup("sponsor", "暂无赞助商推荐。")}</div>
-      </section>
-      <section class="codex-plus-ad-section">
-        <h3 class="codex-plus-ad-section-title">普通推荐</h3>
-        <div class="codex-plus-ad-list">${renderCodexPlusAdGroup("normal", "暂无普通推荐。")}</div>
-      </section>
-    `;
-  }
-
-  function cacheBustCodexPlusAdUrl(url, version) {
-    return `${url}${url.includes("?") ? "&" : "?"}v=${version}`;
-  }
-
-  async function directFetchCodexPlusAds() {
-    const urls = [
-      "https://raw.githubusercontent.com/BigPizzaV3/Ad-List/main/ads.json",
-      "https://cdn.jsdelivr.net/gh/BigPizzaV3/Ad-List@main/ads.json",
-    ];
-    let lastError = null;
-    const cacheBust = Date.now();
-    for (const url of urls) {
-      try {
-        const response = await fetch(cacheBustCodexPlusAdUrl(url, cacheBust), {
-          headers: { "Accept": "application/json" },
-          cache: "no-store",
-        });
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        return await response.json();
-      } catch (error) {
-        lastError = error;
-      }
-    }
-    throw lastError || new Error("ad list unavailable");
-  }
-
-  async function fetchCodexPlusAds() {
-    try {
-      const localPayload = await postJson(codexPlusAdsUrl, {});
-      codexPlusAds = normalizeCodexPlusAds(localPayload?.ads ? localPayload : localPayload?.payload);
-      if (!codexPlusAds.length) codexPlusAds = normalizeCodexPlusAds(await directFetchCodexPlusAds());
-    } catch (error) {
-      sendCodexPlusDiagnostic("ads_fetch_failed", {
-        errorName: error?.name || "",
-        errorMessage: error?.message || String(error),
-      });
-      codexPlusAds = [];
-    } finally {
-      codexPlusAdsLoaded = true;
-      const panel = document.querySelector('[data-codex-plus-panel="sponsor"] .codex-plus-ad-remote');
-      if (panel) panel.innerHTML = renderCodexPlusAds();
-    }
-  }
-
   function selectCodexPlusTab(tab) {
     document.querySelectorAll(".codex-plus-modal-content").forEach((modal) => {
       modal.dataset.codexPlusActiveTab = tab;
@@ -3730,7 +3599,6 @@
         <div class="codex-plus-tabs" role="tablist" aria-label="Codex++">
           <button type="button" class="codex-plus-tab-button" data-codex-plus-tab="home" data-active="true">主页</button>
           <button type="button" class="codex-plus-tab-button" data-codex-plus-tab="userScripts" data-active="false">用户脚本</button>
-          <button type="button" class="codex-plus-tab-button" data-codex-plus-tab="sponsor" data-active="false">推荐内容</button>
         </div>
         <div class="codex-plus-modal-body">
           <div class="codex-plus-panel" data-codex-plus-panel="home">
@@ -3837,19 +3705,11 @@
               <button type="button" class="codex-plus-action-button" data-codex-open-devtools="true">打开 DevTools</button>
             </div>
             <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">关于 Codex++</div><div class="codex-plus-about">Codex++ 是通过外部 launcher 注入的增强菜单，不修改 Codex App 原始安装文件。<br>Build: <span data-codex-plus-build="true">${codexPlusBuild}</span><br>GitHub: <a href="https://github.com/BigPizzaV3/CodexPlusPlus" target="_blank" rel="noreferrer">https://github.com/BigPizzaV3/CodexPlusPlus</a><br>Discord: <a href="https://discord.gg/y96kX7A76v" target="_blank" rel="noreferrer">https://discord.gg/y96kX7A76v</a><br>Telegram: <a href="https://t.me/CodexPlusPlus" target="_blank" rel="noreferrer">https://t.me/CodexPlusPlus</a></div></div>
+              <div><div class="codex-plus-row-title">关于 Codex++</div><div class="codex-plus-about">Codex++ 是通过外部 launcher 注入的增强菜单，不修改 Codex App 原始安装文件。<br>Build: <span data-codex-plus-build="true">${codexPlusBuild}</span><br>仓库: <a href="https://github.com/chenchen-777/CodexPlusPlus" target="_blank" rel="noreferrer">chenchen-777/CodexPlusPlus</a></div></div>
             </div>
             <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">Discord 社区</div><div class="codex-plus-row-description">加入 Discord 获取更新消息、反馈问题或交流使用体验。</div></div>
-              <button type="button" class="codex-plus-action-button" data-codex-plus-discord="true">打开 Discord</button>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">Telegram 频道</div><div class="codex-plus-row-description">加入 Telegram 获取更新消息和交流使用体验。</div></div>
-              <button type="button" class="codex-plus-action-button" data-codex-plus-telegram="true">打开 Telegram</button>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">提出问题</div><div class="codex-plus-row-description">打开 GitHub Issues 反馈问题或建议。</div></div>
-              <button type="button" class="codex-plus-issue-button" data-codex-plus-issue="true">提出问题</button>
+              <div><div class="codex-plus-row-title">项目仓库</div><div class="codex-plus-row-description">打开 Codex++ 777 定制仓库。</div></div>
+              <button type="button" class="codex-plus-issue-button" data-codex-plus-issue="true">打开仓库</button>
             </div>
           </div>
           <div class="codex-plus-panel" data-codex-plus-panel="userScripts" hidden>
@@ -3865,12 +3725,6 @@
                 <button type="button" class="codex-plus-toggle" data-codex-user-scripts-enabled="true"><span></span></button>
                 <button type="button" class="codex-plus-user-script-reload" data-codex-user-scripts-reload="true">重新加载用户脚本</button>
               </div>
-            </div>
-          </div>
-          <div class="codex-plus-panel" data-codex-plus-panel="sponsor" hidden>
-            <div class="codex-plus-sponsor-text">推荐内容分为赞助商推荐和普通推荐。赞助商推荐来自支持 Codex++ 继续维护的合作方；普通推荐用于展示适合 Codex 用户的服务与信息。</div>
-            <div class="codex-plus-ad-remote">
-              ${renderCodexPlusAds()}
             </div>
           </div>
         </div>
@@ -3915,17 +3769,9 @@
         openManagerFromCodex();
         return;
       }
-      if (target?.closest("[data-codex-plus-discord]")) {
-        window.open("https://discord.gg/y96kX7A76v", "_blank");
-        return;
-      }
-      if (target?.closest("[data-codex-plus-telegram]")) {
-        window.open("https://t.me/CodexPlusPlus", "_blank");
-        return;
-      }
       const issueButton = target?.closest("[data-codex-plus-issue]");
       if (issueButton) {
-        const issueUrl = "https://github.com/BigPizzaV3/CodexPlusPlus/issues";
+        const issueUrl = "https://github.com/chenchen-777/CodexPlusPlus";
         window.open(issueUrl, "_blank");
         return;
       }
@@ -3994,7 +3840,6 @@
       }
     }, true);
     document.body.appendChild(overlay);
-    if (!codexPlusAdsLoaded) fetchCodexPlusAds();
     selectCodexPlusTab("home");
     renderCodexPlusMenu();
     refreshCodexPlusBackendToggles();
@@ -4407,8 +4252,7 @@
       return false;
     }
     const isKnownFilterSource = source.includes("!u(e.marketplaceName)||e.marketplaceName===r")
-      || source.includes("!ne(e.marketplaceName)||e.marketplaceName===n")
-      || source.includes("!Eu(e.marketplaceName)||e.marketplaceName===n");
+      || source.includes("!ne(e.marketplaceName)||e.marketplaceName===n");
     if (!isKnownFilterSource) return false;
     if (!sample.some((plugin) => codexPluginOfficialMarketplaceName(plugin?.marketplaceName))) return false;
     return sample.some((plugin) => codexPluginOfficialMarketplaceName(plugin?.marketplaceName) && !callback(plugin));
@@ -4564,6 +4408,101 @@
 
   function remoteOnlyPluginMarketplaceFallbackResult() {
     return pluginMarketplaceFallbackResult(false);
+  }
+
+  function pluginAutoExpandVisibleElement(el) {
+    if (!(el instanceof HTMLElement) || !el.isConnected) return false;
+    const style = getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden" || style.pointerEvents === "none") return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  function pluginAutoExpandPageLooksRelevant() {
+    const text = String(document.body?.innerText || "");
+    return /插件|Plugins?|Marketplace|市场/i.test(text) && !!document.querySelector('button, [role="button"]');
+  }
+
+  function pluginAutoExpandButtonLooksScoped(button) {
+    let node = button;
+    for (let depth = 0; node instanceof HTMLElement && node !== document.body && depth < 8; depth += 1, node = node.parentElement) {
+      const text = String(node.innerText || "");
+      if (text.length > 16000) continue;
+      if (/插件|Plugins?|Marketplace|市场/i.test(text)) return true;
+    }
+    return false;
+  }
+
+  function pluginAutoExpandButtonText(button) {
+    return String(button?.textContent || button?.getAttribute?.("aria-label") || button?.getAttribute?.("title") || "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  function pluginAutoExpandButtonLooksLikeMore(button) {
+    const text = pluginAutoExpandButtonText(button);
+    if (!text || text.length > 120) return false;
+    if (/^(更多|显示更多|查看更多|加载更多|Show more|Load more|More)$/i.test(text)) return true;
+    if (/^查看\s+.+以及另外\s*\d+\s*个$/i.test(text)) return true;
+    if (/^View\s+.+\s+and\s+\d+\s+more$/i.test(text)) return true;
+    if (/^Show\s+.+\s+and\s+\d+\s+more$/i.test(text)) return true;
+    return false;
+  }
+
+  function pluginAutoExpandButtonCandidates() {
+    if (!codexPlusSettings().pluginAutoExpand || !pluginAutoExpandPageLooksRelevant()) return [];
+    return Array.from(document.querySelectorAll('button, [role="button"]'))
+      .filter(pluginAutoExpandVisibleElement)
+      .filter((button) => !button.disabled && button.getAttribute("aria-disabled") !== "true")
+      .filter(pluginAutoExpandButtonLooksLikeMore)
+      .filter(pluginAutoExpandButtonLooksScoped)
+      .filter((button) => !button.closest?.(`.${moreMenuClass}, #${codexPlusMenuId}, .codex-plus-modal-overlay`));
+  }
+
+  function pluginAutoExpandSignature() {
+    return pluginAutoExpandButtonCandidates()
+      .map((button) => {
+        const rect = button.getBoundingClientRect();
+        return `${pluginAutoExpandButtonText(button)}:${Math.round(rect.top)}:${Math.round(rect.left)}`;
+      })
+      .join("|");
+  }
+
+  function schedulePluginAutoExpand(force = false) {
+    if (!codexPlusSettings().pluginAutoExpand) return;
+    if (window.__codexPluginAutoExpandRunning && !force) return;
+    clearTimeout(window.__codexPluginAutoExpandTimer);
+    window.__codexPluginAutoExpandTimer = setTimeout(() => runPluginAutoExpand(force), force ? 30 : 180);
+  }
+
+  function runPluginAutoExpand(force = false) {
+    if (!codexPlusSettings().pluginAutoExpand) return;
+    const currentSignature = pluginAutoExpandSignature();
+    if (!force && currentSignature && currentSignature === window.__codexPluginAutoExpandLastSignature) return;
+    window.__codexPluginAutoExpandLastSignature = currentSignature;
+    window.__codexPluginAutoExpandRunning = true;
+    window.__codexPluginAutoExpandClicks = 0;
+    const clickNext = () => {
+      if (!codexPlusSettings().pluginAutoExpand) {
+        window.__codexPluginAutoExpandRunning = false;
+        return;
+      }
+      const button = pluginAutoExpandButtonCandidates()[0];
+      if (!button || window.__codexPluginAutoExpandClicks >= codexPluginAutoExpandMaxClicks) {
+        window.__codexPluginAutoExpandRunning = false;
+        sendCodexPlusDiagnostic("plugin_auto_expand_finished", {
+          version: codexPluginAutoExpandVersion,
+          clicks: window.__codexPluginAutoExpandClicks || 0,
+          exhausted: !!button,
+        });
+        return;
+      }
+      window.__codexPluginAutoExpandClicks = (window.__codexPluginAutoExpandClicks || 0) + 1;
+      button.dataset.codexPluginAutoExpandClicked = String(Date.now());
+      button.click();
+      setTimeout(clickNext, codexPluginAutoExpandClickDelayMs);
+    };
+    clickNext();
   }
 
   function patchPluginMarketplaceRequestClient(client) {
@@ -9558,6 +9497,7 @@
     installCodexServiceTierBadge();
     scheduleThreadScrollSync();
     refreshCodexModelWhitelistFromScan(window.__codexSessionDeleteLastMutations);
+    schedulePluginAutoExpand();
   }
 
   function runScanStep(step) {

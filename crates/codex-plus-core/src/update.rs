@@ -1,14 +1,14 @@
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 
-pub const DEFAULT_REPOSITORY: &str = "BigPizzaV3/CodexPlusPlus";
+pub const DEFAULT_REPOSITORY: &str = "chenchen-777/CodexPlusPlus";
 pub const DEFAULT_LATEST_JSON_URL: &str =
-    "https://github.com/BigPizzaV3/CodexPlusPlus/releases/latest/download/latest.json";
-const UPDATE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-const UPDATE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+    "https://github.com/chenchen-777/CodexPlusPlus/releases/latest/download/latest.json";
+pub const FALLBACK_MIRROR_PREFIX: &str = "https://gh-proxy.com/";
+pub const FALLBACK_LATEST_JSON_URL: &str =
+    "https://gh-proxy.com/https://github.com/chenchen-777/CodexPlusPlus/releases/latest/download/latest.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReleaseAsset {
@@ -170,7 +170,8 @@ pub fn select_update_asset(assets: &[(String, String)]) -> Option<ReleaseAsset> 
 }
 
 pub async fn fetch_latest_release(latest_json_url: &str) -> anyhow::Result<Release> {
-    let client = update_http_client()?;
+    let client =
+        crate::http_client::proxied_client(&format!("Codex++/{}", crate::version::VERSION))?;
     let payload = client
         .get(latest_json_url)
         .header(reqwest::header::ACCEPT, "application/json")
@@ -182,8 +183,26 @@ pub async fn fetch_latest_release(latest_json_url: &str) -> anyhow::Result<Relea
     release_from_latest_json_payload(&payload)
 }
 
+pub fn fallback_mirror_url(url: &str) -> Option<String> {
+    const RELEASE_PREFIX: &str =
+        "https://github.com/chenchen-777/CodexPlusPlus/releases/";
+    url.starts_with(RELEASE_PREFIX)
+        .then(|| format!("{FALLBACK_MIRROR_PREFIX}{url}"))
+}
+
+pub async fn fetch_latest_release_from_default_channels() -> anyhow::Result<Release> {
+    match fetch_latest_release(DEFAULT_LATEST_JSON_URL).await {
+        Ok(release) => Ok(release),
+        Err(primary_error) => fetch_latest_release(FALLBACK_LATEST_JSON_URL)
+            .await
+            .map_err(|mirror_error| {
+                anyhow::anyhow!("更新检查失败；主地址：{primary_error}；备用镜像：{mirror_error}")
+            }),
+    }
+}
+
 pub async fn check_for_update(current_version: &str) -> anyhow::Result<UpdateCheck> {
-    let release = fetch_latest_release(DEFAULT_LATEST_JSON_URL).await?;
+    let release = fetch_latest_release_from_default_channels().await?;
     let update_available = is_newer_version(&release.version, current_version)?;
     Ok(UpdateCheck {
         current_version: current_version.to_string(),
@@ -203,98 +222,24 @@ pub async fn perform_update(
         .asset_url
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("没有可下载的 Release asset"))?;
-    let _ = crate::diagnostic_log::append_diagnostic_log(
-        "update.perform.start",
-        json!({
-            "version": release.version,
-            "assetName": release.asset_name,
-            "assetUrl": url,
-            "downloadTimeoutSeconds": UPDATE_DOWNLOAD_TIMEOUT.as_secs()
-        }),
-    );
-    let response = match update_http_client()?.get(url).send().await {
-        Ok(response) => response,
-        Err(error) => {
-            let _ = crate::diagnostic_log::append_diagnostic_log(
-                "update.download.failed",
-                json!({ "version": release.version, "assetName": release.asset_name, "error": error.to_string() }),
-            );
-            return Err(anyhow::anyhow!("下载安装包失败：{error}"));
-        }
-    };
-    let response = match response.error_for_status() {
-        Ok(response) => response,
-        Err(error) => {
-            let _ = crate::diagnostic_log::append_diagnostic_log(
-                "update.download.bad_status",
-                json!({ "version": release.version, "assetName": release.asset_name, "error": error.to_string() }),
-            );
-            return Err(anyhow::anyhow!("下载安装包失败：{error}"));
-        }
-    };
-    let bytes = match response.bytes().await {
+    let client =
+        crate::http_client::proxied_client(&format!("Codex++/{}", crate::version::VERSION))?;
+    let bytes = match fetch_update_asset(&client, url).await {
         Ok(bytes) => bytes,
-        Err(error) => {
-            let _ = crate::diagnostic_log::append_diagnostic_log(
-                "update.download.body_failed",
-                json!({ "version": release.version, "assetName": release.asset_name, "error": error.to_string() }),
-            );
-            return Err(anyhow::anyhow!("读取安装包失败：{error}"));
+        Err(primary_error) => {
+            let fallback_url = fallback_mirror_url(url)
+                .ok_or_else(|| anyhow::anyhow!("下载安装包失败：{primary_error}"))?;
+            fetch_update_asset(&client, &fallback_url)
+                .await
+                .map_err(|fallback_error| {
+                    anyhow::anyhow!(
+                        "下载安装包失败；主地址：{primary_error}；备用镜像：{fallback_error}"
+                    )
+                })?
         }
     };
-    let _ = crate::diagnostic_log::append_diagnostic_log(
-        "update.download.completed",
-        json!({
-            "version": release.version,
-            "assetName": release.asset_name,
-            "bytes": bytes.len()
-        }),
-    );
-    let installer_path = match download_asset_to(release, &bytes, download_dir) {
-        Ok(path) => path,
-        Err(error) => {
-            let _ = crate::diagnostic_log::append_diagnostic_log(
-                "update.write.failed",
-                json!({
-                    "version": release.version,
-                    "assetName": release.asset_name,
-                    "downloadDir": download_dir.to_string_lossy(),
-                    "bytes": bytes.len(),
-                    "error": error.to_string()
-                }),
-            );
-            return Err(error);
-        }
-    };
-    let _ = crate::diagnostic_log::append_diagnostic_log(
-        "update.write.completed",
-        json!({
-            "version": release.version,
-            "assetName": release.asset_name,
-            "installerPath": installer_path.to_string_lossy(),
-            "bytes": bytes.len()
-        }),
-    );
-    if let Err(error) = launch_installer(&installer_path) {
-        let _ = crate::diagnostic_log::append_diagnostic_log(
-            "update.launch.failed",
-            json!({
-                "version": release.version,
-                "assetName": release.asset_name,
-                "installerPath": installer_path.to_string_lossy(),
-                "error": error.to_string()
-            }),
-        );
-        return Err(error);
-    }
-    let _ = crate::diagnostic_log::append_diagnostic_log(
-        "update.launch.completed",
-        json!({
-            "version": release.version,
-            "assetName": release.asset_name,
-            "installerPath": installer_path.to_string_lossy()
-        }),
-    );
+    let installer_path = download_asset_to(release, &bytes, download_dir)?;
+    launch_installer(&installer_path)?;
     Ok(UpdateInstall {
         release: release.clone(),
         installer_path,
@@ -302,12 +247,15 @@ pub async fn perform_update(
     })
 }
 
-fn update_http_client() -> anyhow::Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
-        .user_agent(format!("Codex++/{}", crate::version::VERSION))
-        .connect_timeout(UPDATE_CONNECT_TIMEOUT)
-        .timeout(UPDATE_DOWNLOAD_TIMEOUT)
-        .build()?)
+async fn fetch_update_asset(client: &reqwest::Client, url: &str) -> anyhow::Result<Vec<u8>> {
+    Ok(client
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?
+        .to_vec())
 }
 
 pub fn download_asset_to(

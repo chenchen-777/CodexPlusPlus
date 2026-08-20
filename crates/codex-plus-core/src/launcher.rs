@@ -2948,7 +2948,8 @@ pub async fn activate_packaged_app(
 #[cfg(windows)]
 fn activate_packaged_app_blocking(app_user_model_id: &str, arguments: &str) -> anyhow::Result<u32> {
     use windows::Win32::System::Com::{
-        CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
+        CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+        CoUninitialize,
     };
     use windows::Win32::UI::Shell::{ApplicationActivationManager, IApplicationActivationManager};
     use windows::core::HSTRING;
@@ -2967,7 +2968,7 @@ fn activate_packaged_app_blocking(app_user_model_id: &str, arguments: &str) -> a
 
         let result: windows::core::Result<u32> = (|| {
             let manager: IApplicationActivationManager =
-                CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_ALL)?;
+                CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_LOCAL_SERVER)?;
             let process_id = manager.ActivateApplication(
                 &HSTRING::from(app_user_model_id),
                 &HSTRING::from(arguments),
