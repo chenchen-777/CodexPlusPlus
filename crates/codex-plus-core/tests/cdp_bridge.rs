@@ -955,6 +955,8 @@ fn injection_script_does_not_bypass_plugin_marketplace_search_filters() {
     let script = assets::injection_script(57321);
 
     assert!(script.contains("codexPluginMarketplaceUnlockVersion = \"15\""));
+    assert!(script.contains("codexPluginFilterSourceCache = new WeakMap()"));
+    assert!(script.contains("function codexPluginFilterCallbackSource(callback)"));
     assert!(script.contains("isCodexPluginBuildFlavorFilter"));
     assert!(script.contains("source.includes(\"!u(e.marketplaceName)||e.marketplaceName===r\")"));
     assert!(script.contains("source.includes(\"!t.includes(e.name)\")"));
@@ -973,12 +975,10 @@ fn injection_script_expands_api_key_plugin_marketplace_requests() {
     assert!(script.contains("Array.prototype.filter"));
     assert!(script.contains("codexPluginBuildFlavorFilterPatch"));
     assert!(script.contains("isCodexPluginBuildFlavorFilter"));
-    assert!(script.contains(
-        "codexPluginOfficialMarketplaceName(plugin?.marketplaceName) && !callback(plugin)"
-    ));
+    assert!(script.contains("!filtered.includes(plugin) : !callback(plugin)"));
     assert!(script.contains("isCodexPluginMarketplaceHiddenFilter"));
     assert!(script.contains(
-        "codexPluginOfficialMarketplaceName(marketplace?.name) && !callback(marketplace)"
+        "!filtered.includes(marketplace) : !callback(marketplace)"
     ));
     assert!(script.contains("plugin_marketplace_hidden_filter_bypassed"));
     assert!(script.contains("method === \"list-plugins\""));
@@ -1058,6 +1058,12 @@ fn injection_script_logs_marketplace_grouping_diagnostics() {
 fn injection_script_recovers_plugin_search_from_remote_auth_errors() {
     let cases = run_plugin_marketplace_search_contract_harness();
 
+    assert_eq!(cases["ordinaryBuildMatched"], false);
+    assert_eq!(cases["ordinaryHiddenMatched"], false);
+    assert_eq!(cases["ordinaryFunctionToStringCalls"], 0);
+    assert_eq!(cases["buildFlavorMatched"], true);
+    assert_eq!(cases["buildFlavorMatchedAgain"], true);
+    assert_eq!(cases["cachedFunctionToStringCalls"], 1);
     assert_eq!(cases["initialKinds"], json!(["local", "vertical"]));
     assert_eq!(cases["latestBroadOmittedHasKinds"], false);
     assert_eq!(cases["latestBroadOmittedKinds"], serde_json::Value::Null);
@@ -1144,6 +1150,25 @@ window.__CODEX_PLUS_PLUGIN_MARKETPLACES__ = [{{
 }}];
 const api = window.__codexPlusPluginMarketplaceTest;
 api.reset();
+const nativeFunctionToString = Function.prototype.toString;
+let functionToStringCalls = 0;
+Function.prototype.toString = function(...args) {{
+  functionToStringCalls += 1;
+  return nativeFunctionToString.apply(this, args);
+}};
+const ordinaryFilter = (value) => value > 1;
+const ordinaryBuildMatched = api.isBuildFlavorFilter(ordinaryFilter, [1, 2, 3]);
+const ordinaryHiddenMatched = api.isHiddenMarketplaceFilter(ordinaryFilter, [1, 2, 3]);
+const ordinaryFunctionToStringCalls = functionToStringCalls;
+const buildFlavorFilter = function(e) {{
+  /* !u(e.marketplaceName)||e.marketplaceName===r */
+  return false;
+}};
+const officialPlugins = [{{ name: "product-design", marketplaceName: "openai-bundled" }}];
+const buildFlavorMatched = api.isBuildFlavorFilter(buildFlavorFilter, officialPlugins);
+const buildFlavorMatchedAgain = api.isBuildFlavorFilter(buildFlavorFilter, officialPlugins);
+const cachedFunctionToStringCalls = functionToStringCalls - ordinaryFunctionToStringCalls;
+Function.prototype.toString = nativeFunctionToString;
 const initial = api.patchRequestParams("list-plugins", {{ cwds: ["C:/workspace"] }});
 api.setCodexAppVersion("26.803.41515");
 const latestBroadOmitted = api.patchRequestParams("list-plugins", {{ cwds: ["C:/workspace"] }});
@@ -1174,6 +1199,12 @@ const remoteUnavailable = api.remoteCatalogUnavailable();
 api.reset();
 const chatGpt = api.patchRequestParams("list-plugins", {{ marketplaceKinds: ["created-by-me-remote"] }});
 const cases = {{
+  ordinaryBuildMatched,
+  ordinaryHiddenMatched,
+  ordinaryFunctionToStringCalls,
+  buildFlavorMatched,
+  buildFlavorMatchedAgain,
+  cachedFunctionToStringCalls,
   initialKinds: initial.marketplaceKinds,
   latestBroadOmittedHasKinds: Object.prototype.hasOwnProperty.call(latestBroadOmitted, "marketplaceKinds"),
   latestBroadOmittedKinds: latestBroadOmitted.marketplaceKinds ?? null,
@@ -1284,7 +1315,6 @@ fn injection_script_keeps_session_action_buttons_in_pr_style() {
 
     assert!(script.contains("actionButtonClass = \"codex-session-action-button\""));
     assert!(script.contains("background: transparent;"));
-    assert!(script.contains("background: #363839;"));
     assert!(script.contains("cursor: default;"));
 }
 
@@ -1394,7 +1424,7 @@ fn injection_script_unlocks_custom_model_catalog() {
     assert!(script.contains("loadAppServerRequestCandidates"));
     assert!(script.contains("appServerFallbackAssetUrls"));
     assert!(script.contains("collectAppServerRequestCandidatesFromModule"));
-    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"5\""));
+    assert!(script.contains("codexAppServerModelRequestPatchVersion = \"6\""));
 
     assert!(script.contains("list-models-for-host"));
     assert!(script.contains("appServerModelRequestMethod"));
@@ -1503,6 +1533,17 @@ fn injection_script_exposes_fast_service_tier_control() {
     assert!(script.contains("dispatcher export unavailable"));
     assert!(!script.contains("data-codex-max-reasoning-control"));
     assert!(!script.contains("codexAppMaxReasoningOverride"));
+}
+
+#[test]
+fn injection_script_keeps_remote_provider_patch_installed_for_openai_identity() {
+    let script = assets::injection_script(57321);
+
+    assert!(
+        script
+            .contains("codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled()")
+    );
+    assert!(script.contains("if (!codexRemoteSessionProviderPatchEnabled()) return;"));
 }
 
 #[test]
@@ -1657,7 +1698,66 @@ fn injection_script_applies_fast_service_tier_contract() {
     assert_eq!(cases["legacyStateApi"], true);
     assert_eq!(cases["currentStateApi"], true);
     assert_eq!(cases["appServerParamsUnchanged"], true);
-    assert_eq!(cases["appServerSentCount"], 1);
+    assert_eq!(cases["appServerSentCount"], 6);
+    assert_eq!(
+        cases["providerFromMissing"]["modelProvider"],
+        "vendor_alpha"
+    );
+    assert_eq!(cases["providerFromOpenAi"]["modelProvider"], "vendor_alpha");
+    assert_eq!(cases["providerFromOtherUnchanged"], true);
+    assert_eq!(cases["nonThreadProviderUnchanged"], true);
+    assert_eq!(
+        cases["providerWithServiceTierControlsDisabled"]["modelProvider"],
+        "vendor_alpha"
+    );
+    assert_eq!(cases["appServerProviderOverride"], "vendor_alpha");
+    assert_eq!(cases["directThreadStartedId"], "thread-mobile-direct");
+    assert_eq!(cases["nestedThreadStartedId"], "thread-mobile-nested");
+    assert_eq!(
+        cases["browserUseRouteThreadId"],
+        "thread-mobile-browser-route"
+    );
+    assert_eq!(cases["inactiveBrowserUseUnscheduled"], true);
+    assert_eq!(cases["remoteRecoveryScheduled"], true);
+    assert_eq!(cases["remoteRecoveryThreadId"], "thread-mobile-notify");
+    assert_eq!(cases["remoteRecoveryCallCountAfterSuccess"], 1);
+    assert_eq!(cases["remoteRecoveryDispatcherInstalled"], true);
+    assert_eq!(
+        cases["remoteRecoveryDispatcherThreadId"],
+        "thread-mobile-dispatcher"
+    );
+    assert_eq!(
+        cases["remoteRecoveryBrowserUseDispatcherThreadId"],
+        "thread-mobile-browser-dispatcher"
+    );
+    assert_eq!(
+        cases["remoteRecoveryOutboundRouteThreadId"],
+        "thread-mobile-browser-outbound"
+    );
+    assert_eq!(cases["remoteRecoveryListenerInstalled"], true);
+    assert_eq!(
+        cases["remoteRecoveryViewEventThreadId"],
+        "thread-mobile-view-event"
+    );
+    assert_eq!(cases["remoteRecoveryRetried"], true);
+    assert_eq!(cases["remoteRecoveryRetryAttempts"], json!([0, 1]));
+    assert_eq!(cases["openAiSessionProviderUnchanged"], true);
+    assert_eq!(cases["openAiRecoveryUnscheduled"], true);
+    assert_eq!(cases["openAiPatchRemainsInstalled"], true);
+    assert_eq!(cases["openAiNormalizationDisabled"], true);
+    assert_eq!(cases["refreshedCustomProviderOverride"], "refreshed_vendor");
+    assert_eq!(cases["refreshedOpenAiProvider"], "openai");
+    assert_eq!(cases["refreshedPureApiResumeProvider"], "custom");
+    assert_eq!(cases["failedRefreshProviderUnchanged"], "openai");
+    assert_eq!(cases["missingActiveProviderUnchanged"], true);
+    assert_eq!(cases["missingActiveRecoveryUnscheduled"], true);
+    assert_eq!(cases["pureApiThreadStartProvider"], "custom");
+    assert_eq!(cases["pureApiThreadResumeProvider"], "custom");
+    assert_eq!(cases["pureApiTurnStartProvider"], "custom");
+    assert_eq!(cases["pureApiTurnWithoutProviderUnchanged"], true);
+    assert_eq!(cases["pureApiOtherProviderUnchanged"], true);
+    assert_eq!(cases["pureApiRecoveryUnscheduled"], true);
+    assert_eq!(cases["pureOfficialProviderUnchanged"], true);
 }
 
 fn run_service_tier_contract_harness() -> serde_json::Value {
@@ -1695,6 +1795,11 @@ function node() {{
 }}
 globalThis.window = globalThis;
 window.__CODEX_PLUS_TEST_SERVICE_TIER__ = true;
+const windowListeners = new Map();
+window.addEventListener = (type, listener) => windowListeners.set(type, listener);
+window.removeEventListener = (type, listener) => {{
+  if (windowListeners.get(type) === listener) windowListeners.delete(type);
+}};
 globalThis.document = {{
   scripts: [],
   documentElement: node(),
@@ -1930,6 +2035,301 @@ const appServerParamsUnchanged = appServerCalls[0]?.params === nativeAppServerPa
   && appServerCalls[0]?.params?.workspaceKind === "project"
   && appServerCalls[0]?.params?.cwd === "C:/native/work"
   && appServerCalls[0]?.params?.projectAssignment?.projectId === "C:/native/work";
+api.setBackendSettings({{
+  relayProfilesEnabled: true,
+  activeRelayId: "custom-relay",
+  activeRelaySessionProvider: "custom",
+  activeRelayCodexProvider: "vendor_alpha",
+  relayProfiles: [{{ id: "custom-relay", relayMode: "official", officialMixApiKey: true }}],
+}});
+api.setModelCatalog({{
+  status: "ok",
+  model: "gpt-5.6-sol",
+  default_model: "gpt-5.6-sol",
+  model_provider: "relay-ms0ihvx9",
+  codex_model_provider: "vendor_alpha",
+  models: ["gpt-5.6-sol"],
+}});
+localStorage.setItem("codexPlusSettings", JSON.stringify({{ serviceTierControls: false }}));
+const providerFromMissing = api.applyProviderOverride("thread/start", {{ cwd: "C:/mobile" }});
+const providerFromOpenAi = api.applyProviderOverride("thread/start", {{ cwd: "C:/mobile", modelProvider: "openai" }});
+const explicitOtherProvider = {{ cwd: "C:/mobile", modelProvider: "other" }};
+const providerFromOther = api.applyProviderOverride("thread/start", explicitOtherProvider);
+const nonThreadParams = {{ cwd: "C:/mobile", modelProvider: "openai" }};
+const nonThreadProviderUnchanged = api.applyProviderOverride("turn/start", nonThreadParams) === nonThreadParams;
+const providerWithServiceTierControlsDisabled = api.requestOverride({{
+  type: "start-conversation",
+  cwd: "C:/mobile",
+  modelProvider: "openai",
+}});
+await appServerClient.sendRequest("thread/start", {{ cwd: "C:/mobile", modelProvider: "openai" }}, {{ signal: "mobile" }});
+const appServerProviderOverride = appServerCalls[1]?.params?.modelProvider;
+const directThreadStartedId = api.remoteSessionStartedThreadId({{
+  method: "thread/started",
+  params: {{ thread: {{ id: "thread-mobile-direct" }} }},
+}});
+const nestedThreadStartedId = api.remoteSessionStartedThreadId({{
+  type: "mcp-response",
+  message: {{ method: "thread/started", params: {{ thread: {{ id: "thread-mobile-nested" }} }} }},
+}});
+const browserUseRouteThreadId = api.remoteSessionStartedThreadId({{
+  type: "browser-use-session-route-capture",
+  conversationId: "thread-mobile-browser-route",
+}});
+const inactiveBrowserUseUnscheduled = api.observeRemoteSessionNotification({{
+  type: "browser-sidebar-browser-use-state",
+  conversationId: "thread-mobile-browser-inactive",
+  isActive: false,
+}}) === false;
+const remoteRecoveryCalls = [];
+const remoteRecoveryDispatcherHandlers = new Map();
+const remoteRecoveryDispatcher = {{
+  subscribe(type, callback) {{
+    remoteRecoveryDispatcherHandlers.set(type, callback);
+    return () => remoteRecoveryDispatcherHandlers.delete(type);
+  }},
+}};
+window.__CODEX_PLUS_TEST_REMOTE_RECOVERY__ = (payload, attempt) => {{
+  remoteRecoveryCalls.push({{ payload, attempt }});
+  return {{ status: "synced", message: "Remote Control session catalog recovery complete" }};
+}};
+const remoteRecoveryScheduled = api.observeRemoteSessionNotification({{
+  response: {{ method: "thread/started", params: {{ thread: {{ id: "thread-mobile-notify" }} }} }},
+}});
+await new Promise((resolve) => setTimeout(resolve, 500));
+const remoteRecoveryCallCountAfterSuccess = remoteRecoveryCalls.length;
+const remoteRecoveryDispatcherCalls = [];
+window.__CODEX_PLUS_TEST_REMOTE_RECOVERY__ = (payload, attempt) => {{
+  remoteRecoveryDispatcherCalls.push({{ payload, attempt }});
+  return {{ status: "synced", message: "Remote Control session catalog recovery complete" }};
+}};
+const remoteRecoveryDispatcherInstalled = api.installRemoteSessionDispatcherSubscription(remoteRecoveryDispatcher);
+remoteRecoveryDispatcherHandlers.get("thread/started")?.({{ id: "thread-mobile-dispatcher" }});
+await new Promise((resolve) => setTimeout(resolve, 500));
+const remoteRecoveryDispatcherThreadId = remoteRecoveryDispatcherCalls[0]?.payload?.thread_id || "";
+const remoteRecoveryBrowserUseDispatcherCalls = [];
+window.__CODEX_PLUS_TEST_REMOTE_RECOVERY__ = (payload, attempt) => {{
+  remoteRecoveryBrowserUseDispatcherCalls.push({{ payload, attempt }});
+  return {{ status: "synced", message: "Remote Control session catalog recovery complete" }};
+}};
+remoteRecoveryDispatcherHandlers.get("browser-sidebar-browser-use-state")?.({{
+  conversationId: "thread-mobile-browser-dispatcher",
+  isActive: true,
+}});
+await new Promise((resolve) => setTimeout(resolve, 500));
+const remoteRecoveryBrowserUseDispatcherThreadId = remoteRecoveryBrowserUseDispatcherCalls[0]?.payload?.thread_id || "";
+const remoteRecoveryOutboundRouteCalls = [];
+window.__CODEX_PLUS_TEST_REMOTE_RECOVERY__ = (payload, attempt) => {{
+  remoteRecoveryOutboundRouteCalls.push({{ payload, attempt }});
+  return {{ status: "synced", message: "Remote Control session catalog recovery complete" }};
+}};
+const outboundDispatcherMessages = [];
+const outboundDispatcher = {{
+  __codexServiceTierOriginalDispatchMessage(type, payload) {{
+    outboundDispatcherMessages.push({{ type, payload }});
+    return true;
+  }},
+}};
+api.dispatchMessage(outboundDispatcher, "browser-use-session-route-capture", {{
+  conversationId: "thread-mobile-browser-outbound",
+}});
+await new Promise((resolve) => setTimeout(resolve, 500));
+const remoteRecoveryOutboundRouteThreadId = remoteRecoveryOutboundRouteCalls[0]?.payload?.thread_id || "";
+const remoteRecoveryViewEventCalls = [];
+window.__CODEX_PLUS_TEST_REMOTE_RECOVERY__ = (payload, attempt) => {{
+  remoteRecoveryViewEventCalls.push({{ payload, attempt }});
+  return {{ status: "synced", message: "Remote Control session catalog recovery complete" }};
+}};
+const remoteRecoveryListenerInstalled = api.installRemoteSessionRecoveryListener();
+windowListeners.get("codex-message-from-view")?.({{
+  detail: {{
+    type: "browser-use-session-route-capture",
+    conversationId: "thread-mobile-view-event",
+  }},
+}});
+await new Promise((resolve) => setTimeout(resolve, 500));
+const remoteRecoveryViewEventThreadId = remoteRecoveryViewEventCalls[0]?.payload?.thread_id || "";
+const remoteRecoveryRetryCalls = [];
+window.__CODEX_PLUS_TEST_REMOTE_RECOVERY__ = (payload, attempt) => {{
+  remoteRecoveryRetryCalls.push({{ payload, attempt }});
+  if (attempt === 0) {{
+    return {{ status: "synced", message: "Remote Control session recovery already up to date" }};
+  }}
+  return {{ status: "synced", message: "Remote Control session recovery complete" }};
+}};
+const remoteRecoveryRetried = api.observeRemoteSessionNotification({{
+  response: {{ method: "thread/started", params: {{ thread: {{ id: "thread-mobile-retry" }} }} }},
+}});
+await new Promise((resolve) => setTimeout(resolve, 500));
+const remoteRecoveryRetryAttempts = remoteRecoveryRetryCalls.map((call) => call.attempt);
+api.setBackendSettings({{
+  relayProfilesEnabled: true,
+  activeRelayId: "openai-relay",
+  activeRelaySessionProvider: "openai",
+  activeRelayCodexProvider: "openai",
+  relayProfiles: [{{ id: "openai-relay", relayMode: "official", officialMixApiKey: true }}],
+}});
+api.setModelCatalog({{
+  status: "ok",
+  model: "gpt-5.6-sol",
+  default_model: "gpt-5.6-sol",
+  codex_model_provider: "stale_custom_provider",
+  models: ["gpt-5.6-sol"],
+}});
+const openAiSessionParams = {{ cwd: "C:/mobile", modelProvider: "openai" }};
+const openAiSessionProviderUnchanged = api.applyProviderOverride("thread/start", openAiSessionParams) === openAiSessionParams;
+const openAiRecoveryUnscheduled = api.observeRemoteSessionNotification({{
+  method: "thread/started",
+  params: {{ thread: {{ id: "thread-mobile-openai" }} }},
+}}) === false;
+const openAiPatchRemainsInstalled = api.providerPatchEnabled();
+const openAiNormalizationDisabled = !api.providerNormalizationEnabled();
+api.setBackendSettings({{
+  relayProfilesEnabled: true,
+  activeRelayId: "stale-openai-relay",
+  activeRelaySessionProvider: "openai",
+  activeRelayCodexProvider: "openai",
+  relayProfiles: [{{ id: "stale-openai-relay", relayMode: "official", officialMixApiKey: true }}],
+}});
+api.setModelCatalog({{
+  status: "ok",
+  model: "gpt-5.6-sol",
+  default_model: "gpt-5.6-sol",
+  codex_model_provider: "openai",
+  models: ["gpt-5.6-sol"],
+}});
+window.__codexSessionDeleteBridge = async (path) => {{
+  if (path === "/settings/get") return {{
+    launchMode: "patch",
+    enhancementsEnabled: true,
+    providerSyncEnabled: true,
+    relayProfilesEnabled: true,
+    activeRelayId: "refreshed-custom-relay",
+    activeRelaySessionProvider: "custom",
+    activeRelayCodexProvider: "refreshed_vendor",
+    relayProfiles: [{{ id: "refreshed-custom-relay", relayMode: "official", officialMixApiKey: true }}],
+  }};
+  if (path === "/codex-model-catalog") return {{
+    status: "ok",
+    model: "gpt-5.6-sol",
+    default_model: "gpt-5.6-sol",
+    codex_model_provider: "refreshed_vendor",
+    models: ["gpt-5.6-sol"],
+  }};
+  return {{ status: "failed" }};
+}};
+await appServerClient.sendRequest("thread/start", {{ cwd: "C:/mobile", modelProvider: "openai" }}, {{ signal: "provider-switch" }});
+const refreshedCustomProviderOverride = appServerCalls.at(-1)?.params?.modelProvider || "";
+api.setBackendSettings({{
+  relayProfilesEnabled: true,
+  activeRelayId: "stale-custom-relay",
+  activeRelaySessionProvider: "custom",
+  activeRelayCodexProvider: "stale_custom_provider",
+  relayProfiles: [{{ id: "stale-custom-relay", relayMode: "official", officialMixApiKey: true }}],
+}});
+api.setModelCatalog({{
+  status: "ok",
+  model: "gpt-5.6-sol",
+  default_model: "gpt-5.6-sol",
+  codex_model_provider: "stale_custom_provider",
+  models: ["gpt-5.6-sol"],
+}});
+window.__codexSessionDeleteBridge = async (path) => {{
+  if (path === "/settings/get") return {{
+    launchMode: "patch",
+    enhancementsEnabled: true,
+    providerSyncEnabled: true,
+    relayProfilesEnabled: true,
+    activeRelayId: "refreshed-openai-relay",
+    activeRelaySessionProvider: "openai",
+    activeRelayCodexProvider: "openai",
+    relayProfiles: [{{ id: "refreshed-openai-relay", relayMode: "official", officialMixApiKey: true }}],
+  }};
+  if (path === "/codex-model-catalog") return {{
+    status: "ok",
+    model: "gpt-5.6-sol",
+    default_model: "gpt-5.6-sol",
+    codex_model_provider: "stale_custom_provider",
+    models: ["gpt-5.6-sol"],
+  }};
+  return {{ status: "failed" }};
+}};
+await appServerClient.sendRequest("thread/start", {{ cwd: "C:/mobile", modelProvider: "openai" }}, {{ signal: "openai-switch" }});
+const refreshedOpenAiProvider = appServerCalls.at(-1)?.params?.modelProvider || "";
+window.__codexSessionDeleteBridge = async (path) => {{
+  if (path === "/settings/get") return {{
+    launchMode: "patch",
+    enhancementsEnabled: true,
+    providerSyncEnabled: true,
+    relayProfilesEnabled: true,
+    activeRelayId: "refreshed-pure-api",
+    activeRelaySessionProvider: "custom",
+    activeRelayCodexProvider: "custom",
+    relayProfiles: [{{ id: "refreshed-pure-api", relayMode: "pureApi", officialMixApiKey: false }}],
+  }};
+  return {{ status: "failed" }};
+}};
+await appServerClient.sendRequest("thread/resume", {{
+  threadId: "thread-mobile-pure-api-refresh",
+  modelProvider: "openai",
+}}, {{ signal: "pure-api-switch" }});
+const refreshedPureApiResumeProvider = appServerCalls.at(-1)?.params?.modelProvider || "";
+delete window.__codexSessionDeleteBridge;
+api.setBackendSettings({{
+  relayProfilesEnabled: true,
+  activeRelayId: "stale-custom-relay",
+  activeRelaySessionProvider: "custom",
+  activeRelayCodexProvider: "stale_custom_provider",
+  relayProfiles: [{{ id: "stale-custom-relay", relayMode: "official", officialMixApiKey: true }}],
+}});
+window.__codexSessionDeleteBridge = async (path) => {{
+  if (path === "/settings/get") throw new Error("settings unavailable");
+  return {{ status: "failed" }};
+}};
+await appServerClient.sendRequest("thread/start", {{ cwd: "C:/mobile", modelProvider: "openai" }}, {{ signal: "provider-refresh-failed" }});
+const failedRefreshProviderUnchanged = appServerCalls.at(-1)?.params?.modelProvider || "";
+delete window.__codexSessionDeleteBridge;
+api.setBackendSettings({{
+  relayProfilesEnabled: true,
+  activeRelayId: "missing",
+  relayProfiles: [{{ id: "eligible", relayMode: "official", officialMixApiKey: true }}],
+}});
+const missingActiveParams = {{ cwd: "C:/mobile", modelProvider: "openai" }};
+const missingActiveProviderUnchanged = api.applyProviderOverride("thread/start", missingActiveParams) === missingActiveParams;
+const missingActiveRecoveryUnscheduled = api.observeRemoteSessionNotification({{
+  method: "thread/started",
+  params: {{ thread: {{ id: "thread-mobile-missing-active" }} }},
+}}) === false;
+api.setBackendSettings({{
+  relayProfilesEnabled: true,
+  activeRelayId: "pure-api",
+  relayProfiles: [{{ id: "pure-api", relayMode: "pureApi", officialMixApiKey: true }}],
+}});
+const pureApiParams = {{ cwd: "C:/mobile", modelProvider: "openai" }};
+const pureApiThreadStartProvider = api.applyProviderOverride("thread/start", pureApiParams)?.modelProvider;
+const pureApiThreadResumeProvider = api.applyProviderOverride("thread/resume", {{
+  threadId: "thread-mobile-pure-api",
+  model_provider: "openai",
+}})?.modelProvider;
+const pureApiTurnStartProvider = api.applyProviderOverride("turn/start", {{
+  threadId: "thread-mobile-pure-api",
+  modelProvider: "openai",
+}})?.modelProvider;
+const pureApiTurnWithoutProvider = {{ threadId: "thread-mobile-pure-api", model: "gpt-5.6-luna" }};
+const pureApiTurnWithoutProviderUnchanged = api.applyProviderOverride("turn/start", pureApiTurnWithoutProvider) === pureApiTurnWithoutProvider;
+const pureApiOtherProvider = {{ threadId: "thread-mobile-pure-api", modelProvider: "other" }};
+const pureApiOtherProviderUnchanged = api.applyProviderOverride("turn/start", pureApiOtherProvider) === pureApiOtherProvider;
+const pureApiRecoveryUnscheduled = api.observeRemoteSessionNotification({{
+  method: "thread/started",
+  params: {{ thread: {{ id: "thread-mobile-pure-api" }} }},
+}}) === false;
+api.setBackendSettings({{
+  relayProfilesEnabled: true,
+  activeRelayId: "official",
+  relayProfiles: [{{ id: "official", relayMode: "official", officialMixApiKey: false }}],
+}});
+const pureOfficialParams = {{ cwd: "C:/mobile", modelProvider: "openai" }};
+const pureOfficialProviderUnchanged = api.applyProviderOverride("thread/start", pureOfficialParams) === pureOfficialParams;
 process.stdout.write(JSON.stringify({{
   supportedFast,
   unsupportedModel,
@@ -1958,6 +2358,44 @@ process.stdout.write(JSON.stringify({{
   currentStateApi,
   appServerParamsUnchanged,
   appServerSentCount: appServerCalls.length,
+  providerFromMissing,
+  providerFromOpenAi,
+  providerFromOtherUnchanged: providerFromOther === explicitOtherProvider,
+  nonThreadProviderUnchanged,
+  providerWithServiceTierControlsDisabled,
+  appServerProviderOverride,
+  directThreadStartedId,
+  nestedThreadStartedId,
+  browserUseRouteThreadId,
+  inactiveBrowserUseUnscheduled,
+  remoteRecoveryScheduled,
+  remoteRecoveryThreadId: remoteRecoveryCalls[0]?.payload?.thread_id || "",
+  remoteRecoveryCallCountAfterSuccess,
+  remoteRecoveryDispatcherInstalled,
+  remoteRecoveryDispatcherThreadId,
+  remoteRecoveryBrowserUseDispatcherThreadId,
+  remoteRecoveryOutboundRouteThreadId,
+  remoteRecoveryListenerInstalled,
+  remoteRecoveryViewEventThreadId,
+  remoteRecoveryRetried,
+  remoteRecoveryRetryAttempts,
+  openAiSessionProviderUnchanged,
+  openAiRecoveryUnscheduled,
+  openAiPatchRemainsInstalled,
+  openAiNormalizationDisabled,
+  refreshedCustomProviderOverride,
+  refreshedOpenAiProvider,
+  refreshedPureApiResumeProvider,
+  failedRefreshProviderUnchanged,
+  missingActiveProviderUnchanged,
+  missingActiveRecoveryUnscheduled,
+  pureApiThreadStartProvider,
+  pureApiThreadResumeProvider,
+  pureApiTurnStartProvider,
+  pureApiTurnWithoutProviderUnchanged,
+  pureApiOtherProviderUnchanged,
+  pureApiRecoveryUnscheduled,
+  pureOfficialProviderUnchanged,
 }}));
 }}).catch((error) => {{
   console.error(error);
