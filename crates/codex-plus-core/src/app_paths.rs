@@ -686,9 +686,18 @@ fn codex_package_parts(package_name: &str) -> Option<(AppPackageSpec, &str, &str
 }
 
 fn strip_prefix_ignore_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
-    if value.len() < prefix.len() {
-        return None;
-    }
-    let (head, rest) = value.split_at(prefix.len());
+    let head = value.get(..prefix.len())?;
+    let rest = value.get(prefix.len()..)?;
     head.eq_ignore_ascii_case(prefix).then_some(rest)
+}
+
+#[cfg(test)]
+mod prefix_tests {
+    use super::strip_prefix_ignore_ascii_case;
+
+    #[test]
+    fn package_prefix_rejects_unicode_paths_without_panicking() {
+        assert_eq!(strip_prefix_ignore_ascii_case("Codex\u{7ef4}\u{62a4}\u{5de5}\u{7a0b}", "OpenAI.Codex"), None);
+        assert_eq!(strip_prefix_ignore_ascii_case("openai.codex_1", "OpenAI.Codex"), Some("_1"));
+    }
 }
