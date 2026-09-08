@@ -5417,8 +5417,6 @@ select {
   text-transform: uppercase;
 }
 
-/* 赞助位：极淡的品牌色渐变，与普通面板区分 */
-.jojocode-overview,
 .hero-panel {
   border-color: hsl(var(--brand-accent) / 0.24);
   background:
@@ -5429,14 +5427,6 @@ select {
       transparent 78%
     ),
     hsl(var(--card));
-}
-
-.jojocode-overview-mark {
-  border-color: transparent;
-  border-radius: var(--radius-lg);
-  background: linear-gradient(140deg, hsl(var(--brand-accent)), hsl(var(--brand-accent-2)));
-  box-shadow: 0 4px 14px hsl(var(--brand-accent) / 0.3);
-  color: #fff;
 }
 
 .service-model-tags span,
