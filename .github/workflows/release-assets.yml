@@ -29,14 +29,23 @@ jobs:
 
       - name: Install frontend dependencies
         working-directory: apps/codex-plus-manager
-        run: npm install --package-lock=false
+        run: npm ci --no-audit --no-fund
+
+      - name: Check frontend and promotion removal
+        working-directory: apps/codex-plus-manager
+        run: |
+          npm run check
+          npm test
 
       - name: Build frontend
         working-directory: apps/codex-plus-manager
         run: npm run vite:build
 
+      - name: Test core and custom update behavior
+        run: cargo test -p codex-plus-core --lib --test ads --test updater --test cdp_bridge
+
       - name: Build binaries
-        run: cargo build --release
+        run: cargo build --locked --release
 
       - name: Stage Windows app files
         shell: pwsh
@@ -103,7 +112,13 @@ jobs:
 
       - name: Install frontend dependencies
         working-directory: apps/codex-plus-manager
-        run: npm install --package-lock=false
+        run: npm ci --no-audit --no-fund
+
+      - name: Check frontend and promotion removal
+        working-directory: apps/codex-plus-manager
+        run: |
+          npm run check
+          npm test
 
       - name: Build frontend
         working-directory: apps/codex-plus-manager

@@ -70,7 +70,7 @@ const STEPWISE_SCRIPT: &str = concat!(
     "\n})();\n",
 );
 pub const DIAGNOSTIC_BUILD_ID: &str = "diag-20260518-1";
-const DREAM_SKIN_RENDERER_REVISION: &str = "20-modern-main-surface";
+const DREAM_SKIN_RENDERER_REVISION: &str = "24-home-composer-rounded";
 
 pub fn renderer_script() -> &'static str {
     RENDERER_SCRIPT
@@ -197,7 +197,7 @@ fn dream_skin_target_runtime_script(settings: &BackendSettings, include_art: boo
     });
     let skin_api_bootstrap = dream_skin_skin_api_bootstrap_script(&theme);
     payload = format!(
-        "(() => {{\nwindow.__CODEX_PLUS_EXTERNAL_DREAM_SKIN_RUNTIME__ = true;\nwindow.__CODEX_PLUS_CLEAR_DREAM_SKIN__?.();\n{}window.__CODEX_PLUS_DREAM_SKIN_ART_SIGNATURE__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_THEME__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_RUNTIME_REVISION__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_TARGET_ENGINE__ = {};\n{}const result = {};\nconst state = window.__CODEX_DREAM_SKIN_STATE__ || window.__CODEX_GLASS_VISION_SKIN_STATE__;\nif (state) {{\n  state.version = `codex-plus:${{String(window.__CODEX_PLUS_DREAM_SKIN_PLATFORM__ || 'unknown')}}:${{window.__CODEX_PLUS_DREAM_SKIN_TARGET_ENGINE__}}:r${{window.__CODEX_PLUS_DREAM_SKIN_RUNTIME_REVISION__}}`;\n  state.observer?.disconnect?.();\n  if (state.timer) clearInterval(state.timer);\n  state.observer = null;\n  state.timer = null;\n}}\nwindow.__CODEX_PLUS_DREAM_SKIN_PAYLOAD_SIGNATURE__ = {};\nreturn result;\n}})()",
+        "(() => {{\nwindow.__CODEX_PLUS_EXTERNAL_DREAM_SKIN_RUNTIME__ = true;\nwindow.__CODEX_PLUS_CLEAR_DREAM_SKIN__?.();\n{}window.__CODEX_PLUS_DREAM_SKIN_ART_SIGNATURE__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_THEME__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_RUNTIME_REVISION__ = {};\nwindow.__CODEX_PLUS_DREAM_SKIN_TARGET_ENGINE__ = {};\n{}const result = {};\nconst state = window.__CODEX_DREAM_SKIN_STATE__ || window.__CODEX_GLASS_VISION_SKIN_STATE__;\nif (state) {{\n  state.version = `codex-plus:${{String(window.__CODEX_PLUS_DREAM_SKIN_PLATFORM__ || 'unknown')}}:${{window.__CODEX_PLUS_DREAM_SKIN_TARGET_ENGINE__}}:r${{window.__CODEX_PLUS_DREAM_SKIN_RUNTIME_REVISION__}}`;\n}}\nwindow.__CODEX_PLUS_DREAM_SKIN_PAYLOAD_SIGNATURE__ = {};\nreturn result;\n}})()",
         art_assignment.unwrap_or_default(),
         serde_json::to_string(&dream_skin_art_content_signature(settings)).unwrap(),
         theme,
@@ -262,11 +262,28 @@ fn dream_skin_skin_api_bootstrap_script(theme: &str) -> String {
     "composer-toolbar": ".composer-surface-chrome [role='toolbar']", dialog: "[role='dialog']",
   }};
   const mark = () => {{
-    for (const [part, selector] of Object.entries(map)) for (const node of document.querySelectorAll(selector)) node.setAttribute("data-ds-part", part);
+    for (const [part, selector] of Object.entries(map)) for (const node of document.querySelectorAll(selector)) {{
+      // data-ds-part 是皮肤 API 的挂载点标记，值不变时绝不重写，避免长会话里对每条消息重复置属性
+      if (node.getAttribute("data-ds-part") !== part) node.setAttribute("data-ds-part", part);
+    }}
   }};
   mark();
   window.__CODEX_PLUS_DREAM_SKIN_API_OBSERVER__?.disconnect?.();
-  const observer = new MutationObserver(() => mark());
+  let markTimer = null;
+  const scheduleMark = () => {{
+    if (markTimer !== null) return;
+    markTimer = setTimeout(() => {{
+      markTimer = null;
+      mark();
+    }}, 250);
+  }};
+  const observer = new MutationObserver((records) => {{
+    // 流式输出只产生纯文本节点增删，不会增减皮肤挂载点；这类批次直接跳过（issue #2181）
+    if (records.every((record) =>
+      [...record.addedNodes].every((node) => node.nodeType === 3)
+      && [...record.removedNodes].every((node) => node.nodeType === 3))) return;
+    scheduleMark();
+  }});
   observer.observe(document.documentElement, {{ childList: true, subtree: true }});
   window.__CODEX_PLUS_DREAM_SKIN_API_OBSERVER__ = observer;
 }})();"#,
@@ -453,7 +470,11 @@ pub fn injection_script_with_settings(helper_port: u16, settings: &BackendSettin
         serde_json::to_string(&fast_startup).expect("fast startup config should serialize"),
         serde_json::to_string(&hide_official_usage_alert)
             .expect("usage alert config should serialize"),
-        renderer_script(),
+        format!(
+            "{}\n{}",
+            include_str!("../../../assets/inject/api-quota-gate.js"),
+            renderer_script()
+        ),
         stepwise_runtime,
         dream_skin_target_runtime,
     )

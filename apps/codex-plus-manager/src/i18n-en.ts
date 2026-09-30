@@ -15,6 +15,8 @@ export const EN_PLAIN: Record<string, string> = {
   "启动中": "Starting",
   "启动仍在后台进行，可在概览的“最近启动”中查看状态。": "Startup is still running in the background. Check Recent Launch on Overview for its status.",
   "正在等待 Codex 重新启动…": "Waiting for Codex to restart...",
+  "原生浏览器文件恢复失败，仍会继续启动。":
+    "Native browser files could not be restored. Codex will still start.",
   "正在等待 Codex 启动结果…": "Waiting for the Codex startup result...",
   "运行中（增强等待中）": "Running (waiting for enhancements)",
   "API Key 模式下扩展插件市场请求，尽量显示完整插件列表；官方/混合模式通常不需要。":
@@ -285,6 +287,9 @@ export const EN_PLAIN: Record<string, string> = {
   "上次修复结果": "Last repair result",
   "上次更新结果": "Last update result",
   "上游协议": "Upstream protocol",
+  "纯标准协议": "Standard protocol only",
+  "仅在上游协议为 Chat Completions 时可用。Responses API 会原样转发。": "Available only when the upstream protocol is Chat Completions. Responses API requests are forwarded unchanged.",
+  "强制走标准 OpenAI 协议，不注入厂商私有 reasoning 参数。面向只认标准 OpenAI 字段、拒绝厂商私有参数的第三方网关。": "Force the standard OpenAI protocol without vendor-specific reasoning parameters, for third-party gateways that accept only standard OpenAI fields and reject vendor-bundled private parameters.",
   "上一页": "Previous page",
   "下一页": "Next page",
   "下载并运行安装包": "Download and run installer",
@@ -327,6 +332,70 @@ export const EN_PLAIN: Record<string, string> = {
   "供应商测试": "Provider test",
   "供应商测试模型": "Provider test model",
   "供应商配置": "Provider configuration",
+  "工具切换": "Tool switcher",
+  "工具列表": "Tool list",
+  "该工具暂不可切换": "That tool cannot be switched yet",
+  "待接入": "Coming soon",
+  "Grok 供应商": "Grok providers",
+  "每个供应商对应一套 Base URL + API Key + 模型列表；「应用到 Grok」会把它写进 ~/.grok/config.toml。":
+    "Each provider is one Base URL + API key + model list; Apply to Grok writes it into ~/.grok/config.toml.",
+  "应用到 Grok": "Apply to Grok",
+  "新建 Grok 供应商": "New Grok provider",
+  "新增供应商": "Add provider",
+  "请先选择一个供应商": "Select a provider first",
+  "未填写 Base URL": "No Base URL yet",
+  "留空则不改动 Grok 里已有的 Key": "Leave blank to keep the key already in Grok",
+  "每行一个模型，可用 [1M] / [200K] 后缀声明上下文窗口。改完点「保存此供应商」，再点「应用到 Grok」生效。":
+    "One model per line; a [1M] / [200K] suffix declares its context window. Click Save provider first, then Apply to Grok to write it.",
+  "保存此供应商": "Save provider",
+  "没有需要保存的修改": "No changes to save",
+  "请先保存当前修改": "Save your changes first",
+  "请先保存当前供应商，再应用到 Grok。": "Save the current provider before applying it to Grok.",
+  "已保存": "Saved",
+  "工具": "Tool",
+  "配置目录": "Config directory",
+  "配置切换": "Config switching",
+  "已接入，可在该工具页切换供应商。": "Wired up — switch providers on that tool's own page.",
+  "尚未接入配置切换。": "Config switching is not wired up yet.",
+  "该工具由它自己的页签管理": "This tool is managed on its own tab",
+  "打开推荐内容": "Open recommendation",
+  "Codex 供应商设置": "Codex provider settings",
+  "只作用于 Codex 供应商的配置": "Applies only to Codex providers",
+  "「测试供应商」按钮用这个模型发起一次真实请求，用于判断 Key 与端点是否可用。":
+    "The Test provider button sends one real request with this model to check that the key and endpoint work.",
+  "Codex 图片覆盖层": "Codex image overlay",
+  "在当前 Codex 会话上叠加一张背景图": "Overlay a background image on the current Codex session",
+  "这个工具目前没有独立设置项": "This tool has no settings of its own yet",
+  "该工具的配置在它自己的页签里管理；上面的基础设置对所有工具通用。":
+    "This tool is configured on its own tab; the basic settings above apply to every tool.",
+  "赞助商推荐": "Sponsor recommendations",
+  "普通推荐内容": "General recommendations",
+  "有未保存修改。": "Unsaved changes.",
+  "每个供应商对应一套 Base URL + API Key + 模型列表。":
+    "Each provider is one Base URL + API key + model list.",
+  "还没有 Grok 供应商": "No Grok provider yet",
+  "点「新增供应商」，填好 Base URL、API Key 和模型列表，再点「应用到 Grok」。":
+    "Click Add provider, fill in the Base URL, API key and model list, then click Apply to Grok.",
+  "编辑供应商": "Edit provider",
+  "每行一个模型，可用 [1M] / [200K] 后缀声明上下文窗口。":
+    "One model per line; a [1M] / [200K] suffix declares its context window.",
+  "改完点「保存此供应商」，再点「应用到 Grok」生效。":
+    "When done, click Save provider, then Apply to Grok to write it.",
+  "CLI": "CLI",
+  "全局端点": "Global endpoint",
+  "受管模型": "Managed models",
+  "Grok 当前配置": "Grok's current config",
+  "读取 ~/.grok/config.toml": "Reading ~/.grok/config.toml",
+  "未设置": "Not set",
+  "无": "None",
+  "尚未读取。": "Not loaded yet.",
+  "应用到 Grok？": "Apply to Grok?",
+  "确认应用": "Confirm and apply",
+  "已新增": "Added",
+  "已应用": "Applied",
+  "应用失败": "Apply failed",
+  "应用中": "Applying",
+  "刷新中": "Refreshing",
   "供应商配置可能不正确": "Provider configuration may be incorrect",
   "供应商配置已关闭": "Provider configuration disabled",
   "供应商配置总开关已关闭": "The provider configuration master switch is off",
@@ -395,6 +464,11 @@ export const EN_PLAIN: Record<string, string> = {
   "刷新市场": "Refresh marketplace",
   "刷新当前页面": "Refresh current page",
   "刷新本地": "Refresh local",
+  "热重载脚本": "Reload scripts",
+  "应用本地脚本及开关；旧脚本可能需要刷新 Codex 页面": "Apply local scripts and switches; legacy scripts may require refreshing the Codex page",
+  "部分脚本执行失败，请查看本地脚本状态。": "Some scripts failed. Check the local script status.",
+  "用户脚本已热重载。": "User scripts reloaded.",
+  "已请求刷新 Codex 页面以安全重载旧脚本。": "Refreshing the Codex page to safely reload legacy scripts.",
   "刷新项目": "Refresh projects",
   "加入当前工作区": "Add to current workspace",
   "包含版本、路径、设置和平台信息": "Includes version, paths, settings and platform info",
@@ -707,8 +781,8 @@ export const EN_PLAIN: Record<string, string> = {
   "混入 API": "Mixed-in API",
   "混入 API KEY": "Mix in API KEY",
   "关闭官方低额度提示": "Hide official low-usage alert",
-  "关闭后仍可从 Codex 左下角账户菜单查看官方剩余额度。":
-    "When hidden, you can still view the official quota from the account menu in the lower-left corner of Codex.",
+  "只隐藏低额度和已用完提示，不改变发送限制。左下角账户菜单仍显示官方剩余额度。":
+    "Only hides low-usage and exhausted prompts. It does not change send restrictions. The account menu in Codex's lower-left corner still shows the official remaining quota.",
   "混入 API Key": "Mix in API Key",
   "添加供应商": "Add provider",
   "添加模型": "Add model",
@@ -786,6 +860,19 @@ export const EN_PLAIN: Record<string, string> = {
     "An aggregate provider needs at least 1 selected API provider with a Base URL / Key filled in.",
   "聚合策略": "Aggregate strategy",
   "聚合配置只引用已有供应商，不复制 Key 和配置文件": "Aggregate config only references existing providers; it doesn't copy keys or config files",
+  "该路由的目标供应商不可用或未选择，请重新选择或删除该规则。": "Route target provider is unavailable or unselected; pick one or delete this rule.",
+  "路由规则": "Route rules",
+  "按模型名自动路由到指定成员；仅支持 * 通配符，chat/completions 协议不走路由。":
+    "Automatically route models to a member; only * wildcards are supported and chat/completions traffic is not routed.",
+  "例如 deepseek-*": "e.g. deepseek-*",
+  "优先级": "Priority",
+  "删除规则": "Delete rule",
+  "暂无路由规则，未匹配的模型会按聚合策略选择成员。":
+    "No route rules yet; unmatched models fall back to the aggregate strategy.",
+  "添加规则": "Add rule",
+  "路由规则的模型匹配模式不能为空。": "Route rule model pattern must not be empty.",
+  "路由目标必须是已勾选的聚合成员，请先在成员供应商中勾选。":
+    "Route target must be a checked aggregate member; check it under Member providers first.",
   "脚本市场": "Script marketplace",
   "自动接管": "Auto-takeover",
   "覆盖图片": "Overlay image",
@@ -1074,11 +1161,35 @@ export const EN_PLAIN: Record<string, string> = {
     "❌ Batch description parse failed (should not trigger for single-image tests)",
   "❌ HTTP 客户端构建失败": "❌ Failed to build the HTTP client",
   "❌ 未知错误": "❌ Unknown error",
+  // issue #1685：供应商自定义上游请求头。
+  "自定义请求头": "Custom request headers",
+  "请求头名称": "Header name",
+  "请求头值": "Header value",
+  "自定义请求头会同时用于测试连接、模型列表与实际代理请求。":
+    "Custom headers apply to the connection test, the model list and proxied requests alike.",
+  "Host、Content-Length 等传输头由协议层掌控，不能覆盖；配置 Authorization 时以它为准，不再注入 API Key。":
+    "Transport headers such as Host and Content-Length are managed by the proxy and cannot be overridden. When Authorization is set here it takes precedence and the API key is not injected.",
 };
 
 // Interpolated strings: tf("前缀 {0}", [x]) -> EN_TEMPLATE["前缀 {0}"] with {0} filled.
 export const EN_TEMPLATE: Record<string, string> = {
+  "路由规则「{0}」的优先级必须是大于等于 0 的整数。":
+    "Route rule \"{0}\" priority must be an integer greater than or equal to 0.",
+  "路由规则「{0}」的目标供应商必须是聚合成员，请先将其勾选为成员。":
+    "Route rule \"{0}\" target provider must be an aggregate member; select it as a member first.",
   "{0} 个模型": "{0} model(s)",
+  "{0}｜{1}｜{2} 个供应商": "{0} | {1} | {2} provider(s)",
+  "{0}｜{1}｜供应商配置尚未接入": "{0} | {1} | provider configuration not wired up yet",
+  "{0} 的供应商配置还没接入，切过去只会显示空列表。":
+    "Provider configuration for {0} is not wired up yet, so switching would only show an empty list.",
+  "{0} 状态": "{0} status",
+  "{0} 设置": "{0} settings",
+  "{0} 个已保存": "{0} saved",
+  "Grok 里所有由 Codex++ 管理的模型表会被供应商「{0}」的模型列表整体替换（[ui]、web_search 等未管理字段保留）。原配置会先备份。":
+    "Every model table managed by Codex++ in Grok will be replaced wholesale by the model list of provider \"{0}\" (unmanaged fields such as [ui] and web_search are kept). The previous config is backed up first.",
+  "已新增供应商「{0}」，填好模型列表后点「应用到 Grok」。":
+    "Added provider \"{0}\"; fill in its model list and click Apply to Grok.",
+  "供应商「{0}」已保存。": "Provider \"{0}\" saved.",
   "删除 Grok 模型「{0}」？": "Delete Grok model \"{0}\"?",
   "模型「{0}」的上下文窗口必须是大于 0 的整数。": "The context window for model \"{0}\" must be a positive integer.",
   "作者：{0} · {1}": "Author: {0} · {1}",
@@ -1212,9 +1323,6 @@ export const EN_BACKEND: Record<string, string> = {
   "脚本删除失败": "Failed to delete script",
   "只允许打开 http 或 https 链接。": "Only http or https links can be opened.",
   "已在系统浏览器打开链接。": "Link opened in system browser.",
-  "安装入口": "Install entrypoints",
-  "卸载入口": "Uninstall entrypoints",
-  "修复快捷方式": "Repair shortcuts",
   "修复后重新读取设置失败": "Failed to reload settings after repair",
   "插件市场需要初始化或注册。": "Plugin marketplace needs initialization or registration.",
   "插件市场已可用。": "Plugin marketplace is available.",
@@ -1260,7 +1368,6 @@ export const EN_BACKEND: Record<string, string> = {
   "纯 API 配置写入后未检测到完整 custom provider，请检查 config.toml 和供应商 API Key。": "After writing pure API config, no complete custom provider was detected. Please check config.toml and the provider API Key.",
   "供应商导入后重新读取设置失败": "Failed to reload settings after provider import",
   "诊断日志已写入。": "Diagnostics log written.",
-  "未命名供应商": "Unnamed provider",
   "响应内容为空": "Response is empty",
 };
 

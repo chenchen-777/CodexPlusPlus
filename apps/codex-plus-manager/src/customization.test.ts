@@ -13,4 +13,5 @@ test("777 build keeps relay marketing and recommendation UI out of the manager",
   assert.doesNotMatch(source, /jojocode\.com|JOJO Code|jojocode-overview/i);
   assert.doesNotMatch(source, /id:\s*"recommendations"|route === "recommendations"/);
   assert.doesNotMatch(source, /BigPizzaV3\/Ad-List/);
+  assert.doesNotMatch(source, /load_ads|refreshAds/);
 });

@@ -55,10 +55,15 @@ pub fn parse_version_tag(value: &str) -> anyhow::Result<Vec<u64>> {
     if digits.is_empty() {
         anyhow::bail!("Invalid version tag: {value}");
     }
-    digits
+    let mut parts = digits
         .split('.')
         .map(|part| part.parse::<u64>().map_err(Into::into))
-        .collect()
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    // 定制修订号也参与比较，保证同一上游版本的后续定制包可更新。
+    if let Some((_, revision)) = normalized.split_once("-777.") {
+        parts.extend([777, revision.parse::<u64>()?]);
+    }
+    Ok(parts)
 }
 
 pub fn is_newer_version(candidate: &str, current: &str) -> anyhow::Result<bool> {

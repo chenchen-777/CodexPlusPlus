@@ -199,3 +199,10 @@ fn download_asset_to_writes_bytes() {
     assert_eq!(path, dir.path().join("pkg.zip"));
     assert_eq!(std::fs::read(path).unwrap(), b"abcdef");
 }
+
+#[test]
+fn custom_revision_updates_within_the_same_upstream_version() {
+    assert!(is_newer_version("v1.4.0-777.2", "v1.4.0-777.1").unwrap());
+    assert!(!is_newer_version("v1.4.0-777.1", "v1.4.0-777.2").unwrap());
+    assert!(!is_newer_version("v1.4.0-777.1", "v1.4.0-777.1").unwrap());
+}
