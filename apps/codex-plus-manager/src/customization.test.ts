@@ -15,3 +15,15 @@ test("777 build keeps relay marketing and recommendation UI out of the manager",
   assert.doesNotMatch(source, /BigPizzaV3\/Ad-List/);
   assert.doesNotMatch(source, /load_ads|refreshAds/);
 });
+
+test("777 renderer fragments and assembled asset never load relay advertising", async () => {
+  const paths = ["../../../assets/inject/renderer-inject.js", "../../../assets/inject/renderer-inject/40-backend-settings.js", "../../../assets/inject/renderer-inject/00-prelude.js"];
+  for (const path of paths) {
+    const source = await readFile(new URL(path, import.meta.url), "utf8");
+    assert.doesNotMatch(source, /BigPizzaV3\/Ad-List|fetchCodexPlusAds|directFetchCodexPlusAds|codexPlusRailSponsorId|codexPlusSponsorTab|renderCodexPlusAds/);
+  }
+  const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+  assert.match(renderer, /function runPluginAutoExpand/);
+  assert.match(renderer, /pluginAutoExpand: "codexAppPluginAutoExpand"/);
+  assert.match(renderer, /function openCodexPlusExtensions/);
+});
