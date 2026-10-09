@@ -4891,7 +4891,7 @@ fn manager_ui_exposes_pure_api_relay_mode_button() {
 }
 
 #[test]
-fn manager_ui_disables_plugin_auto_expand_in_compatible_mode() {
+fn manager_ui_controls_plugin_auto_expand_with_master_switch() {
     let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(std::path::Path::parent)
@@ -4899,7 +4899,7 @@ fn manager_ui_disables_plugin_auto_expand_in_compatible_mode() {
     let source = std::fs::read_to_string(repo.join("apps/codex-plus-manager/src/App.tsx")).unwrap();
 
     assert!(source.contains(
-        "checked={form.codexAppPluginAutoExpand} disabled={!masterEnabled || !patchMode}"
+        "checked={form.codexAppPluginAutoExpand} disabled={!masterEnabled}"
     ));
 }
 
