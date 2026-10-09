@@ -7,7 +7,7 @@
    */
   function isExtensionUiNode(node) {
     if (!node?.closest) return false;
-    if (node.closest(`.codex-delete-toast, .codex-delete-confirm-overlay, .codex-plus-modal-overlay, .${codexPlusPageClass}, #${codexPlusSidebarNavId}, #${codexPlusRailNavId}, #${codexPlusRailExtensionsId}, #${codexPlusRailNavId} > button, #${codexPlusRailExtensionsId} > button, .${codexServiceTierBadgeClass}, .${sessionShareButtonClass}, .codex-zed-remote-button, .codex-zed-remote-toast, .${sessionCopyMenuItemClass}, #codex-plus-menu`)) {
+    if (node.closest(`.codex-delete-toast, .codex-delete-confirm-overlay, .codex-plus-modal-overlay, .${codexPlusPageClass}, #${codexPlusSidebarNavId}, #${codexPlusRailNavId}, #${codexPlusRailExtensionsId}, #${codexPlusRailNavId} > button, #${codexPlusRailExtensionsId} > button, .${codexServiceTierBadgeClass}, .${sessionShareButtonClass}, .${sessionCopyMenuItemClass}, #codex-plus-menu`)) {
       return true;
     }
     return isCodexPlusExtensionNode(node);
@@ -29,8 +29,8 @@
       selectors.archiveNav,
       selectors.pluginNavButton,
       'aside.app-shell-left-panel nav[role="navigation"]',
-      codexMenuLocalizationScopeSelector(),
-      ...(pluginPatchDisabledInRelayMode() ? [] : [selectors.disabledInstallButton]),
+      'nav[data-app-navigation-rail]',
+      ...(codexPluginMarketplacePatchEnabled() ? [selectors.disabledInstallButton] : []),
     ].join(", ");
   }
 
@@ -83,7 +83,6 @@
 
   function scheduleScan(mutations) {
     window.__codexSessionDeleteLastMutations = mutations;
-    scheduleZedRemoteMenuRefresh(mutations);
     if (!shouldScheduleScan(mutations)) return;
     if (window.__codexSessionDeleteScanPending) return;
     window.__codexSessionDeleteScanPending = true;
@@ -123,8 +122,6 @@
   }
 
   void loadBackendSettingsForStartup();
-  installUpstreamBranchDropdownAdapter();
-  installUpstreamWorktreeNativeAdapter();
   scan();
   syncOfficialUsagePolicy();
   scheduleSidebarNavStartupRetry();

@@ -1,4 +1,7 @@
   function installCodexPlusNavigationEntries() {
+    // 插件入口沿用原生按钮，清理旧注入留下的重复商店入口。
+    document.getElementById(codexPlusRailPluginMarketId)?.remove();
+    document.getElementById(codexPlusSidebarPluginMarketId)?.remove();
     if (installCodexPlusRailNavigation()) {
       detachCodexPlusSidebarNavigation();
       return;
@@ -84,16 +87,20 @@
     if (name === "openai-curated") return "OpenAI插件2(Codex++)";
     if (name === "openai-primary-runtime") return "OpenAI插件3(Codex++)";
     if (name === "openai-api-curated") return "OpenAI插件4(Codex++)";
-    // 内置插件包的注册名。曾经叫 openai-curated-remote，但那是 codex 的保留名，
-    // 注册在它下面会被静默忽略，已改为 codex-plus-curated；旧名保留以兼容
-    // 尚未升级的配置。
+    // 兼容原生返回的既有旧配置名称；这里不会注入、缓存或注册插件市场。
     if (name === "codex-plus-curated" || name === "openai-curated-remote") return "OpenAI插件5(Codex++)";
     return fallback;
   }
 
   function patchPluginMarketplaceObject(marketplace) {
     if (!marketplace || typeof marketplace !== "object" || marketplace.__codexPlusMarketplaceUnlockPatched) return false;
-    const displayName = displayNameForPluginMarketplaceName(marketplace.name, marketplace.displayName || marketplace.title || marketplace.label || marketplace.name);
+    // 上游已经给了显示名就用上游的（issue #692：此前无条件用上面的中文编号覆盖，
+    // 用户看到的是「OpenAI插件1(Codex++)」而不是市场真实名字）。
+    // 编号映射只在市场上游确实没给显示名时兜底；去重仍走 restorePluginMarketplaceName，
+    // 与显示名无关，所以不会因此退回重复条目。
+    const upstreamDisplayName = marketplace.displayName || marketplace.title || marketplace.label || "";
+    const displayName = upstreamDisplayName
+      || displayNameForPluginMarketplaceName(marketplace.name, marketplace.name);
     if (!displayName || displayName === marketplace.name) return false;
     marketplace.displayName = displayName;
     marketplace.title = displayName;
@@ -111,92 +118,6 @@
     }
     marketplace.__codexPlusMarketplaceUnlockPatched = true;
     return true;
-  }
-
-  function cloneCodexPluginMarketplace(value) {
-    if (!value || typeof value !== "object") return null;
-    try {
-      return JSON.parse(JSON.stringify(value));
-    } catch {
-      return null;
-    }
-  }
-
-  function pluginMarketplacePluginKey(plugin) {
-    if (!plugin || typeof plugin !== "object") return "";
-    return String(plugin.name || plugin.id || plugin.pluginName || "").trim();
-  }
-
-  function normalizeLocalPluginMarketplacePlugin(plugin, marketplaceName) {
-    const cloned = cloneCodexPluginMarketplace(plugin);
-    if (!cloned || typeof cloned !== "object") return null;
-    const name = String(cloned.name || cloned.id || cloned.pluginName || "").trim();
-    if (!name) return null;
-    if (!cloned.name) cloned.name = name;
-    if (!cloned.id) cloned.id = `${name}@${marketplaceName}`;
-    if (!cloned.marketplaceName) cloned.marketplaceName = marketplaceName;
-    if (!cloned.marketplacePath) cloned.marketplacePath = marketplaceName;
-    if (!cloned.interface || typeof cloned.interface !== "object") cloned.interface = {};
-    if (!cloned.interface.displayName) cloned.interface.displayName = name;
-    if (!Array.isArray(cloned.keywords)) cloned.keywords = [];
-    return cloned;
-  }
-
-  function mergePluginMarketplacePlugins(target, source) {
-    if (!target || !source || !Array.isArray(source.plugins)) return 0;
-    if (!Array.isArray(target.plugins)) target.plugins = [];
-    const marketplaceName = restorePluginMarketplaceName(target.name || source.name || "");
-    const existing = new Set(target.plugins.map(pluginMarketplacePluginKey).filter(Boolean));
-    let added = 0;
-    source.plugins.forEach((plugin) => {
-      const key = pluginMarketplacePluginKey(plugin);
-      if (!key || existing.has(key)) return;
-      const cloned = normalizeLocalPluginMarketplacePlugin(plugin, marketplaceName);
-      if (!cloned) return;
-      target.plugins.push(cloned);
-      existing.add(key);
-      added += 1;
-    });
-    return added;
-  }
-
-  function mergeLocalPluginMarketplaces(result) {
-    if (!result || typeof result !== "object" || !Array.isArray(result.marketplaces)) {
-      return { addedMarketplaces: 0, addedPlugins: 0 };
-    }
-    const localMarketplaces = Array.isArray(window.__CODEX_PLUS_PLUGIN_MARKETPLACES__)
-      ? window.__CODEX_PLUS_PLUGIN_MARKETPLACES__
-      : [];
-    if (!localMarketplaces.length) return { addedMarketplaces: 0, addedPlugins: 0 };
-    const byName = new Map();
-    result.marketplaces.forEach((marketplace) => {
-      const name = restorePluginMarketplaceName(marketplace?.name || "");
-      if (name) byName.set(name, marketplace);
-    });
-    let addedMarketplaces = 0;
-    let addedPlugins = 0;
-    localMarketplaces.forEach((marketplace) => {
-      const name = restorePluginMarketplaceName(marketplace?.name || "");
-      if (!name) return;
-      const existing = byName.get(name);
-      if (existing) {
-        addedPlugins += mergePluginMarketplacePlugins(existing, marketplace);
-        return;
-      }
-      const cloned = cloneCodexPluginMarketplace(marketplace);
-      if (!cloned) return;
-      cloned.plugins = Array.isArray(cloned.plugins)
-        ? cloned.plugins.map((plugin) => normalizeLocalPluginMarketplacePlugin(plugin, name)).filter(Boolean)
-        : [];
-      result.marketplaces.push(cloned);
-      byName.set(name, cloned);
-      addedMarketplaces += 1;
-      addedPlugins += Array.isArray(cloned.plugins) ? cloned.plugins.length : 0;
-    });
-    if (addedMarketplaces > 0 || addedPlugins > 0) {
-      sendCodexPlusDiagnostic("plugin_marketplace_local_merged", { addedMarketplaces, addedPlugins });
-    }
-    return { addedMarketplaces, addedPlugins };
   }
 
   function restorePluginMarketplaceName(name) {
@@ -228,16 +149,39 @@
     return source;
   }
 
+  // 这三种 marketplace 过滤器由 Codex 打包后压缩，标识符每版都会换名
+  // （历史形态: !u(e.marketplaceName)||e.marketplaceName===r / !ne(...) / !Eu(...) /
+  // 26.928.31416 起: !Mj(e.marketplaceName)||e.marketplaceName===n）。
+  // 所以按「结构」而不是按字面量识别，避免每次发版都要补一个新变体。
+  const codexPluginBuildFlavorFilterSourcePattern =
+    /!\s*([A-Za-z_$][\w$]*)\s*\(\s*([A-Za-z_$][\w$]*)\s*\.marketplaceName\s*\)\s*\|\|\s*\2\s*\.marketplaceName\s*===\s*[A-Za-z_$][\w$]*/;
+  // featuredPluginIds 那条：{let t=Gj(e);return t==null||!Mj(t)||t===n}
+  // 入参是 plugin id 字符串（不是对象），先取 marketplace 再判，形态和上面不同，需单独认。
+  // 三个 X 必须同一个标识符，且 `===` 右边是标识符而非调用——否则会误伤 bundle 里
+  // 形如 `t==null||r==null||!ds(r)||r===SFe(t)` 的无关函数（实测存在）。
+  // 右值后面必须紧跟非标识符字符（`(?![\w$(])`），光写 `(?!\s*\()` 会被贪婪回溯绕过：
+  // `===SFe(t)` 里 `SFe` 可退回 `SF`，后面 `e` 不是 `(`，前瞻就放行了。实测踩过。
+  const codexPluginFeaturedFilterSourcePattern =
+    /([A-Za-z_$][\w$]*)\s*==\s*null\s*\|\|\s*!\s*[A-Za-z_$][\w$]*\s*\(\s*\1\s*\)\s*\|\|\s*\1\s*===\s*[A-Za-z_$][\w$]*(?![\w$(])/;
+
   function isCodexPluginBuildFlavorFilter(callback, sample, filtered = null) {
     if (!Array.isArray(sample) || sample.length === 0 || typeof callback !== "function") return false;
     if (!sample.some((plugin) => codexPluginOfficialMarketplaceName(plugin?.marketplaceName))) return false;
     const source = codexPluginFilterCallbackSource(callback);
     if (!source) return false;
-    const isKnownFilterSource = source.includes("!u(e.marketplaceName)||e.marketplaceName===r")
-      || source.includes("!ne(e.marketplaceName)||e.marketplaceName===n")
-      || source.includes("!Eu(e.marketplaceName)||e.marketplaceName===n");
-    if (!isKnownFilterSource) return false;
+    if (!codexPluginBuildFlavorFilterSourcePattern.test(source)) return false;
     return sample.some((plugin) => codexPluginOfficialMarketplaceName(plugin?.marketplaceName)
       && (Array.isArray(filtered) ? !filtered.includes(plugin) : !callback(plugin)));
   }
 
+  // featuredPluginIds 过滤：sample 是字符串数组，回调按 id 反查 marketplace 后剔除官方目录。
+  // 外部拿不到 id→marketplace 的映射，所以这里只做「结构 + 确实过滤掉了元素」的判定。
+  function isCodexPluginFeaturedFilter(callback, sample, filtered = null) {
+    if (!Array.isArray(sample) || sample.length === 0 || typeof callback !== "function") return false;
+    if (!sample.every((id) => typeof id === "string")) return false;
+    const source = codexPluginFilterCallbackSource(callback);
+    if (!source) return false;
+    if (!codexPluginFeaturedFilterSourcePattern.test(source)) return false;
+    if (Array.isArray(filtered) && filtered.length >= sample.length) return false;
+    return true;
+  }

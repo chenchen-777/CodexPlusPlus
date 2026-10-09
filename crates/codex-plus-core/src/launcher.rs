@@ -27,12 +27,17 @@ const BRIDGE_HEALTH_FAILURE_THRESHOLD: u8 = 2;
 /// 改变了页面上下文），避免每 10~15 秒重发一次完整注入脚本（issue #2169）。
 const BRIDGE_REINJECT_BACKOFF_BASE_SECS: u64 = 10;
 const BRIDGE_REINJECT_BACKOFF_CAP_SECS: u64 = 300;
+/// 重注入后紧接着的那次健康检查必然通过（`lastInjectionAt` 还在 5 秒窗口内），
+/// 若一见健康就清零，退避会永远停在第一档、根本挡不住周期性重注入（issue #2330）。
+/// 必须持续健康满这么久才清零。
+const BRIDGE_REINJECT_BACKOFF_RESET_AFTER_SECS: u64 = 60;
 
-/// 看门狗内跟踪重注入退避状态；健康恢复或应用实例更换时重置。
+/// 看门狗内跟踪重注入退避状态；持续健康一段时间或应用实例更换时重置。
 #[derive(Debug, Default)]
 struct BridgeReinjectBackoff {
     consecutive_attempts: u32,
     next_allowed_at: Option<std::time::Instant>,
+    healthy_since: Option<std::time::Instant>,
 }
 
 fn reinject_backoff_delay(consecutive_attempts: u32) -> std::time::Duration {
@@ -60,6 +65,22 @@ impl BridgeReinjectBackoff {
     fn reset(&mut self) {
         self.consecutive_attempts = 0;
         self.next_allowed_at = None;
+        self.healthy_since = None;
+    }
+
+    /// 观测到一次健康：持续健康满 `BRIDGE_REINJECT_BACKOFF_RESET_AFTER_SECS` 才清零。
+    fn observe_healthy(&mut self, now: std::time::Instant) {
+        let since = *self.healthy_since.get_or_insert(now);
+        if now.saturating_duration_since(since)
+            >= std::time::Duration::from_secs(BRIDGE_REINJECT_BACKOFF_RESET_AFTER_SECS)
+        {
+            self.reset();
+        }
+    }
+
+    /// 观测到一次不健康：重新计时。
+    fn observe_unhealthy(&mut self) {
+        self.healthy_since = None;
     }
 }
 const MACOS_DEBUG_TAKEOVER_WAIT_MS: u64 = 5_000;
@@ -161,6 +182,7 @@ pub struct LaunchHandle {
     pub app_dir: PathBuf,
     pub launch: CodexLaunch,
     pub status_store: StatusStore,
+    status_started_at_ms: u64,
     helper_started: bool,
     hooks: Arc<dyn LaunchHooks>,
 }
@@ -188,8 +210,58 @@ impl LaunchHandle {
             self.hooks.shutdown_helper(self.helper_port).await;
         }
         self.hooks.stop_native_browser_compatibility().await;
+        let (status, message) = match &result {
+            Ok(()) => (
+                "stopped",
+                "Codex target is no longer available; launcher stopped.".to_string(),
+            ),
+            Err(error) => (
+                "failed",
+                format!("Codex process monitoring failed: {error:#}"),
+            ),
+        };
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "launcher.exited",
+            serde_json::json!({
+                "debug_port": self.debug_port,
+                "helper_port": self.helper_port,
+                "status": status,
+                "message": message,
+            }),
+        );
+        if let Err(error) = save_terminal_launch_status(
+            &self.status_store,
+            self.status_started_at_ms,
+            status,
+            &message,
+        ) {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "launcher.exit_status_failed",
+                serde_json::json!({ "message": format!("{error:#}") }),
+            );
+        }
         result
     }
+}
+
+fn save_terminal_launch_status(
+    store: &StatusStore,
+    started_at_ms: u64,
+    status: &str,
+    message: &str,
+) -> anyhow::Result<()> {
+    let Some(mut latest) = store.load_latest()? else {
+        return Ok(());
+    };
+    // 重启过程中管理器可能已写入新请求；旧 launcher 不能把它覆盖成 stopped。
+    if latest.started_at_ms != started_at_ms {
+        return Ok(());
+    }
+    latest.status = status.to_string();
+    latest.message = message.to_string();
+    latest.phase = None;
+    latest.progress = Some(100);
+    store.save_latest(&latest)
 }
 
 #[async_trait(?Send)]
@@ -219,12 +291,6 @@ pub trait LaunchHooks: Send + Sync {
         Ok(())
     }
     async fn ensure_active_protocol_proxy_config(
-        &self,
-        _settings: &BackendSettings,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
-    async fn ensure_plugin_marketplace_config(
         &self,
         _settings: &BackendSettings,
     ) -> anyhow::Result<()> {
@@ -279,6 +345,8 @@ pub trait LaunchHooks: Send + Sync {
         }
         false
     }
+    /// 初次启动初始化结束时固定身份（包含注入降级）；watchdog 不能重新绑定实例。
+    async fn capture_injected_launch_identity(&self, _debug_port: u16) {}
     async fn start_bridge_watchdog(
         &self,
         _debug_port: u16,
@@ -302,6 +370,19 @@ pub struct DefaultLaunchHooks {
     helper: Mutex<Option<HelperRuntime>>,
     bridge_watchdog: Mutex<Option<BridgeWatchdogRuntime>>,
     bridge_reinjector: Mutex<Option<BridgeReinjector>>,
+    #[cfg(windows)]
+    packaged_executable: Mutex<Option<PathBuf>>,
+    #[cfg(windows)]
+    packaged_activation_process: Mutex<Option<crate::windows_integration::TrackedWindowsProcess>>,
+    #[cfg(windows)]
+    packaged_launch_identity: Mutex<Option<PackagedLaunchIdentity>>,
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct PackagedLaunchIdentity {
+    browser_id: Option<String>,
+    process: Option<crate::windows_integration::TrackedWindowsProcess>,
 }
 
 struct HelperRuntime {
@@ -421,8 +502,8 @@ where
             }
             Err(error) => error,
         };
-        let retryable = error_is_address_in_use(&error)
-            || (retry_forbidden && error_is_bind_forbidden(&error));
+        let retryable =
+            error_is_address_in_use(&error) || (retry_forbidden && error_is_bind_forbidden(&error));
         if !retryable || waited_ms >= timeout_ms {
             return Err(error);
         }
@@ -452,8 +533,8 @@ pub fn helper_bind_retry_interval_ms() -> u64 {
 /// 这次启动如果必须占用写进 `config.toml` 的协议代理端口，返回那个端口。
 /// 不需要协议代理时返回 `None`，调用方不应去等一个用不到的端口。
 pub fn required_fixed_helper_port(settings: &BackendSettings) -> Option<u16> {
-    let enabled = relay_protocol_proxy_enabled(settings)
-        || remote_control_provider_proxy_enabled(settings);
+    let enabled =
+        relay_protocol_proxy_enabled(settings) || remote_control_provider_proxy_enabled(settings);
     enabled.then(crate::protocol_proxy::protocol_proxy_port)
 }
 
@@ -499,13 +580,21 @@ where
     let mut helper_started = false;
     let mut launched = None;
     let mut keep_launched_on_error = false;
+    let mut status_started_at_ms = 0;
 
     let result: anyhow::Result<LaunchHandle> = async {
+        // issue #2244：冷启动 80~110 秒期间既没有 latest-status 阶段，也没有带耗时的
+        // 日志，用户无法区分「正在处理」与「已经卡死」。每个前置步骤前后都打一次
+        // 阶段标记与耗时。
+        let timeline = LaunchTimeline::new(options.status_store.clone());
+        timeline.mark("start_native_browser_compatibility", 5);
         hooks.start_native_browser_compatibility(&settings).await;
         let home = crate::relay_config::default_codex_home_dir();
+        timeline.mark("cleanup_unsupported_config", 10);
         hooks.cleanup_unsupported_config()?;
         crate::relay_config::ensure_windows_sandbox_usable_for_current_user(&home)?;
         if settings.provider_sync_enabled {
+            timeline.mark("provider_sync", 15);
             crate::codex_app_state::capture_app_state_snapshot_nonfatal(&home, "launcher.before");
             hooks.run_provider_sync().await?;
             crate::codex_app_state::sync_app_state_after_provider_switch_nonfatal(
@@ -516,6 +605,7 @@ where
         if hooks.has_pending_remote_control_session_recoveries()
             && hooks.remote_control_session_recovery_is_safe_to_run()
         {
+            timeline.mark("remote_control_session_recovery", 25);
             hooks.run_remote_control_session_recovery().await?;
         } else if hooks.has_pending_remote_control_session_recoveries() {
             let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -523,20 +613,16 @@ where
                 serde_json::json!({"reason": "desktop_writer_active"}),
             );
         }
+        timeline.mark("dream_skin_theme", 30);
         crate::dream_skin::sync_default_dream_skin_base_theme(
             settings.enhancements_enabled
                 && settings.codex_app_dream_skin_enabled
                 && !settings.codex_app_dream_skin_paused,
             &settings.codex_app_dream_skin_theme_config,
         )?;
-        if let Err(error) = hooks.ensure_plugin_marketplace_config(&settings).await {
-            let _ = crate::diagnostic_log::append_diagnostic_log(
-                "launcher.plugin_marketplace_config_failed_nonfatal",
-                serde_json::json!({
-                    "message": error.to_string()
-                }),
-            );
-        }
+        // 这一步在 #2244 的采样里是嫌疑最大的同步全表扫描，单独标记起止，
+        // 从 latest-status 就能看出冷启动时间是否耗在这里。
+        timeline.mark("sanitize_historical_model_suffixes", 40);
         match crate::codex_sqlite::sanitize_historical_model_suffixes(&home) {
             Ok(result) if result.updated > 0 => {
                 let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -557,6 +643,7 @@ where
                 );
             }
         }
+        timeline.mark("sanitize_historical_model_suffixes_done", 50);
         let protocol_proxy_enabled = relay_protocol_proxy_enabled(&settings)
             || remote_control_provider_proxy_enabled(&settings);
         // issue #2264：重启链路上的模型漂移修复。launcher 不重放完整 apply（那会
@@ -578,11 +665,13 @@ where
             }
         }
         if protocol_proxy_enabled {
+            timeline.mark("protocol_proxy_config", 55);
             hooks.ensure_active_protocol_proxy_config(&settings).await?;
             helper_port = crate::protocol_proxy::protocol_proxy_port();
         }
         if settings.enhancements_enabled || protocol_proxy_enabled {
             // macOS 重启时旧 launcher 的 socket 释放可能稍晚于进程退出。
+            timeline.mark("helper_bind", 60);
             let bind_retry_timeout_ms =
                 helper_bind_retry_timeout_ms(protocol_proxy_enabled, cfg!(target_os = "macos"));
             start_helper_waiting_for_busy_port(
@@ -601,19 +690,24 @@ where
                 )
             })?;
             helper_started = true;
+            timeline.mark("helper_listening", 65);
         }
 
+        timeline.mark("launch_codex", 70);
         let launch = hooks
             .launch_codex(&app_dir, debug_port, &settings, &settings.codex_extra_args)
             .await?;
         launched = Some(launch.clone());
         keep_launched_on_error = true;
+        timeline.mark("launch_codex_done", 80);
 
         let mut injection_degraded = false;
         if settings.enhancements_enabled {
+            timeline.mark("ensure_injection", 85);
             let injection_ready = hooks
                 .ensure_injection(debug_port, helper_port, &app_dir)
                 .await;
+            timeline.mark("ensure_injection_done", 95);
             if injection_ready {
                 keep_launched_on_error = false;
                 // 注入成功后页面已加载，此时可以通过 CDP 清理 Electron Local Storage
@@ -622,7 +716,6 @@ where
                     debug_port,
                 )
                 .await;
-                hooks.start_bridge_watchdog(debug_port, helper_port).await?;
             } else {
                 let degraded = launch_status(
                     "running_degraded",
@@ -632,12 +725,20 @@ where
                     &app_dir,
                 );
                 options.status_store.save_latest(&degraded)?;
+                status_started_at_ms = degraded.started_at_ms;
                 hooks.write_status("running_degraded").await;
                 injection_degraded = true;
             }
         }
 
+        // 注入降级或只启用协议代理也要固定身份；后台重注入不能为旧启动器换绑实例。
+        hooks.capture_injected_launch_identity(debug_port).await;
+        if settings.enhancements_enabled && !injection_degraded {
+            hooks.start_bridge_watchdog(debug_port, helper_port).await?;
+        }
+
         if !settings.enhancements_enabled || !injection_degraded {
+            timeline.mark("ready", 100);
             let status = launch_status(
                 "running",
                 "Codex++ launcher ready",
@@ -646,6 +747,7 @@ where
                 &app_dir,
             );
             options.status_store.save_latest(&status)?;
+            status_started_at_ms = status.started_at_ms;
             hooks.write_status("running").await;
         }
 
@@ -655,6 +757,7 @@ where
             app_dir: app_dir.clone(),
             launch,
             status_store: status_store.clone(),
+            status_started_at_ms,
             helper_started,
             hooks: Arc::clone(&hooks),
         })
@@ -689,29 +792,6 @@ fn relay_protocol_proxy_enabled(settings: &BackendSettings) -> bool {
 fn remote_control_provider_proxy_enabled(settings: &BackendSettings) -> bool {
     let profile = settings.active_relay_profile();
     profile.relay_mode == crate::settings::RelayMode::Official && profile.official_mix_api_key
-}
-
-fn select_native_menu_inspector_port(debug_port: u16) -> u16 {
-    let requested = debug_port.saturating_add(100);
-    crate::ports::select_platform_loopback_port(requested)
-}
-
-fn start_native_menu_localizer(inspector_port: u16) {
-    if inspector_port == 0 {
-        return;
-    }
-    tokio::spawn(async move {
-        if let Err(error) = crate::native_menu::install_native_menu_localizer(inspector_port).await
-        {
-            let _ = crate::diagnostic_log::append_diagnostic_log(
-                "native_menu.localization_failed",
-                serde_json::json!({
-                    "inspector_port": inspector_port,
-                    "message": error.to_string()
-                }),
-            );
-        }
-    });
 }
 
 #[cfg(windows)]
@@ -798,7 +878,23 @@ impl LaunchHooks for DefaultLaunchHooks {
             app_dir,
             Some(settings.codex_app_path.as_str()),
         )
-        .ok_or_else(|| anyhow::anyhow!("Codex App directory not found"))
+        .ok_or_else(|| {
+            // issue #2204：原来四种失败原因（不存在 / 是 Codex++ 目录 / 无可执行文件 /
+            // 纯自动探测落空）共用一句「Codex App directory not found」，用户看不出
+            // 该改什么。这里按来源细分，并保留原句前缀以便既有日志检索与用户既有
+            // 报障文本仍能对上。
+            let saved = settings.codex_app_path.trim();
+            let message = crate::app_paths::describe_codex_app_dir_not_found(app_dir, Some(saved));
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "launcher.app_dir_not_found",
+                serde_json::json!({
+                    "explicit_app_path": app_dir.map(|path| path.to_string_lossy().to_string()),
+                    "saved_app_path": saved,
+                    "reason": message,
+                }),
+            );
+            anyhow::anyhow!(message)
+        })
     }
 
     fn select_debug_port(&self, requested: u16) -> u16 {
@@ -875,60 +971,6 @@ impl LaunchHooks for DefaultLaunchHooks {
         Ok(())
     }
 
-    async fn ensure_plugin_marketplace_config(
-        &self,
-        settings: &BackendSettings,
-    ) -> anyhow::Result<()> {
-        let home = crate::relay_config::default_codex_home_dir();
-        crate::plugin_marketplace::cleanup_managed_reserved_marketplace_configs(&home)?;
-        if !settings.codex_app_plugin_marketplace_unlock {
-            return Ok(());
-        }
-        match crate::plugin_marketplace::ensure_openai_curated_marketplace_config(&home) {
-            Ok(configured) => {
-                if configured {
-                    let _ = crate::diagnostic_log::append_diagnostic_log(
-                        "launcher.openai_curated_marketplace_configured",
-                        serde_json::json!({
-                            "home": home,
-                        }),
-                    );
-                }
-            }
-            Err(error) => {
-                let _ = crate::diagnostic_log::append_diagnostic_log(
-                    "launcher.openai_curated_marketplace_config_failed",
-                    serde_json::json!({
-                        "home": home,
-                        "message": error.to_string(),
-                    }),
-                );
-            }
-        }
-        match crate::plugin_marketplace::ensure_role_specific_plugins_marketplace_config(&home) {
-            Ok(configured) => {
-                if configured {
-                    let _ = crate::diagnostic_log::append_diagnostic_log(
-                        "launcher.role_specific_plugins_marketplace_configured",
-                        serde_json::json!({
-                            "home": home,
-                        }),
-                    );
-                }
-            }
-            Err(error) => {
-                let _ = crate::diagnostic_log::append_diagnostic_log(
-                    "launcher.role_specific_plugins_marketplace_config_failed",
-                    serde_json::json!({
-                        "home": home,
-                        "message": error.to_string(),
-                    }),
-                );
-            }
-        }
-        Ok(())
-    }
-
     async fn start_helper(&self, helper_port: u16) -> anyhow::Result<()> {
         let bind_host = helper_bind_host();
         let listener = tokio::net::TcpListener::bind((bind_host.as_str(), helper_port))
@@ -970,24 +1012,18 @@ impl LaunchHooks for DefaultLaunchHooks {
         &self,
         app_dir: &Path,
         debug_port: u16,
-        settings: &BackendSettings,
+        _settings: &BackendSettings,
         extra_args: &[String],
     ) -> anyhow::Result<CodexLaunch> {
-        let native_menu_localization_enabled = settings.codex_app_native_menu_localization;
-        let native_menu_inspector_port =
-            native_menu_localization_enabled.then(|| select_native_menu_inspector_port(debug_port));
-        let launch_extra_args = codex_extra_args_for_launch(settings, extra_args);
+        let launch_extra_args = normalize_codex_extra_args(extra_args);
         if cfg!(windows) {
-            let activation = if let Some(inspector_port) = native_menu_inspector_port {
-                build_packaged_activation_with_native_menu_inspector(
-                    app_dir,
-                    debug_port,
-                    inspector_port,
-                    &launch_extra_args,
-                )
-            } else {
-                build_packaged_activation(app_dir, debug_port, &launch_extra_args)
-            };
+            // AUMID 解析留在调用点：它要查系统里的 Store 注册表（#2140），是有副作用
+            // 的一步；下面的构造函数只做纯拼接。解析不出来（目录名像包、但系统里没
+            // 这个包）就不再走打包激活，继续往下按路径启动——与既有回退路径一致。
+            let activation =
+                crate::app_paths::packaged_app_user_model_id(app_dir).map(|app_user_model_id| {
+                    build_packaged_activation(&app_user_model_id, debug_port, &launch_extra_args)
+                });
             if let Some(activation) = activation {
                 let CodexLaunch::PackagedActivation {
                     app_user_model_id,
@@ -999,10 +1035,28 @@ impl LaunchHooks for DefaultLaunchHooks {
                 };
                 match activate_packaged_app(app_user_model_id, arguments).await {
                     Ok(process_id) => {
-                        apply_codexplusplus_window_icon_after_launch(process_id);
-                        if let Some(inspector_port) = native_menu_inspector_port {
-                            start_native_menu_localizer(inspector_port);
+                        #[cfg(windows)]
+                        {
+                            let executable = crate::app_paths::build_codex_executable(app_dir);
+                            // 立即持有激活 PID，不能在漫长注入之后再按旧 PID 打开进程。
+                            let process = match crate::windows_integration::TrackedWindowsProcess::capture(
+                                process_id,
+                                &executable,
+                            ) {
+                                Ok(process) => process,
+                                Err(error) => {
+                                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                                        "launcher.packaged_process_wait_failed_nonfatal",
+                                        serde_json::json!({ "process_id": process_id, "message": format!("{error:#}") }),
+                                    );
+                                    None
+                                }
+                            };
+                            *self.packaged_executable.lock().await = Some(executable);
+                            *self.packaged_activation_process.lock().await = process;
+                            *self.packaged_launch_identity.lock().await = None;
                         }
+                        apply_codexplusplus_window_icon_after_launch(process_id);
                         return Ok(match activation {
                             CodexLaunch::PackagedActivation {
                                 app_user_model_id,
@@ -1027,6 +1081,15 @@ impl LaunchHooks for DefaultLaunchHooks {
                                 "error": error.to_string()
                             }),
                         );
+                        // 提权进程激活打包应用必然失败，按路径启动的进程会因缺少
+                        // 包身份立即退出、注入也必然失败；此时必须如实失败并给出
+                        // 指引，而不是静默回退导致 latest-status.json 误报 running
+                        // （issue #2351）。
+                        if let Some(reason) = packaged_activation_fallback_block_reason(
+                            crate::windows_integration::current_process_is_elevated(),
+                        ) {
+                            anyhow::bail!("{reason}（激活错误：{error}）");
+                        }
                     }
                 }
             }
@@ -1054,16 +1117,7 @@ impl LaunchHooks for DefaultLaunchHooks {
                     MacosCleanupPolicy::QuitIfNotPreviouslyRunning
                 }
             };
-            let command = if let Some(inspector_port) = native_menu_inspector_port {
-                build_macos_open_command_with_native_menu_inspector(
-                    app_dir,
-                    debug_port,
-                    inspector_port,
-                    &launch_extra_args,
-                )
-            } else {
-                build_macos_open_command(app_dir, debug_port, &launch_extra_args)
-            };
+            let command = build_macos_open_command(app_dir, debug_port, &launch_extra_args);
             let executable = command
                 .first()
                 .ok_or_else(|| anyhow::anyhow!("macOS open command is empty"))?;
@@ -1074,9 +1128,6 @@ impl LaunchHooks for DefaultLaunchHooks {
                 .spawn()
                 .context("failed to launch macOS Codex app")?;
             *self.child.lock().await = Some(child);
-            if let Some(inspector_port) = native_menu_inspector_port {
-                start_native_menu_localizer(inspector_port);
-            }
             return Ok(CodexLaunch::Process {
                 command,
                 wait_strategy: ProcessWaitStrategy::ExternalWaitCommand,
@@ -1084,16 +1135,7 @@ impl LaunchHooks for DefaultLaunchHooks {
             });
         }
 
-        let command = if let Some(inspector_port) = native_menu_inspector_port {
-            build_codex_command_with_native_menu_inspector(
-                app_dir,
-                debug_port,
-                inspector_port,
-                &launch_extra_args,
-            )
-        } else {
-            build_codex_command(app_dir, debug_port, &launch_extra_args)
-        };
+        let command = build_codex_command(app_dir, debug_port, &launch_extra_args);
         let executable = command
             .first()
             .ok_or_else(|| anyhow::anyhow!("Codex command is empty"))?;
@@ -1108,9 +1150,6 @@ impl LaunchHooks for DefaultLaunchHooks {
             .spawn()
             .with_context(|| format!("failed to launch Codex executable {executable}"))?;
         *self.child.lock().await = Some(child);
-        if let Some(inspector_port) = native_menu_inspector_port {
-            start_native_menu_localizer(inspector_port);
-        }
         Ok(CodexLaunch::Process {
             command,
             wait_strategy: ProcessWaitStrategy::TrackedChild,
@@ -1120,6 +1159,62 @@ impl LaunchHooks for DefaultLaunchHooks {
 
     async fn inject(&self, debug_port: u16, helper_port: u16) -> anyhow::Result<()> {
         retry_injection(debug_port, helper_port).await
+    }
+    async fn capture_injected_launch_identity(&self, debug_port: u16) {
+        #[cfg(windows)]
+        {
+            let mut identity = self.packaged_launch_identity.lock().await;
+            if identity.is_some() { return; }
+            let Some(executable) = self.packaged_executable.lock().await.clone() else { return; };
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            let mut last_discovery_error = None;
+            loop {
+                let browser_id = validated_codex_browser_id(debug_port).await;
+                let mut process = match crate::windows_integration::capture_debug_listener(debug_port, &executable) {
+                    Ok(process) => process,
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        if last_discovery_error.as_ref() != Some(&message) {
+                            let _ = crate::diagnostic_log::append_diagnostic_log(
+                                "launcher.packaged_process_identity_unavailable",
+                                serde_json::json!({ "debug_port": debug_port, "message": message }),
+                            );
+                        }
+                        last_discovery_error = Some(message);
+                        None
+                    }
+                };
+                let activation = self.packaged_activation_process.lock().await;
+                let activation_matches = activation.as_ref().zip(process.as_ref()).is_some_and(|(activation, process)| {
+                    activation.process_id == process.process_id && activation.birth_id == process.birth_id
+                });
+                drop(activation);
+                // target 列表、UUID 和 listener 查询之间可能发生替换；只接受稳定的 Codex UUID。
+                let browser_still_matches = if let Some(initial) = browser_id.as_deref() {
+                    validated_codex_browser_id(debug_port).await.as_deref() == Some(initial)
+                } else { false };
+                if browser_id.is_some() && !activation_matches && !browser_still_matches { process = None; }
+                let browser_id = browser_id.filter(|_| browser_still_matches);
+                // 无 CDP 页时，已验证可执行文件和句柄的 listener 仍可作为本次进程身份。
+                if browser_id.is_some() || process.is_some() {
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "launcher.packaged_launch_identity_captured",
+                        serde_json::json!({
+                            "debug_port": debug_port,
+                            "browser_identity_bound": browser_id.is_some(),
+                            "process_id": process.as_ref().map(|process| process.process_id),
+                            "birth_id": process.as_ref().map(|process| process.birth_id),
+                        }),
+                    );
+                    *identity = Some(PackagedLaunchIdentity { browser_id, process });
+                    return;
+                }
+                if tokio::time::Instant::now() >= deadline { return; }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = debug_port;
     }
     async fn start_bridge_watchdog(&self, debug_port: u16, helper_port: u16) -> anyhow::Result<()> {
         let bridge_reinjector = self.bridge_reinjector.lock().await.clone();
@@ -1194,13 +1289,24 @@ impl LaunchHooks for DefaultLaunchHooks {
                 }
             }
             CodexLaunch::PackagedActivation { process_id, .. } => {
+                #[cfg(windows)]
+                {
+                    let executable = self.packaged_executable.lock().await.take()
+                        .context("missing packaged Codex executable identity")?;
+                    let activation = self.packaged_activation_process.lock().await.take();
+                    let identity = self.packaged_launch_identity.lock().await.take().unwrap_or_default();
+                    return wait_for_windows_packaged_exit(
+                        &executable, *process_id, activation, identity, debug_port,
+                    ).await;
+                }
+                #[cfg(not(windows))]
                 if let Some(process_id) = process_id {
                     if let Err(error) = wait_for_windows_process_id(*process_id).await {
                         let _ = crate::diagnostic_log::append_diagnostic_log(
                             "launcher.packaged_process_wait_failed_nonfatal",
                             serde_json::json!({
                                 "process_id": process_id,
-                                "message": error.to_string()
+                                "message": format!("{error:#}")
                             }),
                         );
                     }
@@ -1295,6 +1401,10 @@ async fn handle_helper_connection(
     let request_user_agent = header_value_from_headers(&request_headers, "user-agent");
     let request_beta_features =
         header_value_from_headers(&request_headers, "x-codex-beta-features");
+    let request_session_id = header_value_from_headers(&request_headers, "session-id");
+    let request_thread_id = header_value_from_headers(&request_headers, "thread-id");
+    let request_opencode_session =
+        header_value_from_headers(&request_headers, "x-opencode-session");
     let request_content_type = header_value_from_headers(&request_headers, "content-type");
     let request_content_encoding = header_value_from_headers(&request_headers, "content-encoding");
     let remote_addr_text = remote_addr.map(|addr| addr.to_string());
@@ -1310,6 +1420,17 @@ async fn handle_helper_connection(
         }),
     );
 
+    if matches!(path, "/dictation/transcribe" | "/dictation/status") {
+        return handle_dictation_connection(
+            &mut stream,
+            method,
+            path,
+            &request_headers,
+            &request.body,
+            request_content_type.as_deref().unwrap_or_default(),
+        )
+        .await;
+    }
     if crate::protocol_proxy::is_audio_transcriptions_proxy_path(path) && method == "POST" {
         return handle_audio_transcriptions_proxy_connection(
             &mut stream,
@@ -1407,6 +1528,11 @@ async fn handle_helper_connection(
             &request_body,
             request_user_agent.as_deref(),
             request_beta_features.as_deref(),
+            crate::protocol_proxy::ProxySessionHeaders {
+                session_id: request_session_id.as_deref(),
+                thread_id: request_thread_id.as_deref(),
+                opencode_session: request_opencode_session.as_deref(),
+            },
             method,
             path,
             remote_addr_text,
@@ -1708,11 +1834,11 @@ async fn handle_models_proxy_connection(
                 &body,
             )
             .await?;
-            log_helper_response(
+            log_helper_proxy_failure(
                 "helper.models_proxy_failed",
                 method,
                 path,
-                "502 Bad Gateway",
+                &error.to_string(),
                 remote_addr_text,
             );
             stream.shutdown().await?;
@@ -1747,36 +1873,40 @@ async fn handle_protocol_proxy_connection(
     request_body: &str,
     request_user_agent: Option<&str>,
     request_beta_features: Option<&str>,
+    session_headers: crate::protocol_proxy::ProxySessionHeaders<'_>,
     method: &str,
     path: &str,
     remote_addr_text: Option<String>,
 ) -> anyhow::Result<()> {
     let request_json = serde_json::from_str::<serde_json::Value>(request_body).ok();
-    let upstream = match crate::protocol_proxy::open_responses_proxy_request_for_path_with_beta(
+    let upstream = match crate::protocol_proxy::open_responses_proxy_request_for_path_with_session_headers(
         request_body,
         request_user_agent,
         path,
         request_beta_features,
+        session_headers,
     )
     .await
     {
         Ok(upstream) => upstream,
         Err(error) => {
-            let body = serde_json::to_vec(
-                &serde_json::json!({                     "status": "failed",                     "message": error.to_string()                 }),
-            )?;
+            let unsupported = error.downcast_ref::<crate::protocol_proxy::UnsupportedEncryptedAgentContent>();
+            let status = if unsupported.is_some() { "400 Bad Request" } else { "502 Bad Gateway" };
+            let body = serde_json::to_vec(&unsupported.map(|error| error.response_body()).unwrap_or_else(|| {
+                serde_json::json!({"status":"failed","message":error.to_string()})
+            }))?;
             write_http_response(
                 stream,
-                "502 Bad Gateway",
+                status,
                 "application/json; charset=utf-8",
                 &body,
             )
             .await?;
-            log_helper_response(
+            log_helper_proxy_failure(
                 "helper.protocol_proxy_failed",
                 method,
                 path,
-                "502 Bad Gateway",
+                &error.to_string(),
                 remote_addr_text,
             );
             stream.shutdown().await?;
@@ -1842,15 +1972,28 @@ async fn handle_protocol_proxy_connection(
             stream.shutdown().await?;
             return Ok(());
         }
-        if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
-            let mut bytes_stream = upstream.response.bytes_stream();
-            while let Some(chunk) = bytes_stream.next().await {
-                if let Ok(bytes) = chunk {
-                    stream.write_all(&bytes).await?;
-                } else {
-                    break;
-                }
-            }
+        let failure = forward_protocol_proxy_stream(
+            stream,
+            upstream.response,
+            upstream.wire_api,
+            request_json.as_ref(),
+        )
+        .await?;
+        if let Some(reason) = failure {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "helper.protocol_proxy_stream_failed",
+                serde_json::json!({
+                    "method": method,
+                    "path": path,
+                    "status": "200 OK",
+                    "stream_outcome": "failed",
+                    "wireApi": upstream.wire_api,
+                    "compactV2": request_json.as_ref().is_some_and(crate::protocol_proxy::request_has_compaction_trigger),
+                    "error": reason,
+                    "remote_addr": remote_addr_text
+                }),
+            );
+        } else {
             log_helper_response(
                 "helper.protocol_proxy_stream_ok",
                 method,
@@ -1858,49 +2001,7 @@ async fn handle_protocol_proxy_connection(
                 "200 OK",
                 remote_addr_text,
             );
-            stream.shutdown().await?;
-            return Ok(());
         }
-        let mut converter = request_json
-            .as_ref()
-            .map(crate::protocol_proxy::ChatSseToResponsesConverter::with_request)
-            .unwrap_or_default();
-        let mut bytes_stream = upstream.response.bytes_stream();
-        let mut stream_failed = false;
-        while let Some(chunk) = bytes_stream.next().await {
-            match chunk {
-                Ok(bytes) => {
-                    let converted = converter.push_bytes(&bytes);
-                    if !converted.is_empty() {
-                        stream.write_all(&converted).await?;
-                    }
-                }
-                Err(error) => {
-                    let failed = converter.fail(
-                        format!("Stream error: {error}"),
-                        Some("stream_error".to_string()),
-                    );
-                    if !failed.is_empty() {
-                        stream.write_all(&failed).await?;
-                    }
-                    stream_failed = true;
-                    break;
-                }
-            }
-        }
-        if !stream_failed {
-            let tail = converter.finish();
-            if !tail.is_empty() {
-                stream.write_all(&tail).await?;
-            }
-        }
-        log_helper_response(
-            "helper.protocol_proxy_stream_ok",
-            method,
-            path,
-            "200 OK",
-            remote_addr_text,
-        );
         stream.shutdown().await?;
         return Ok(());
     }
@@ -1966,6 +2067,199 @@ async fn handle_protocol_proxy_connection(
     stream.shutdown().await?;
     Ok(())
 }
+async fn handle_dictation_connection(
+    stream: &mut tokio::net::TcpStream,
+    method: &str,
+    path: &str,
+    headers: &str,
+    body: &[u8],
+    content_type: &str,
+) -> anyhow::Result<()> {
+    let (status, response) = if method == "OPTIONS" {
+        ("204 No Content".to_string(), Vec::new())
+    } else if path == "/dictation/status" && method == "GET" {
+        let settings = SettingsStore::default().load().unwrap_or_default();
+        (
+            "200 OK".to_string(),
+            serde_json::to_vec(&crate::dictation::public_status(
+                &crate::dictation::effective_settings(&settings),
+            ))?,
+        )
+    } else if path == "/dictation/transcribe" && method == "POST" {
+        let token = header_value_from_headers(headers, crate::dictation::TOKEN_HEADER);
+        let result = if !crate::dictation::valid_helper_token(token.as_deref()) {
+            Err(crate::dictation::DictationError {
+                status: 403,
+                message: "语音请求未授权，请从 Codex++ 重新发起".to_string(),
+            })
+        } else {
+            let settings = SettingsStore::default().load().unwrap_or_default();
+            let effective = crate::dictation::effective_settings(&settings);
+            match transcribe_until_disconnect(stream, &effective, body, content_type).await {
+                Some(result) => result,
+                None => return Ok(()),
+            }
+        };
+        match result {
+            Ok(value) => ("200 OK".to_string(), serde_json::to_vec(&value)?),
+            Err(error) => {
+                let reason = match error.status {
+                    400 => "Bad Request",
+                    403 => "Forbidden",
+                    413 => "Payload Too Large",
+                    504 => "Gateway Timeout",
+                    _ => "Bad Gateway",
+                };
+                (
+                    format!("{} {reason}", error.status),
+                    serde_json::to_vec(
+                        &serde_json::json!({ "status": "failed", "message": error.message }),
+                    )?,
+                )
+            }
+        }
+    } else {
+        (
+            "405 Method Not Allowed".to_string(),
+            serde_json::to_vec(
+                &serde_json::json!({ "status": "failed", "message": "语音接口不支持此请求方法" }),
+            )?,
+        )
+    };
+    let response_headers = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json; charset=utf-8\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, X-Codex-Plus-Dictation-Token\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        response.len()
+    );
+    stream.write_all(response_headers.as_bytes()).await?;
+    stream.write_all(&response).await?;
+    stream.shutdown().await?;
+    Ok(())
+}
+
+async fn transcribe_until_disconnect(
+    stream: &mut tokio::net::TcpStream,
+    settings: &crate::settings::DictationSettings,
+    body: &[u8],
+    content_type: &str,
+) -> Option<Result<Value, crate::dictation::DictationError>> {
+    // 浏览器取消请求、关闭连接时释放 reqwest future，停止上游上传或等待。
+    tokio::select! {
+        result = crate::dictation::transcribe(settings, body, content_type) => Some(result),
+        _ = async {
+            let mut buffer = [0u8; 64];
+            loop {
+                match stream.read(&mut buffer).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {},
+                }
+            }
+        } => None,
+    }
+}
+
+#[cfg(test)]
+mod dictation_http_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dictation_helper_rejects_requests_without_capability() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, remote) = listener.accept().await.unwrap();
+            handle_helper_connection(stream, Some(remote))
+                .await
+                .unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client.write_all(format!("POST /dictation/transcribe HTTP/1.1\r\nHost: {addr}\r\nContent-Type: multipart/form-data; boundary=test\r\nContent-Length: 0\r\n\r\n").as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(!response.contains(crate::dictation::helper_token()));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dictation_helper_preflight_allows_capability_header() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, remote) = listener.accept().await.unwrap();
+            handle_helper_connection(stream, Some(remote))
+                .await
+                .unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(
+                format!("OPTIONS /dictation/transcribe HTTP/1.1\r\nHost: {addr}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 204 No Content"));
+        assert!(response.contains(crate::dictation::TOKEN_HEADER));
+        assert!(!response.contains(crate::dictation::helper_token()));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dictation_disconnect_stops_waiting_for_upstream() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(10)))
+            .mount(&upstream)
+            .await;
+        let settings = crate::settings::DictationSettings {
+            enabled: true,
+            base_url: format!("{}/v1", upstream.uri()),
+            ..Default::default()
+        };
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let task = tokio::spawn(async move {
+            transcribe_until_disconnect(&mut stream, &settings,
+                b"--test\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.webm\"\r\n\r\naudio\r\n--test--\r\n",
+                "multipart/form-data; boundary=test").await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if !upstream.received_requests().await.unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(client);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
 async fn handle_audio_transcriptions_proxy_connection(
     stream: &mut tokio::net::TcpStream,
     request_body: &[u8],
@@ -1995,11 +2289,11 @@ async fn handle_audio_transcriptions_proxy_connection(
                 &body,
             )
             .await?;
-            log_helper_response(
+            log_helper_proxy_failure(
                 "helper.audio_transcriptions_proxy_failed",
                 method,
                 path,
-                "502 Bad Gateway",
+                &error.to_string(),
                 remote_addr_text,
             );
             stream.shutdown().await?;
@@ -2067,11 +2361,11 @@ async fn handle_image_proxy_connection(
                 &body,
             )
             .await?;
-            log_helper_response(
+            log_helper_proxy_failure(
                 "helper.image_proxy_failed",
                 method,
                 path,
-                "502 Bad Gateway",
+                &error.to_string(),
                 remote_addr_text,
             );
             stream.shutdown().await?;
@@ -2128,11 +2422,11 @@ async fn handle_chat_completions_proxy_connection(
                 &body,
             )
             .await?;
-            log_helper_response(
+            log_helper_proxy_failure(
                 "helper.chat_completions_proxy_failed",
                 method,
                 path,
-                "502 Bad Gateway",
+                &error.to_string(),
                 remote_addr_text,
             );
             stream.shutdown().await?;
@@ -2206,6 +2500,62 @@ async fn write_http_stream_headers(
     Ok(())
 }
 
+// 返回流失败原因，HTTP 响应头已经发送，不能再把失败伪装成第二个 HTTP 502。
+async fn forward_protocol_proxy_stream(
+    stream: &mut tokio::net::TcpStream,
+    response: reqwest::Response,
+    wire_api: crate::protocol_proxy::UpstreamWireApi,
+    request: Option<&Value>,
+) -> anyhow::Result<Option<String>> {
+    let mut chunks = response.bytes_stream();
+    if wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
+        let mut observer = crate::protocol_proxy::NativeResponsesSseObserver::default();
+        while let Some(chunk) = chunks.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    stream.write_all(&bytes).await?;
+                    observer.push_bytes(&bytes);
+                }
+                Err(error) => return Ok(Some(error.without_url().to_string())),
+            }
+        }
+        return Ok(observer.finish());
+    }
+    let mut converter = request
+        .map(crate::protocol_proxy::ChatSseToResponsesConverter::with_request)
+        .unwrap_or_default();
+    while let Some(chunk) = chunks.next().await {
+        match chunk {
+            Ok(bytes) => {
+                let converted = converter.push_bytes(&bytes);
+                stream.write_all(&converted).await?;
+                if converter.has_failed() {
+                    return Ok(Some("上游返回了流式错误事件".to_string()));
+                }
+            }
+            Err(error) => {
+                let failed = converter.fail(
+                    "上游响应流读取失败".to_string(),
+                    Some("stream_error".to_string()),
+                );
+                stream.write_all(&failed).await?;
+                return Ok(Some(error.without_url().to_string()));
+            }
+        }
+    }
+    // EOF 不是 Chat 协议的完成事件；已发出的文本和工具增量不能自动重放。
+    if !converter.has_terminal_event() {
+        let failed = converter.fail(
+            "上游在完成事件前结束了响应流".to_string(),
+            Some("stream_incomplete".to_string()),
+        );
+        stream.write_all(&failed).await?;
+        return Ok(Some("上游缺少完成事件".to_string()));
+    }
+    stream.write_all(&converter.finish()).await?;
+    Ok(None)
+}
+
 fn log_helper_response(
     event: &str,
     method: &str,
@@ -2219,6 +2569,32 @@ fn log_helper_response(
             "method": method,
             "path": path,
             "status": status,
+            "remote_addr": remote_addr_text
+        }),
+    );
+}
+
+/// 代理失败（502）专用日志：在通用字段之外带上**失败原因**。
+///
+/// 这些分支把 error 写进了响应体，旧实现却只记 method/path/status，于是
+/// 客户端只看到「unexpected status 502 Bad Gateway: Unknown error」，
+/// 日志里也查不到为什么（issue #2385）。原因必须落进日志，否则
+/// 「上游不可达 / 没配可用中转 / 请求体解析失败」这几种完全不同的故障
+/// 在现场长得一模一样。
+fn log_helper_proxy_failure(
+    event: &str,
+    method: &str,
+    path: &str,
+    error: &str,
+    remote_addr_text: Option<String>,
+) {
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        event,
+        serde_json::json!({
+            "method": method,
+            "path": path,
+            "status": "502 Bad Gateway",
+            "error": error,
             "remote_addr": remote_addr_text
         }),
     );
@@ -2650,49 +3026,7 @@ pub fn build_codex_arguments_for_settings(
     debug_port: u16,
     settings: &BackendSettings,
 ) -> Vec<String> {
-    build_codex_arguments(
-        debug_port,
-        &codex_extra_args_for_launch(settings, &settings.codex_extra_args),
-    )
-}
-
-fn codex_extra_args_for_launch(settings: &BackendSettings, extra_args: &[String]) -> Vec<String> {
-    let mut args = Vec::new();
-    if settings.codex_app_fast_startup && !has_host_resolver_rules(extra_args) {
-        args.push(statsig_fast_fail_host_resolver_rule());
-    }
-    args.extend(normalize_codex_extra_args(extra_args));
-    args
-}
-
-fn has_host_resolver_rules(args: &[String]) -> bool {
-    args.iter()
-        .any(|arg| arg.trim().starts_with("--host-resolver-rules"))
-}
-
-fn statsig_fast_fail_host_resolver_rule() -> String {
-    [
-        "--host-resolver-rules=MAP ab.chatgpt.com 127.0.0.1",
-        "MAP featureassets.org 127.0.0.1",
-        "MAP prodregistryv2.org 127.0.0.1",
-        "MAP api.statsigcdn.com 127.0.0.1",
-        "MAP statsigapi.net 127.0.0.1",
-        "MAP cloudflare-dns.com 127.0.0.1",
-    ]
-    .join(",")
-}
-
-pub fn build_codex_arguments_with_native_menu_inspector(
-    debug_port: u16,
-    inspector_port: u16,
-    extra_args: &[String],
-) -> Vec<String> {
-    let mut args = build_codex_arguments(debug_port, &[]);
-    if inspector_port != 0 {
-        args.push(format!("--inspect=127.0.0.1:{inspector_port}"));
-    }
-    args.extend(normalize_codex_extra_args(extra_args));
-    args
+    build_codex_arguments(debug_port, &settings.codex_extra_args)
 }
 
 pub fn build_codex_command(app_dir: &Path, debug_port: u16, extra_args: &[String]) -> Vec<String> {
@@ -2705,52 +3039,21 @@ pub fn build_codex_command(app_dir: &Path, debug_port: u16, extra_args: &[String
     command
 }
 
-pub fn build_codex_command_with_native_menu_inspector(
-    app_dir: &Path,
-    debug_port: u16,
-    inspector_port: u16,
-    extra_args: &[String],
-) -> Vec<String> {
-    let mut command = vec![
-        crate::app_paths::build_codex_executable(app_dir)
-            .to_string_lossy()
-            .to_string(),
-    ];
-    command.extend(build_codex_arguments_with_native_menu_inspector(
-        debug_port,
-        inspector_port,
-        extra_args,
-    ));
-    command
-}
-
+/// 用已解析好的 AUMID 拼出打包激活命令。
+///
+/// AUMID 的解析（含「包是否已注册」这一查询，#2140）留在调用点，这里只做纯拼接。
+/// 早先本函数直接吃 `app_dir` 并自行解析，导致它在 Windows 上依赖 Store 注册表状态、
+/// 无法被测试驱动——测试机上的临时目录永远不算已注册，断言只能拿到 None。
 pub fn build_packaged_activation(
-    app_dir: &Path,
+    app_user_model_id: &str,
     debug_port: u16,
     extra_args: &[String],
-) -> Option<CodexLaunch> {
-    Some(CodexLaunch::PackagedActivation {
-        app_user_model_id: crate::app_paths::packaged_app_user_model_id(app_dir)?,
+) -> CodexLaunch {
+    CodexLaunch::PackagedActivation {
+        app_user_model_id: app_user_model_id.to_string(),
         arguments: command_line_arguments(&build_codex_arguments(debug_port, extra_args)),
         process_id: None,
-    })
-}
-
-pub fn build_packaged_activation_with_native_menu_inspector(
-    app_dir: &Path,
-    debug_port: u16,
-    inspector_port: u16,
-    extra_args: &[String],
-) -> Option<CodexLaunch> {
-    Some(CodexLaunch::PackagedActivation {
-        app_user_model_id: crate::app_paths::packaged_app_user_model_id(app_dir)?,
-        arguments: command_line_arguments(&build_codex_arguments_with_native_menu_inspector(
-            debug_port,
-            inspector_port,
-            extra_args,
-        )),
-        process_id: None,
-    })
+    }
 }
 
 async fn retry_injection(debug_port: u16, helper_port: u16) -> anyhow::Result<()> {
@@ -2788,6 +3091,169 @@ pub fn browser_identity_changed(previous: Option<&str>, current: &str) -> bool {
 
 fn owned_launcher_target_alive(owned_process_alive: bool, debug_port_open: bool) -> bool {
     owned_process_alive || debug_port_open
+}
+
+#[cfg(any(windows, test))]
+async fn validated_codex_browser_id(debug_port: u16) -> Option<String> {
+    let targets = crate::cdp::list_targets(debug_port).await.ok()?;
+    crate::cdp::pick_injectable_codex_page_target(&targets).ok()?;
+    crate::cdp::browser_identity(debug_port).await.ok()?.browser_id().ok()
+}
+
+#[cfg(any(windows, test))]
+#[derive(Default)]
+struct PackagedExitGrace {
+    missing_since: Option<std::time::Instant>,
+    missed_probes: u32,
+}
+
+#[cfg(any(windows, test))]
+impl PackagedExitGrace {
+    fn keep_waiting(
+        &mut self,
+        process_alive: Option<bool>,
+        cdp_available: bool,
+        now: std::time::Instant,
+    ) -> bool {
+        // 已捕获进程退出后，同端口的新实例不能为旧 launcher 续命。
+        if process_alive.unwrap_or(cdp_available) {
+            self.missing_since = None;
+            self.missed_probes = 0;
+            return true;
+        }
+        self.missed_probes = self.missed_probes.saturating_add(1);
+        let since = *self.missing_since.get_or_insert(now);
+        self.missed_probes < 3
+            || now.saturating_duration_since(since) < std::time::Duration::from_secs(10)
+    }
+}
+
+#[cfg(any(windows, test))]
+fn activation_process_is_startup_evidence(alive: bool, elapsed: std::time::Duration) -> bool {
+    // AUMID 有时返回仍存活的中转进程；它只能给实际调试进程有限的出现时间。
+    alive && elapsed < std::time::Duration::from_secs(30)
+}
+
+#[cfg(any(windows, test))]
+struct PackagedBrowserBinding {
+    initial_id: Option<String>,
+    replaced: bool,
+}
+
+#[cfg(any(windows, test))]
+impl PackagedBrowserBinding {
+    fn owns(&mut self, current_id: Option<&str>) -> bool {
+        if self.replaced { return false; }
+        match (self.initial_id.as_deref(), current_id) {
+            (Some(initial), Some(current)) if initial == current => true,
+            (Some(_), Some(_)) => { self.replaced = true; false }
+            _ => false,
+        }
+    }
+}
+
+#[cfg(windows)]
+async fn wait_for_windows_packaged_exit(
+    executable: &Path,
+    activation_pid: Option<u32>,
+    activation: Option<crate::windows_integration::TrackedWindowsProcess>,
+    identity: PackagedLaunchIdentity,
+    debug_port: u16,
+) -> anyhow::Result<()> {
+    use crate::windows_integration::{TrackedWindowsProcess, capture_debug_listener};
+    let mut tracked = identity.process;
+    let mut browser = PackagedBrowserBinding { initial_id: identity.browser_id, replaced: false };
+    let mut grace = PackagedExitGrace::default();
+    let mut last_discovery_error: Option<String> = None;
+    let started_waiting = std::time::Instant::now();
+    loop {
+        let mut owned_browser = false;
+        if tracked.is_none() {
+            let current_browser_id = if browser.initial_id.is_some() && !browser.replaced {
+                crate::cdp::browser_identity(debug_port).await.ok()
+                    .and_then(|identity| identity.browser_id().ok())
+            } else { None };
+            owned_browser = browser.owns(current_browser_id.as_deref());
+            let discovery = if browser.replaced {
+                Ok(None)
+            } else {
+                capture_debug_listener(debug_port, executable).map(|process| process.filter(|process| {
+                    // 重新查询只能沿用初始 browser，或启动时已持有的同一个内核进程。
+                    owned_browser || activation.as_ref().is_some_and(|activation| {
+                        activation.process_id == process.process_id && activation.birth_id == process.birth_id
+                    })
+                }))
+            };
+            let discovery = match discovery {
+                Ok(Some(process)) => {
+                    let activation_matches = activation.as_ref().is_some_and(|activation| {
+                        activation.process_id == process.process_id && activation.birth_id == process.birth_id
+                    });
+                    if !activation_matches {
+                        let confirmation = crate::cdp::browser_identity(debug_port).await.ok()
+                            .and_then(|identity| identity.browser_id().ok());
+                        owned_browser = browser.owns(confirmation.as_deref());
+                    }
+                    Ok((activation_matches || owned_browser).then_some(process))
+                }
+                other => other,
+            };
+            match discovery {
+                Ok(Some(process)) => {
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "launcher.packaged_process_tracked",
+                        serde_json::json!({ "debug_port": debug_port, "process_id": process.process_id, "birth_id": process.birth_id, "activation_pid": activation_pid }),
+                    );
+                    tracked = Some(process);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    if last_discovery_error.as_deref() != Some(&message) {
+                        let _ = crate::diagnostic_log::append_diagnostic_log(
+                            "launcher.packaged_process_identity_unavailable",
+                            serde_json::json!({ "debug_port": debug_port, "message": message }),
+                        );
+                    }
+                    last_discovery_error = Some(message);
+                }
+            }
+        }
+        let process_alive = if let Some(process) = &tracked {
+            Some(process.is_alive()?)
+        } else if browser.replaced {
+            Some(false)
+        } else {
+            // AUMID PID 只作等待实际 listener 出现期间的退路，不能替换已捕获主进程。
+            activation
+                .as_ref()
+                .map(TrackedWindowsProcess::is_alive)
+                .transpose()?
+                .filter(|alive| {
+                    activation_process_is_startup_evidence(*alive, started_waiting.elapsed())
+                })
+        };
+        if !grace.keep_waiting(process_alive, owned_browser, std::time::Instant::now()) {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "launcher.packaged_target_exited",
+                serde_json::json!({
+                    "debug_port": debug_port,
+                    "activation_pid": activation_pid,
+                    "process_id": tracked.as_ref().map(|process| process.process_id),
+                    "process_alive": process_alive,
+                    "owned_browser_available": owned_browser,
+                    "browser_identity_bound": browser.initial_id.is_some(),
+                    "browser_replaced": browser.replaced,
+                    "missed_probes": grace.missed_probes,
+                    "grace_ms": 10000,
+                    "identity_error": last_discovery_error,
+                    "activation_grace_ms": 30000,
+                }),
+            );
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
 }
 
 /// macOS `open` is not the app's parent, so its tracked child exits immediately.
@@ -2860,9 +3326,11 @@ async fn check_and_reinject_bridge_inner(
         }
     };
     match healthy {
-        // 健康恢复或探测不确定时清掉退避；失效计数由 should_reinject_* 统一管理。
-        Some(true) | None => backoff.reset(),
-        Some(false) => {}
+        // 持续健康一段时间才清掉退避（见 BRIDGE_REINJECT_BACKOFF_RESET_AFTER_SECS）；
+        // 探测不确定时不改变退避状态。失效计数由 should_reinject_* 统一管理。
+        Some(true) => backoff.observe_healthy(std::time::Instant::now()),
+        None => {}
+        Some(false) => backoff.observe_unhealthy(),
     }
     if !should_reinject_after_health_result(healthy, browser_identity_changed, health_failures) {
         return false;
@@ -3204,27 +3672,6 @@ pub fn build_macos_open_command(
     command
 }
 
-pub fn build_macos_open_command_with_native_menu_inspector(
-    app_dir: &Path,
-    debug_port: u16,
-    inspector_port: u16,
-    extra_args: &[String],
-) -> Vec<String> {
-    let mut command = vec![
-        "open".to_string(),
-        "-W".to_string(),
-        "-a".to_string(),
-        app_dir.to_string_lossy().to_string(),
-        "--args".to_string(),
-    ];
-    command.extend(build_codex_arguments_with_native_menu_inspector(
-        debug_port,
-        inspector_port,
-        extra_args,
-    ));
-    command
-}
-
 pub fn build_macos_cleanup_command(
     app_dir: &Path,
     policy: MacosCleanupPolicy,
@@ -3336,41 +3783,10 @@ async fn is_macos_app_running(app_dir: &Path) -> bool {
 }
 
 #[cfg(windows)]
-async fn wait_for_windows_process_id(process_id: u32) -> anyhow::Result<()> {
-    tokio::task::spawn_blocking(move || wait_for_windows_process_id_blocking(process_id))
-        .await
-        .context("Windows process wait task failed")?
-}
-
-#[cfg(windows)]
 async fn terminate_windows_process_id(process_id: u32) -> anyhow::Result<()> {
     tokio::task::spawn_blocking(move || terminate_windows_process_id_blocking(process_id))
         .await
         .context("Windows process termination task failed")?
-}
-
-#[cfg(windows)]
-fn wait_for_windows_process_id_blocking(process_id: u32) -> anyhow::Result<()> {
-    use windows::Win32::Foundation::{CloseHandle, WAIT_FAILED};
-    use windows::Win32::System::Threading::{
-        INFINITE, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-        WaitForSingleObject,
-    };
-
-    unsafe {
-        let handle = OpenProcess(
-            PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
-            false,
-            process_id,
-        )
-        .with_context(|| format!("failed to open Windows process id {process_id}"))?;
-        let wait_result = WaitForSingleObject(handle, INFINITE);
-        let _ = CloseHandle(handle);
-        if wait_result == WAIT_FAILED {
-            anyhow::bail!("failed to wait for Windows process id {process_id}");
-        }
-    }
-    Ok(())
 }
 
 #[cfg(windows)]
@@ -3420,6 +3836,43 @@ fn launch_status(
         helper_port: Some(helper_port),
         codex_app: Some(app_dir.to_string_lossy().to_string()),
         aumid: crate::app_paths::packaged_app_user_model_id(app_dir),
+        // 终态不再是「某个进行中的阶段」；进度固定 100 便于 manager 判断已结束。
+        phase: None,
+        progress: Some(100),
+    }
+}
+
+/// 启动阶段埋点（issue #2244）。
+///
+/// 把每个前置步骤写进 `latest-status.json` 的 `phase`/`progress`，同时往
+/// `codex-plus.log` 记一条带「距启动开始多少毫秒」的日志。冷启动慢的时候，
+/// 用户与维护者由此能直接指出卡在哪一步，而不用靠进程采样反推。
+struct LaunchTimeline {
+    status_store: StatusStore,
+    started: std::time::Instant,
+}
+
+impl LaunchTimeline {
+    fn new(status_store: StatusStore) -> Self {
+        Self {
+            status_store,
+            started: std::time::Instant::now(),
+        }
+    }
+
+    /// 进入某个阶段。状态写入与日志写入都是 best-effort：埋点失败绝不能
+    /// 影响启动本身。
+    fn mark(&self, phase: &str, progress: u8) {
+        let elapsed_ms = self.started.elapsed().as_millis() as u64;
+        let _ = self.status_store.save_phase(phase, progress);
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "launcher.phase",
+            serde_json::json!({
+                "phase": phase,
+                "progress": progress,
+                "elapsed_ms": elapsed_ms,
+            }),
+        );
     }
 }
 
@@ -3469,6 +3922,29 @@ pub async fn activate_packaged_app(
     _arguments: &str,
 ) -> anyhow::Result<u32> {
     anyhow::bail!("Packaged app activation is only supported on Windows")
+}
+
+/// 提权运行时禁止「AUMID 激活失败 → 按路径直接启动」回退的原因；
+/// 非提权返回 None 以保留回退（兜底清单 Application Id 变化等场景）。
+///
+/// 提权进程无法激活 MSIX 打包应用，按路径启动的进程会因缺少包身份
+/// （APPMODEL_ERROR_NO_PACKAGE）立即退出，注入也必然失败；此时必须如实失败
+/// 并给出指引，而不是静默回退导致 latest-status.json 误报 running（issue #2351）。
+///
+/// 不加 `#[cfg(windows)]`：调用点在 `if cfg!(windows)` 的运行时分支里，
+/// 全平台都要编译到这个函数（纯逻辑，无平台依赖）。
+fn packaged_activation_fallback_block_reason(is_elevated: bool) -> Option<&'static str> {
+    if is_elevated {
+        Some(
+            "Codex 打包应用激活失败，且 Codex++ 当前以管理员（提权）身份运行：\
+             Windows 不允许提权进程激活 MSIX 打包应用，按路径启动的进程会因缺少\
+             包身份立即退出。请取消可执行文件「属性 → 兼容性 → 以管理员身份运行\
+             此程序」的勾选（或清除 AppCompatFlags\\Layers 中的 RUNASADMIN 标记），\
+             然后以普通权限重新启动 Codex++",
+        )
+    } else {
+        None
+    }
 }
 
 #[cfg(windows)]
@@ -3529,6 +4005,22 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
+    // 提权分支依赖 issue #2351 的手动复现步骤验收（勾选兼容性「以管理员身份运行」
+    // 后应得到指引错误）。这里不断言当前进程的提权状态：GitHub 的 Windows runner
+    // 本身就以提权令牌运行，断言「CI shell 非提权」必然失败。
+    #[test]
+    fn elevated_activation_failure_blocks_path_fallback_with_guidance() {
+        let reason = packaged_activation_fallback_block_reason(true)
+            .expect("elevated activation failure must block the path fallback");
+        assert!(reason.contains("管理员"));
+        assert!(reason.contains("以普通权限"));
+    }
+
+    #[test]
+    fn unelevated_activation_failure_keeps_path_fallback() {
+        assert!(packaged_activation_fallback_block_reason(false).is_none());
+    }
+
     fn counted_reinjector(calls: Arc<AtomicUsize>) -> BridgeReinjector {
         Arc::new(move || {
             let calls = calls.clone();
@@ -3548,6 +4040,214 @@ mod tests {
     #[test]
     fn owned_launcher_waits_for_its_codex_process_when_cdp_is_unavailable() {
         assert!(owned_launcher_target_alive(true, false));
+    }
+
+    #[test]
+    fn packaged_launcher_survives_one_failed_cdp_probe_after_activation_pid_disappears() {
+        let now = std::time::Instant::now();
+        let mut grace = PackagedExitGrace::default();
+        assert!(grace.keep_waiting(None, false, now));
+        assert!(grace.keep_waiting(None, true, now + std::time::Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn packaged_launcher_waits_for_exact_process_without_cdp() {
+        let now = std::time::Instant::now();
+        let mut grace = PackagedExitGrace::default();
+        for seconds in [0, 10, 60, 3600] {
+            assert!(grace.keep_waiting(
+                Some(true),
+                false,
+                now + std::time::Duration::from_secs(seconds)
+            ));
+        }
+        assert_eq!(grace.missed_probes, 0);
+    }
+
+    #[test]
+    fn packaged_launcher_exits_after_bounded_continuous_absence() {
+        let now = std::time::Instant::now();
+        let mut grace = PackagedExitGrace::default();
+        for seconds in [0, 2, 4, 6, 8] {
+            assert!(grace.keep_waiting(None, false, now + std::time::Duration::from_secs(seconds)));
+        }
+        assert!(!grace.keep_waiting(None, false, now + std::time::Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn packaged_launcher_does_not_follow_another_instance_after_its_process_exits() {
+        let now = std::time::Instant::now();
+        let mut grace = PackagedExitGrace::default();
+        assert!(grace.keep_waiting(Some(true), true, now));
+        assert!(grace.keep_waiting(Some(false), true, now));
+        assert!(grace.keep_waiting(Some(false), true, now + std::time::Duration::from_secs(2)));
+        assert!(!grace.keep_waiting(Some(false), true, now + std::time::Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn packaged_launcher_recovery_resets_exit_grace() {
+        let now = std::time::Instant::now();
+        let mut grace = PackagedExitGrace::default();
+        assert!(grace.keep_waiting(None, false, now));
+        assert!(grace.keep_waiting(None, true, now + std::time::Duration::from_secs(8)));
+        assert!(grace.keep_waiting(None, false, now + std::time::Duration::from_secs(20)));
+        assert_eq!(grace.missed_probes, 1);
+    }
+
+    #[test]
+    fn packaged_activation_pid_alone_cannot_keep_launcher_alive_indefinitely() {
+        assert!(activation_process_is_startup_evidence(
+            true,
+            std::time::Duration::from_secs(29)
+        ));
+        assert!(!activation_process_is_startup_evidence(
+            true,
+            std::time::Duration::from_secs(30)
+        ));
+        assert!(!activation_process_is_startup_evidence(
+            false,
+            std::time::Duration::ZERO
+        ));
+    }
+
+    #[test]
+    fn packaged_browser_fallback_after_discovery_error_and_dead_activation_rejects_replacement() {
+        let now = std::time::Instant::now();
+        let mut binding = PackagedBrowserBinding {
+            initial_id: Some("original".to_string()),
+            replaced: false,
+        };
+        let mut grace = PackagedExitGrace::default();
+        // discovery 失败，没有真实句柄，activation 已退出后原路径降级为 None。
+        let process_alive = Some(false).filter(|alive| *alive);
+        for seconds in [0, 2, 4, 6, 8] {
+            assert!(grace.keep_waiting(process_alive, binding.owns(Some("replacement")), now + std::time::Duration::from_secs(seconds)));
+        }
+        assert!(!grace.keep_waiting(process_alive, binding.owns(Some("replacement")), now + std::time::Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn packaged_browser_fallback_without_initial_identity_is_bounded() {
+        let now = std::time::Instant::now();
+        let mut binding = PackagedBrowserBinding { initial_id: None, replaced: false };
+        let mut grace = PackagedExitGrace::default();
+        assert!(grace.keep_waiting(None, binding.owns(Some("unbound")), now));
+        assert!(grace.keep_waiting(None, binding.owns(Some("unbound")), now + std::time::Duration::from_secs(2)));
+        assert!(!grace.keep_waiting(None, binding.owns(Some("unbound")), now + std::time::Duration::from_secs(10)));
+    }
+
+    #[tokio::test]
+    async fn packaged_browser_capture_rejects_other_browsers_before_reading_their_identity() {
+        for (url, accepted) in [("chrome://newtab", false), ("app://-/index.html", true)] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let recorded = requests.clone();
+            let server = tokio::spawn(async move {
+                for _ in 0..if accepted { 2 } else { 1 } {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut request = [0; 4096];
+                    let count = stream.read(&mut request).await.unwrap();
+                    let request = String::from_utf8_lossy(&request[..count]);
+                    let path = request.split_whitespace().nth(1).unwrap().to_string();
+                    recorded.lock().unwrap().push(path.clone());
+                    let body = if path == "/json/version" {
+                        serde_json::json!({ "Browser":"Chrome/fixture", "webSocketDebuggerUrl":format!("ws://127.0.0.1:{port}/devtools/browser/fixture-browser") })
+                    } else {
+                        serde_json::json!([{ "id":"page", "type":"page", "title":"fixture", "url":url,
+                            "webSocketDebuggerUrl":format!("ws://127.0.0.1:{port}/devtools/page/fixture-page") }])
+                    }.to_string();
+                    let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                }
+            });
+            let identity = validated_codex_browser_id(port).await;
+            server.await.unwrap();
+            assert_eq!(identity.as_deref(), accepted.then_some("fixture-browser"));
+            assert_eq!(requests.lock().unwrap().as_slice(), if accepted { &["/json", "/json/version"][..] } else { &["/json"][..] });
+        }
+    }
+
+    #[test]
+    fn packaged_browser_fallback_after_discovery_error_keeps_only_same_initial_browser() {
+        let now = std::time::Instant::now();
+        let mut binding = PackagedBrowserBinding { initial_id: Some("original".to_string()), replaced: false };
+        let mut grace = PackagedExitGrace::default();
+        let process_alive = Some(false).filter(|alive| *alive);
+        for seconds in [0, 10, 60, 3600] {
+            assert!(grace.keep_waiting(process_alive, binding.owns(Some("original")), now + std::time::Duration::from_secs(seconds)));
+        }
+        assert!(!binding.owns(None));
+        assert!(binding.owns(Some("original")));
+        assert!(!binding.owns(Some("replacement")));
+        assert!(!binding.owns(Some("original")), "实例替换后不能重新绑定旧 ID");
+    }
+
+    #[test]
+    fn degraded_packaged_launch_keeps_its_captured_browser_after_activation_grace_expires() {
+        let now = std::time::Instant::now();
+        let mut binding = PackagedBrowserBinding {
+            initial_id: Some("captured-degraded-browser".to_string()),
+            replaced: false,
+        };
+        let mut grace = PackagedExitGrace::default();
+        for seconds in [0, 10, 30, 60, 3600] {
+            let elapsed = std::time::Duration::from_secs(seconds);
+            let activation_alive = Some(false)
+                .filter(|alive| activation_process_is_startup_evidence(*alive, elapsed));
+            assert!(grace.keep_waiting(
+                activation_alive,
+                binding.owns(Some("captured-degraded-browser")),
+                now + elapsed,
+            ));
+        }
+        assert_eq!(grace.missed_probes, 0);
+    }
+
+    #[test]
+    fn packaged_tracked_process_remains_authoritative_when_browser_probe_fails() {
+        let now = std::time::Instant::now();
+        let mut binding = PackagedBrowserBinding { initial_id: Some("original".to_string()), replaced: false };
+        let mut grace = PackagedExitGrace::default();
+        assert!(grace.keep_waiting(Some(true), binding.owns(None), now));
+        assert!(grace.keep_waiting(Some(true), binding.owns(Some("replacement")), now));
+        assert!(grace.keep_waiting(Some(true), false, now + std::time::Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn terminal_status_preserves_run_identity_and_clears_in_progress_phase() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = StatusStore::new(temp.path().join("status.json"));
+        store
+            .save_latest(&LaunchStatus {
+                status: "running".to_string(),
+                started_at_ms: 10,
+                phase: Some("ready".to_string()),
+                debug_port: Some(9229),
+                ..LaunchStatus::default()
+            })
+            .unwrap();
+        save_terminal_launch_status(&store, 10, "stopped", "Codex exited").unwrap();
+        let status = store.load_latest().unwrap().unwrap();
+        assert_eq!(status.status, "stopped");
+        assert_eq!(status.message, "Codex exited");
+        assert_eq!(status.started_at_ms, 10);
+        assert_eq!(status.debug_port, Some(9229));
+        assert_eq!(status.phase, None);
+    }
+
+    #[test]
+    fn old_launcher_terminal_status_cannot_overwrite_new_restart_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = StatusStore::new(temp.path().join("status.json"));
+        let next_request = LaunchStatus {
+            status: "starting".to_string(),
+            started_at_ms: 20,
+            ..LaunchStatus::default()
+        };
+        store.save_latest(&next_request).unwrap();
+        save_terminal_launch_status(&store, 10, "stopped", "old process exited").unwrap();
+        assert_eq!(store.load_latest().unwrap(), Some(next_request));
     }
 
     #[test]
@@ -3636,6 +4336,38 @@ mod tests {
     }
 
     #[test]
+    fn reinject_backoff_resets_only_after_sustained_health() {
+        let now = std::time::Instant::now();
+        let reset_after = std::time::Duration::from_secs(BRIDGE_REINJECT_BACKOFF_RESET_AFTER_SECS);
+        let mut backoff = BridgeReinjectBackoff::default();
+
+        backoff.record_attempt(now);
+        backoff.observe_healthy(now + std::time::Duration::from_secs(1));
+        assert_eq!(
+            backoff.consecutive_attempts, 1,
+            "注入后立刻健康不应清零退避，否则退避永远停在第一档"
+        );
+
+        backoff.observe_healthy(now + std::time::Duration::from_secs(30));
+        assert_eq!(backoff.consecutive_attempts, 1, "未满阈值不应清零");
+
+        // 中途出现一次不健康，重新计时。
+        backoff.observe_unhealthy();
+        let restart = now + std::time::Duration::from_secs(40);
+        backoff.observe_healthy(restart);
+        backoff.observe_healthy(now + std::time::Duration::from_secs(1) + reset_after);
+        assert_eq!(
+            backoff.consecutive_attempts, 1,
+            "不健康之后必须从新起点重新计时"
+        );
+
+        backoff.observe_healthy(restart + reset_after);
+        assert_eq!(backoff.consecutive_attempts, 0, "持续健康满阈值后应清零");
+        assert!(backoff.healthy_since.is_none());
+        assert!(backoff.ready(restart + reset_after));
+    }
+
+    #[test]
     fn helper_bind_retry_covers_fixed_proxy_ports_and_macos_restarts() {
         assert_eq!(
             helper_bind_retry_timeout_ms(true, false),
@@ -3654,7 +4386,10 @@ mod tests {
 
     #[test]
     fn fixed_helper_port_is_required_only_when_protocol_proxy_is_used() {
-        assert_eq!(required_fixed_helper_port(&BackendSettings::default()), None);
+        assert_eq!(
+            required_fixed_helper_port(&BackendSettings::default()),
+            None
+        );
 
         let official_mix = BackendSettings {
             active_relay_id: "official-mix".to_string(),
@@ -4052,7 +4787,7 @@ mod tests {
         });
         let mut client = tokio::net::TcpStream::connect(helper_addr).await.unwrap();
         let headers = format!(
-            "POST /v1/responses HTTP/1.1\r\nHost: {helper_addr}\r\nAuthorization: Bearer chatgpt-secret\r\nContent-Type: application/json\r\nContent-Encoding: zstd\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "POST /v1/responses HTTP/1.1\r\nHost: {helper_addr}\r\nAuthorization: Bearer chatgpt-secret\r\nSeSsIoN-Id: conversation-123\r\nTHREAD-ID: thread-123\r\nX-OpenCode-Session: opencode-123\r\nCookie: private-cookie\r\nX-Unrelated: private-value\r\nContent-Type: application/json\r\nContent-Encoding: zstd\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             compressed.len()
         );
         client.write_all(headers.as_bytes()).await.unwrap();
@@ -4069,10 +4804,74 @@ mod tests {
         assert!(upstream_headers.starts_with("post /v1/responses http/1.1"));
         assert!(upstream_headers.contains("authorization: bearer sk-upstream"));
         assert!(!upstream_headers.contains("chatgpt-secret"));
+        assert!(upstream_headers.contains("session-id: conversation-123"));
+        assert!(upstream_headers.contains("thread-id: thread-123"));
+        assert!(upstream_headers.contains("x-opencode-session: opencode-123"));
+        assert!(!upstream_headers.contains("private-cookie"));
+        assert!(!upstream_headers.contains("private-value"));
         let upstream_body: serde_json::Value =
             serde_json::from_slice(&upstream_request[header_end + 4..]).unwrap();
         assert_eq!(upstream_body["model"], "gpt-5.6-sol");
         crate::paths::set_settings_path_for_tests(previous_settings_path);
+    }
+
+    #[tokio::test]
+    async fn helper_rejects_encrypted_agent_content_as_bad_request_before_upstream_send() {
+        let _settings_guard = crate::paths::settings_path_test_guard();
+        let temp = tempfile::tempdir().unwrap();
+        let settings_path = temp.path().join("settings.json");
+        struct RestoreSettingsPath(Option<PathBuf>);
+        impl Drop for RestoreSettingsPath {
+            fn drop(&mut self) {
+                crate::paths::set_settings_path_for_tests(self.0.take());
+            }
+        }
+        let _restore = RestoreSettingsPath(crate::paths::set_settings_path_for_tests(Some(settings_path.clone())));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        std::fs::write(settings_path, serde_json::to_vec(&serde_json::json!({
+            "activeRelayId":"encrypted-agent-test",
+            "relayProfiles":[{"id":"encrypted-agent-test","name":"Encrypted agent test",
+                "baseUrl":format!("http://{address}/v1"),"apiKey":"fixture-api-key",
+                "protocol":"chatCompletions","relayMode":"mixedApi"}]
+        })).unwrap()).unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let upstream = tokio::spawn(async move {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (mut socket, _) = accepted.unwrap();
+                    let _ = read_http_request(&mut socket).await.unwrap();
+                    let body = br#"{"choices":[{"message":{"role":"assistant","content":"wrong"},"finish_reason":"stop"}]}"#;
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+                    socket.write_all(body).await.unwrap();
+                    true
+                },
+                _ = stopped => false,
+            }
+        });
+        let body = br#"{"model":"custom-model","stream":false,"input":[{"type":"encrypted_content","encrypted_content":"fixture-private-payload"}]}"#;
+        let mut request = format!("POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).into_bytes();
+        request.extend_from_slice(body);
+        let response = send_raw_helper_request(&request).await;
+        let _ = stop.send(());
+        let contacted = upstream.await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request"), "{response}");
+        let body = response.split_once("\r\n\r\n").unwrap().1;
+        let error: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(error["error"]["type"], "invalid_request_error");
+        assert_eq!(error["error"]["code"], "unsupported_encrypted_agent_content");
+        assert!(!response.contains("fixture-private-payload"));
+        assert!(!response.contains("fixture-api-key"));
+        assert!(!contacted);
+
+        // 只有新增的 typed unsupported 错误映射为 400，其余请求错误沿用 502。
+        let response = send_raw_helper_request(b"POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 1\r\nConnection: close\r\n\r\n{").await;
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 502 Bad Gateway"));
+        let body: serde_json::Value = serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body["status"], "failed");
+        assert!(!response.contains("unsupported_encrypted_agent_content"));
     }
 
     async fn send_raw_helper_request(request: &[u8]) -> Vec<u8> {
@@ -4193,5 +4992,113 @@ mod tests {
         helper.await.unwrap();
         assert_eq!(upstream.await.unwrap(), expected_body);
         crate::paths::set_settings_path_for_tests(previous_settings_path);
+    }
+}
+
+#[cfg(test)]
+mod proxy_stream_tests {
+    use super::forward_protocol_proxy_stream;
+    use crate::protocol_proxy::UpstreamWireApi;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn forward_fixture(body: &str, truncated: bool, wire: UpstreamWireApi) -> (Option<String>, String) {
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        let body = body.to_owned();
+        let upstream_task = tokio::spawn(async move {
+            let (mut socket, _) = upstream.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let byte = socket.read_u8().await.unwrap();
+                request.push(byte);
+                if request.ends_with(b"\r\n\r\n") { break; }
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await.unwrap();
+            socket.write_all(format!("{:X}\r\n{}\r\n", body.len(), body).as_bytes()).await.unwrap();
+            if !truncated { socket.write_all(b"0\r\n\r\n").await.unwrap(); }
+            socket.shutdown().await.unwrap();
+        });
+        let response = reqwest::Client::builder().no_proxy().build().unwrap()
+            .get(format!("http://{address}/stream?key=fixture-secret")).send().await.unwrap();
+        let downstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut reader = tokio::net::TcpStream::connect(downstream.local_addr().unwrap()).await.unwrap();
+        let (mut writer, _) = downstream.accept().await.unwrap();
+        let forwarded = tokio::spawn(async move {
+            let result = forward_protocol_proxy_stream(&mut writer, response, wire, None).await.unwrap();
+            writer.shutdown().await.unwrap();
+            result
+        });
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.unwrap();
+        let result = forwarded.await.unwrap();
+        upstream_task.await.unwrap();
+        (result, String::from_utf8(bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn transport_errors_are_failures_for_native_and_chat_streams() {
+        for wire in [UpstreamWireApi::Responses, UpstreamWireApi::ChatCompletions] {
+            let (failure, output) = forward_fixture(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n", true, wire,
+            ).await;
+            let failure = failure.expect("truncated transfer must not log stream_ok");
+            assert!(!failure.contains("fixture-secret"));
+            assert!(!output.contains("event: response.completed"));
+            if wire == UpstreamWireApi::ChatCompletions {
+                assert!(output.contains("event: response.failed"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_eof_and_error_events_are_not_completed_or_replayed() {
+        for body in [
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+            "event: error\ndata: {\"error\":{\"message\":\"failed\"}}\n\n",
+        ] {
+            let (failure, output) = forward_fixture(body, false, UpstreamWireApi::ChatCompletions).await;
+            assert!(failure.is_some());
+            assert!(output.contains("event: response.failed"));
+            assert!(!output.contains("event: response.completed"));
+        }
+    }
+
+    #[tokio::test]
+    async fn native_responses_failure_events_are_observed_without_rewriting_or_echoing_payload() {
+        for (body, event_type) in [
+            ("event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"private-upstream-error\"},\"output\":[{\"encrypted_content\":\"private-payload\"}]}}\n\n", "response.failed"),
+            ("data: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"private-upstream-error\"}}}\n\n", "response.incomplete"),
+            ("event: error\ndata: {\"error\":{\"message\":\"private-upstream-error\"}}\r\n\r\n", "error"),
+        ] {
+            let (failure, output) = forward_fixture(body, false, UpstreamWireApi::Responses).await;
+            let failure = failure.expect("原生失败事件不得记成 stream_ok");
+            assert!(failure.contains(event_type));
+            assert!(!failure.contains("private-upstream-error"));
+            assert!(!failure.contains("private-payload"));
+            assert_eq!(output, body, "原生响应必须原字节转发");
+        }
+    }
+
+    #[tokio::test]
+    async fn native_responses_clean_http_eof_without_completed_is_diagnosed_without_replay() {
+        let body = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\ndata: [DONE]\n\n";
+        let (failure, output) = forward_fixture(body, false, UpstreamWireApi::Responses).await;
+        assert!(failure.expect("HTTP EOF 和 DONE 均不能代替 response.completed").contains("完成事件"));
+        assert_eq!(output, body);
+    }
+
+    #[tokio::test]
+    async fn successful_native_passthrough_and_chat_completion_are_preserved() {
+        let native = "event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n";
+        let (failure, output) = forward_fixture(native, false, UpstreamWireApi::Responses).await;
+        assert!(failure.is_none());
+        assert_eq!(output, native);
+        let (failure, output) = forward_fixture(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            false, UpstreamWireApi::ChatCompletions,
+        ).await;
+        assert!(failure.is_none());
+        assert!(output.contains("event: response.completed"));
+        assert!(!output.contains("event: response.failed"));
     }
 }

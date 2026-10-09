@@ -1,19 +1,20 @@
 use codex_plus_core::protocol_proxy::{
-    ChatSseToResponsesConverter, CompactionSseConverter, audio_transcriptions_url,
-    chat_completion_to_response, chat_completion_to_response_with_request, chat_completions_url,
-    chat_sse_to_responses_sse, chat_sse_to_responses_sse_with_request, image_edits_url,
-    image_generations_url, is_audio_transcriptions_proxy_path, is_chat_completions_proxy_path,
-    is_image_edits_proxy_path, is_image_generations_proxy_path, is_models_proxy_path,
-    is_responses_compact_proxy_path, is_responses_proxy_path, models_url,
-    open_audio_transcriptions_proxy_request, open_chat_completions_proxy_request,
-    open_image_edits_proxy_request, open_image_generations_proxy_request,
-    open_models_proxy_request, open_responses_proxy_request,
+    ChatSseToResponsesConverter, CompactionSseConverter, ProxySessionHeaders,
+    audio_transcriptions_url, chat_completion_to_response,
+    chat_completion_to_response_with_request, chat_completions_url, chat_sse_to_responses_sse,
+    chat_sse_to_responses_sse_with_request, image_edits_url, image_generations_url,
+    is_audio_transcriptions_proxy_path, is_chat_completions_proxy_path, is_image_edits_proxy_path,
+    is_image_generations_proxy_path, is_models_proxy_path, is_responses_compact_proxy_path,
+    is_responses_proxy_path, models_url, open_audio_transcriptions_proxy_request,
+    open_chat_completions_proxy_request, open_image_edits_proxy_request,
+    open_image_generations_proxy_request, open_models_proxy_request, open_responses_proxy_request,
     open_responses_proxy_request_with_settings,
-    open_responses_proxy_request_with_settings_for_path, request_has_compaction_trigger,
-    responses_compact_url, responses_error_from_upstream, responses_to_chat_completions,
-    responses_to_chat_completions_with_options, send_upstream_request_with_header_timeout,
-    upstream_header_timeout, upstream_http_client, upstream_stream_header_timeout,
-    wrap_non_stream_response_as_compaction,
+    open_responses_proxy_request_with_settings_for_path,
+    open_responses_proxy_request_with_settings_for_path_and_session_headers,
+    request_has_compaction_trigger, responses_compact_url, responses_error_from_upstream,
+    responses_to_chat_completions, responses_to_chat_completions_with_options,
+    send_upstream_request_with_header_timeout, upstream_header_timeout, upstream_http_client,
+    upstream_stream_header_timeout, wrap_non_stream_response_as_compaction,
 };
 use codex_plus_core::relay_config::test_relay_profile;
 use codex_plus_core::settings::{
@@ -89,6 +90,95 @@ fn compaction_history_item_expands_to_user_message_in_chat_conversion() {
         })
         .expect("compaction item 应展开为摘要 user 消息");
     assert_eq!(replayed["role"], "user");
+}
+
+#[test]
+fn chat_conversion_rejects_encrypted_agent_content_without_echoing_payload() {
+    for input in [
+        json!([{"type":"message","role":"user","content":[
+            {"type":"input_text","text":"Payload:"},
+            {"type":"encrypted_content","text":"private-agent-payload"}
+        ]}]),
+        json!([{"type":"encrypted_content","encrypted_content":"private-agent-payload"}]),
+        json!([{"type":"agent_message","content":[
+            {"type":"encrypted_content","encrypted_content":"private-agent-payload"}
+        ]}]),
+        json!({"type":"encrypted_content","encrypted_content":"private-agent-payload"}),
+        json!([{"type":"message","role":"user","content":[{"type":"encrypted_content"}]}]),
+    ] {
+        for standard in [false, true] {
+            let error = responses_to_chat_completions_with_options(
+                json!({"model":"custom-model","input":input}), standard,
+            ).expect_err("加密 agent 内容必须明确拒绝，不能静默丢弃或视为明文");
+            let diagnostic = format!("{error:#}");
+            assert!(diagnostic.contains("unsupported_encrypted_agent_content"));
+            assert!(!diagnostic.contains("private-agent-payload"));
+        }
+    }
+}
+
+#[test]
+fn chat_conversion_keeps_plaintext_and_existing_reasoning_compaction_contracts() {
+    let converted = responses_to_chat_completions(json!({
+        "model":"custom-model",
+        "input":[
+            {"type":"reasoning","summary":[{"type":"summary_text","text":"visible-summary"}],
+             "encrypted_content":"opaque-reasoning"},
+            {"type":"message","role":"user","content":[
+                {"type":"input_text","text":"Payload:"},
+                {"type":"input_text","text":"plaintext-task"}
+            ]},
+            {"type":"compaction","encrypted_content":"local-summary"},
+            {"type":"function_call_output","call_id":"orphan",
+             "output":{"type":"encrypted_content","text":"tool-output-text"}}
+        ]
+    })).unwrap();
+    let messages = converted["messages"].to_string();
+    assert!(messages.contains("plaintext-task"));
+    assert!(messages.contains("visible-summary"));
+    assert!(messages.contains("local-summary"));
+    assert!(messages.contains("tool-output-text"));
+    assert!(!messages.contains("opaque-reasoning"));
+}
+
+#[tokio::test]
+async fn encrypted_agent_content_is_rejected_before_contacting_chat_upstream() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let upstream = tokio::spawn(async move {
+        tokio::select! {
+            request = capture_json_request_once(listener) => Some(request),
+            _ = stopped => None,
+        }
+    });
+    let settings = session_header_settings(RelayProtocol::ChatCompletions, format!("http://{address}/v1"));
+    let result = open_responses_proxy_request_with_settings(
+        &json!({"model":"custom-model","stream":false,"input":[
+            {"type":"encrypted_content","encrypted_content":"private-agent-payload"}
+        ]}).to_string(), settings,
+    ).await;
+    let _ = stop.send(());
+    let request = upstream.await.unwrap();
+    assert!(result.is_err(), "必须在发送上游请求前拒绝不支持的加密内容");
+    assert!(request.is_none(), "不得向 Chat 上游发送删掉 payload 的请求");
+}
+
+#[tokio::test]
+async fn responses_upstream_preserves_encrypted_agent_content() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let upstream = tokio::spawn(capture_json_request_once(listener));
+    let request = json!({"model":"custom-model","stream":false,"input":[
+        {"type":"agent_message","sender_agent_id":"sender","recipient_agent_id":"recipient",
+         "content":[{"type":"encrypted_content","encrypted_content":"opaque-agent-payload"}]},
+        {"type":"encrypted_content","encrypted_content":"standalone-opaque-agent-payload"}
+    ]});
+    let settings = session_header_settings(RelayProtocol::Responses, format!("http://{address}/v1"));
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings).await.unwrap();
+    assert_eq!(result.status_code, 200);
+    let (_, sent) = upstream.await.unwrap();
+    assert_eq!(sent, request);
 }
 
 #[test]
@@ -485,6 +575,76 @@ async fn chat_compaction_v2_request_routes_to_summary_endpoint_and_flags_respons
     assert_eq!(result.status_code, 200);
 }
 
+/// #2031：GLM 系上游只接受纯 base64，不认 `data:image/...;base64,` 前缀。
+#[test]
+fn glm_image_urls_are_stripped_to_bare_base64() {
+    let converted = responses_to_chat_completions(json!({
+        "model": "glm-5.3-flash",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    { "type": "input_text", "text": "看图" },
+                    { "type": "input_image", "image_url": "data:image/png;base64,QUJD" }
+                ]
+            }
+        ]
+    }))
+    .unwrap();
+
+    let url = converted["messages"][0]["content"][1]["image_url"]["url"]
+        .as_str()
+        .expect("image part survives");
+    assert_eq!(url, "QUJD");
+}
+
+/// 标准 data URL 上游（OpenAI 等）不能被这层改写波及。
+#[test]
+fn non_glm_image_urls_keep_data_url_prefix() {
+    let converted = responses_to_chat_completions(json!({
+        "model": "gpt-5-mini",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    { "type": "input_image", "image_url": "data:image/png;base64,QUJD" }
+                ]
+            }
+        ]
+    }))
+    .unwrap();
+
+    let url = converted["messages"][0]["content"][0]["image_url"]["url"]
+        .as_str()
+        .expect("image part survives");
+    assert_eq!(url, "data:image/png;base64,QUJD");
+}
+
+/// 远端 https 图片既没有前缀可剥，也不该被改动。
+#[test]
+fn remote_image_urls_are_untouched_for_glm() {
+    let converted = responses_to_chat_completions(json!({
+        "model": "glm-5.3-flash",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    { "type": "input_image", "image_url": "https://example.com/a.png" }
+                ]
+            }
+        ]
+    }))
+    .unwrap();
+
+    let url = converted["messages"][0]["content"][0]["image_url"]["url"]
+        .as_str()
+        .expect("image part survives");
+    assert_eq!(url, "https://example.com/a.png");
+}
+
 #[test]
 fn responses_request_converts_to_chat_completions() {
     let converted = responses_to_chat_completions(json!({
@@ -782,6 +942,20 @@ fn responses_request_maps_kimi_coding_reasoning_effort_per_official_spec() {
     .unwrap();
     assert_eq!(off["thinking"]["type"], "disabled");
     assert!(off.get("reasoning_effort").is_none());
+}
+
+#[test]
+fn kimi_k3_standard_protocol_avoids_adaptive_and_preserves_opt_in_vendor_behavior() {
+    for model in ["kimi-k3", "k3-256k"] {
+        let request = json!({"model":model,"reasoning":{"effort":"xhigh"},"input":"hello"});
+        let standard = responses_to_chat_completions_with_options(request.clone(), true).unwrap();
+        assert!(standard.get("thinking").is_none());
+        assert!(standard.get("reasoning_effort").is_none());
+        let vendor = responses_to_chat_completions_with_options(request, false).unwrap();
+        assert_eq!(vendor["thinking"]["type"], "adaptive");
+        assert_eq!(vendor["reasoning_effort"], "max");
+        assert_eq!(standard["messages"], vendor["messages"]);
+    }
 }
 
 #[test]
@@ -1278,6 +1452,161 @@ fn responses_request_merges_reasoning_text_and_tool_calls_like_ccx() {
 }
 
 #[test]
+fn responses_request_keeps_reasoning_when_text_message_precedes_tool_call() {
+    // issue #2210：reasoning → 不带 tool_calls 的 assistant 文本消息 → function_call。
+    // 文本消息先把 pending_reasoning 消费掉，随后的 function_call 走
+    // flush_tool_calls 的 merge 分支（最后一条已是 assistant），旧实现在那里
+    // 提前 return，把这条 reasoning 静默丢弃。
+    // 注意与 responses_request_merges_reasoning_text_and_tool_calls_like_ccx 的区别：
+    // 那个用例里 reasoning 直接跟在 assistant 之后，走的是新建 assistant 分支。
+    let converted = responses_to_chat_completions(json!({
+        "model": "deepseek-v4-pro",
+        "input": [
+            {
+                "type": "reasoning",
+                "status": "completed",
+                "summary": [{ "type": "summary_text", "text": "先看仓库状态。" }]
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "我先检查一下。" }]
+            },
+            {
+                "type": "reasoning",
+                "status": "completed",
+                "summary": [{ "type": "summary_text", "text": "需要跑 git status。" }]
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_009",
+                "name": "exec_command",
+                "arguments": "{\"cmd\":\"git status\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_009",
+                "output": "clean"
+            }
+        ]
+    }))
+    .unwrap();
+
+    let assistant = converted["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message.get("tool_calls").is_some())
+        .expect("应存在带 tool_calls 的 assistant 消息");
+
+    assert_eq!(assistant["content"], "我先检查一下。");
+    assert_eq!(assistant["tool_calls"][0]["id"], "call_009");
+    // 两段 reasoning 归并到同一条 assistant 上（先来的已由文本消息附着，
+    // 后来的由 merge 分支追加）。关键是**一点都不能丢**。
+    let reasoning = assistant["reasoning_content"].as_str().unwrap_or("");
+    assert!(
+        reasoning.contains("先看仓库状态。"),
+        "文本消息阶段的 reasoning 不能丢：{reasoning:?}"
+    );
+    assert!(
+        reasoning.contains("需要跑 git status。"),
+        "merge 分支必须消费 pending_reasoning，不能静默丢弃：{reasoning:?}"
+    );
+}
+
+#[test]
+fn responses_request_relocates_developer_notice_between_tool_outputs() {
+    // issue #2275 / #2257：<image_resize_notice> 这类提示以 developer（映射成 system）
+    // 形式插在两条 tool 结果之间。配对判定用 take_while 只数连续 tool 消息，
+    // 数到夹心就停，于是第二个 tool_call 被判 orphaned 从 tool_calls 摘掉，
+    // 而它的 tool 消息还在原位 → 上游 400「No tool output found for tool call」。
+    let converted = responses_to_chat_completions(json!({
+        "model": "deepseek-v4-pro",
+        "input": [
+            {
+                "type": "function_call",
+                "call_id": "call_a",
+                "name": "view_image",
+                "arguments": "{\"path\":\"a.png\"}"
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_b",
+                "name": "view_image",
+                "arguments": "{\"path\":\"b.png\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_a",
+                "output": "a ok"
+            },
+            {
+                "type": "message",
+                "role": "developer",
+                "content": [{ "type": "input_text", "text": "<image_resize_notice>a.png resized</image_resize_notice>" }]
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_b",
+                "output": "b ok"
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "继续" }]
+            }
+        ]
+    }))
+    .unwrap();
+
+    let messages = converted["messages"].as_array().unwrap();
+
+    // 每个 tool 消息都必须能找到恰好一条含该 tool_call_id 的 assistant.tool_calls。
+    let mut declared: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for message in messages {
+        if let Some(tool_calls) = message.get("tool_calls").and_then(|value| value.as_array()) {
+            for tool_call in tool_calls {
+                declared.insert(tool_call["id"].as_str().unwrap().to_string());
+            }
+        }
+    }
+    assert!(declared.contains("call_a"), "call_a 不应被判 orphaned");
+    assert!(
+        declared.contains("call_b"),
+        "call_b 不应被判 orphaned（夹心消息必须被搬走）"
+    );
+
+    for (position, message) in messages.iter().enumerate() {
+        if message.get("role").and_then(|value| value.as_str()) != Some("tool") {
+            continue;
+        }
+        let id = message["tool_call_id"].as_str().unwrap();
+        assert!(
+            declared.contains(id),
+            "第 {position} 条 tool 消息（{id}）没有前置 tool_calls"
+        );
+        // 相邻前一条不能是 developer 通知（说明夹心已被搬走）。
+        if position > 0 {
+            let previous = messages[position - 1]["content"]
+                .as_str()
+                .unwrap_or("");
+            assert!(
+                !previous.contains("image_resize_notice"),
+                "夹心通知仍插在 tool 结果之间"
+            );
+        }
+    }
+
+    // 至少有一条 tool 消息承载了 b 的结果，且内容没丢。
+    assert!(
+        messages.iter().any(|message| {
+            message.get("tool_call_id").and_then(|value| value.as_str()) == Some("call_b")
+        }),
+        "call_b 的结果不能丢失"
+    );
+}
+
+#[test]
 fn responses_request_normalizes_empty_assistant_messages_for_chat_upstream() {
     let converted = responses_to_chat_completions(json!({
         "model": "deepseek-chat",
@@ -1361,6 +1690,106 @@ fn responses_request_to_chat_inlines_ref_siblings_in_tool_defs() {
     assert_eq!(
         parameters["properties"]["targetThreadId"]["$ref"],
         "#/$defs/__schema20"
+    );
+}
+
+#[test]
+fn responses_request_flattens_top_level_one_of_in_tool_parameters() {
+    // issue #2367：zod-to-json-schema 会生成顶层 oneOf 的 schema，
+    // Anthropic（Claude）上游直接拒绝、整轮 400、模型完全不可用。
+    // 转换后顶层不得再有组合器，且各分支贡献的字段要出现在 properties 里。
+    let converted = responses_to_chat_completions(json!({
+        "model": "claude-sonnet",
+        "input": "hi",
+        "tools": [{
+            "type": "function",
+            "name": "automation_update",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "oneOf": [
+                    { "$ref": "#/$defs/__schema0" },
+                    { "$ref": "#/$defs/__schema1" }
+                ],
+                "$defs": {
+                    "__schema0": {
+                        "type": "object",
+                        "properties": {
+                            "mode": { "type": "string" },
+                            "targetThreadId": { "type": "string" }
+                        },
+                        "required": ["mode", "targetThreadId"]
+                    },
+                    "__schema1": {
+                        "type": "object",
+                        "properties": {
+                            "mode": { "type": "string" },
+                            "note": { "type": "string" }
+                        },
+                        "required": ["mode"]
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+
+    let parameters = &converted["tools"][0]["function"]["parameters"];
+    assert!(
+        parameters.get("oneOf").is_none(),
+        "顶层 oneOf 必须被摊平：{parameters}"
+    );
+    assert!(parameters.get("anyOf").is_none());
+    assert!(parameters.get("allOf").is_none());
+    assert_eq!(parameters["type"], "object");
+
+    let properties = parameters["properties"].as_object().unwrap();
+    assert!(properties.contains_key("mode"), "分支共有的字段应并入");
+    assert!(properties.contains_key("targetThreadId"), "分支独有字段应并入");
+    assert!(properties.contains_key("note"), "第二个分支的独有字段应并入");
+
+    // required 取交集：只有 mode 是所有分支都要求的。
+    let required: Vec<&str> = parameters["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|value| value.as_str())
+        .collect();
+    assert_eq!(required, vec!["mode"]);
+}
+
+#[test]
+fn responses_request_degrades_unmergeable_top_level_combinator_without_losing_tool() {
+    // 分支不是对象（此处是字符串）时无法摊平，但**不能丢掉工具**——
+    // 降级成带说明的私有字段，schema 仍合法。
+    let converted = responses_to_chat_completions(json!({
+        "model": "claude-sonnet",
+        "input": "hi",
+        "tools": [{
+            "type": "function",
+            "name": "transfer_voice_call",
+            "parameters": {
+                "type": "object",
+                "anyOf": [
+                    { "type": "string", "description": "转人工" },
+                    { "type": "string", "description": "转语音信箱" }
+                ]
+            }
+        }]
+    }))
+    .unwrap();
+
+    let tools = converted["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 1, "工具不得因无法摊平而消失");
+    let parameters = &tools[0]["function"]["parameters"];
+    assert!(parameters.get("anyOf").is_none(), "顶层组合器仍须剥掉");
+    assert_eq!(parameters["type"], "object");
+    let fallback = &parameters["x-merged-combinator"];
+    assert_eq!(fallback["kind"], "anyOf");
+    assert_eq!(fallback["branches"].as_array().unwrap().len(), 2);
+    assert!(
+        fallback["description"].as_str().unwrap().contains("转人工"),
+        "分支说明应被保留"
     );
 }
 
@@ -2365,6 +2794,116 @@ fn chat_completion_response_maps_reasoning_tool_calls_and_usage_details() {
     );
 }
 
+/// #332 / #1012：Gemini 3 系要求 functionCall 回传 thought_signature，否则整轮 400。
+/// 签名由上游产生、本仓不理解其语义，因此原样透传 `extra_content`：
+/// 上游返回时记住（按 call_id），下一轮构造请求时挂回对应的 tool_call。
+#[test]
+fn gemini_thought_signature_is_carried_back_across_turns() {
+    // 第一轮：上游在 tool_call 上带了 extra_content
+    let converted = chat_completion_to_response(json!({
+        "id": "chatcmpl_sig",
+        "created": 123,
+        "model": "gemini-3.5-flash",
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_sig",
+                    "type": "function",
+                    "function": { "name": "get_weather", "arguments": "{\"city\":\"Tokyo\"}" },
+                    "extra_content": { "google": { "thought_signature": "SIG-ABC" } }
+                }]
+            }
+        }]
+    }))
+    .unwrap();
+
+    let call_id = converted["output"][0]["call_id"]
+        .as_str()
+        .expect("tool call survives")
+        .to_string();
+
+    // 第二轮：客户端把这个 function_call 作为历史带回来
+    let replayed = responses_to_chat_completions(json!({
+        "model": "gemini-3.5-flash",
+        "input": [
+            { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "天气" }] },
+            {
+                "type": "function_call",
+                "call_id": call_id,
+                "name": "get_weather",
+                "arguments": "{\"city\":\"Tokyo\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": "sunny"
+            }
+        ]
+    }))
+    .unwrap();
+
+    let tool_call = replayed["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|message| message.get("tool_calls").and_then(Value::as_array))
+        .and_then(|calls| calls.first())
+        .expect("tool call replayed into chat history");
+    assert_eq!(
+        tool_call["extra_content"]["google"]["thought_signature"],
+        "SIG-ABC",
+        "签名字段必须原样回到下一轮请求"
+    );
+}
+
+/// 无 extra_content 时不得凭空造字段（其它供应商不受影响）。
+#[test]
+fn tool_call_without_extra_content_replays_without_the_field() {
+    let converted = chat_completion_to_response(json!({
+        "id": "chatcmpl_plain",
+        "created": 123,
+        "model": "gpt-5.4",
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_plain",
+                    "type": "function",
+                    "function": { "name": "get_weather", "arguments": "{\"city\":\"Tokyo\"}" }
+                }]
+            }
+        }]
+    }))
+    .unwrap();
+
+    let call_id = converted["output"][0]["call_id"].as_str().unwrap().to_string();
+    let replayed = responses_to_chat_completions(json!({
+        "model": "gpt-5.4",
+        "input": [
+            { "type": "function_call", "call_id": call_id, "name": "get_weather", "arguments": "{\"city\":\"Tokyo\"}" },
+            { "type": "function_call_output", "call_id": call_id, "output": "sunny" }
+        ]
+    }))
+    .unwrap();
+
+    let tool_call = replayed["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|message| message.get("tool_calls").and_then(Value::as_array))
+        .and_then(|calls| calls.first())
+        .expect("tool call replayed");
+    assert!(
+        tool_call.get("extra_content").is_none(),
+        "没有附带数据时不应凭空造 extra_content"
+    );
+}
+
 #[test]
 fn chat_completion_response_defaults_missing_reasoning_tokens_to_zero() {
     // Kimi 等上游在一次响应无 reasoning 时会省略 completion_tokens_details
@@ -3011,7 +3550,10 @@ async fn upstream_request_returns_when_provider_accepts_but_never_sends_headers(
     .await;
 
     assert!(result.is_err());
-    assert!(started.elapsed() < Duration::from_secs(1));
+    // 断言意图：客户端在 header 超时（100ms）后放弃等待，而不是傻等上游那 2 秒。
+    // 上限取 1.5s：既与「傻等 2 秒」有明确区分，又给满负载下的调度抖动留出余量。
+    // 原先写 1s，跑全量测试（几十个 target 并发）时会间歇性越界。
+    assert!(started.elapsed() < Duration::from_millis(1500));
     server.abort();
 }
 
@@ -3806,6 +4348,208 @@ async fn responses_proxy_passes_through_original_user_agent_when_unconfigured() 
 
     let request = server.finish();
     assert_eq!(request.user_agent, "Original-Codex-UA/1.0");
+}
+
+fn captured_header_values<'a>(headers: &'a str, expected_name: &str) -> Vec<&'a str> {
+    headers
+        .lines()
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case(expected_name)
+                .then(|| value.trim())
+        })
+        .collect()
+}
+
+fn session_header_settings(protocol: RelayProtocol, base_url: String) -> BackendSettings {
+    BackendSettings {
+        relay_profiles_enabled: true,
+        active_relay_id: "session-headers".to_string(),
+        relay_profiles: vec![RelayProfile {
+            id: "session-headers".to_string(),
+            base_url,
+            api_key: "sk-upstream".to_string(),
+            protocol,
+            relay_mode: RelayMode::PureApi,
+            ..RelayProfile::default()
+        }],
+        ..BackendSettings::default()
+    }
+}
+
+#[tokio::test]
+async fn responses_proxy_preserves_session_headers_through_both_protocols() {
+    for protocol in [RelayProtocol::Responses, RelayProtocol::ChatCompletions] {
+        // 连续两次请求携带不同的客户端会话，不能混成供应商级固定值。
+        for (session_id, thread_id, opencode_session) in [
+            ("session-a", "thread-a", "opencode-a"),
+            ("session-b", "thread-b", "opencode-b"),
+        ] {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(capture_request_with_response(
+                listener,
+                "application/json",
+                "{}".to_string(),
+            ));
+            let settings = session_header_settings(protocol, format!("http://{address}/v1"));
+            let result = open_responses_proxy_request_with_settings_for_path_and_session_headers(
+                r#"{"model":"session-probe","input":"hello","stream":false}"#,
+                settings,
+                "/v1/responses",
+                Some("remote_compaction_v2"),
+                ProxySessionHeaders {
+                    session_id: Some(session_id),
+                    thread_id: Some(thread_id),
+                    opencode_session: Some(opencode_session),
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.status_code, 200);
+            let (headers, _) = server.await.unwrap();
+            let endpoint = if protocol == RelayProtocol::Responses {
+                "/v1/responses"
+            } else {
+                "/v1/chat/completions"
+            };
+            assert!(headers.starts_with(&format!("POST {endpoint} HTTP/1.1")));
+            assert_eq!(
+                captured_header_values(&headers, "session-id"),
+                vec![session_id]
+            );
+            assert_eq!(
+                captured_header_values(&headers, "thread-id"),
+                vec![thread_id]
+            );
+            assert_eq!(
+                captured_header_values(&headers, "x-opencode-session"),
+                vec![opencode_session]
+            );
+            assert_eq!(
+                captured_header_values(&headers, "authorization"),
+                vec!["Bearer sk-upstream"]
+            );
+            assert_eq!(
+                captured_header_values(&headers, "x-codex-beta-features"),
+                if protocol == RelayProtocol::Responses {
+                    vec!["remote_compaction_v2"]
+                } else {
+                    vec![]
+                },
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn responses_proxy_session_headers_keep_custom_headers_authoritative() {
+    for protocol in [RelayProtocol::Responses, RelayProtocol::ChatCompletions] {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(capture_request_with_response(
+            listener,
+            "application/json",
+            "{}".to_string(),
+        ));
+        let mut settings = session_header_settings(protocol, format!("http://{address}/v1"));
+        let relay = &mut settings.relay_profiles[0];
+        relay.custom_headers = vec![
+            codex_plus_core::settings::RelayHeaderKeyValue {
+                key: "Session-ID".to_string(),
+                value: "configured-session".to_string(),
+            },
+            codex_plus_core::settings::RelayHeaderKeyValue {
+                key: "THREAD-id".to_string(),
+                value: "configured-thread".to_string(),
+            },
+            codex_plus_core::settings::RelayHeaderKeyValue {
+                key: "X-OpenCode-Session".to_string(),
+                value: String::new(),
+            },
+        ];
+        let result = open_responses_proxy_request_with_settings_for_path_and_session_headers(
+            r#"{"model":"session-probe","input":"hello","stream":false}"#,
+            settings,
+            "/v1/responses",
+            None,
+            ProxySessionHeaders {
+                session_id: Some("client-session"),
+                thread_id: Some("client-thread"),
+                opencode_session: Some("client-opencode"),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.status_code, 200);
+        let (headers, _) = server.await.unwrap();
+        assert_eq!(
+            captured_header_values(&headers, "session-id"),
+            vec!["configured-session"]
+        );
+        assert_eq!(
+            captured_header_values(&headers, "thread-id"),
+            vec!["configured-thread"]
+        );
+        assert_eq!(
+            captured_header_values(&headers, "x-opencode-session"),
+            vec![""]
+        );
+        assert!(!headers.contains("client-"));
+    }
+}
+
+#[tokio::test]
+async fn responses_proxy_omits_empty_or_invalid_session_headers_and_keeps_legacy_api() {
+    for legacy_api in [false, true] {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(capture_request_with_response(
+            listener,
+            "application/json",
+            "{}".to_string(),
+        ));
+        let settings =
+            session_header_settings(RelayProtocol::Responses, format!("http://{address}/v1"));
+        let body = r#"{"model":"session-probe","input":"hello","stream":false}"#;
+        let result = if legacy_api {
+            open_responses_proxy_request_with_settings_for_path(body, settings, "/v1/responses")
+                .await
+        } else {
+            open_responses_proxy_request_with_settings_for_path_and_session_headers(
+                body,
+                settings,
+                "/v1/responses",
+                None,
+                ProxySessionHeaders {
+                    session_id: Some("   "),
+                    thread_id: Some("invalid\r\nx-injected: value"),
+                    opencode_session: None,
+                },
+            )
+            .await
+        }
+        .unwrap();
+        assert_eq!(result.status_code, 200);
+        let (headers, _) = server.await.unwrap();
+        for name in [
+            "session-id",
+            "thread-id",
+            "x-opencode-session",
+            "x-injected",
+        ] {
+            assert!(
+                captured_header_values(&headers, name).is_empty(),
+                "unexpected header: {name}"
+            );
+        }
+    }
 }
 
 #[tokio::test]

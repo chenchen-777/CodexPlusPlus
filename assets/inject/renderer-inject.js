@@ -5,378 +5,51 @@
   if (!codexPlusIsNodeTestHarness && (window.top !== window || window.self !== window || !window.electronBridge || !/^app:\/\/\-\//i.test(window.location.href))) return;
   const codexPlusIsWindowsPlatform = /\bWindows\b/i.test(navigator.userAgent || "");
 
-  function installCodexPlusFastStartup() {
-    const config = window.__CODEX_PLUS_FAST_STARTUP__;
-    if (!config || config.enabled !== true) return;
-    if (window.__codexPlusFastStartupInstalled === "1") return;
-    window.__codexPlusFastStartupInstalled = "1";
-    const timeoutMs = Math.max(100, Math.min(Number(config.statsigTimeoutMs) || 800, 3000));
-    const statsigHosts = new Set([
-      "ab.chatgpt.com",
-      "featureassets.org",
-      "prodregistryv2.org",
-      "api.statsigcdn.com",
-      "statsigapi.net",
-      "cloudflare-dns.com",
-    ]);
-
-    const isStatsigUrl = (input) => {
+  // 撤下强制语言后的单次迁移：只撤回仍由旧版管理的设置，不干预用户后来选择的语言。
+  async function restoreCodexPlusManagedLocale() {
+    const managedKey = "codexPlus.forceChineseLocale.managed.v1";
+    const reloadKey = "codexPlus.forceChineseLocale.reload.v1";
+    let marker;
+    let managed;
+    try {
+      marker = window.localStorage.getItem(managedKey);
+      if (!marker) return true;
+      managed = JSON.parse(marker);
+      if (!managed || Array.isArray(managed) || typeof managed.appliedLocale !== "string" || !managed.appliedLocale) return false;
+    } catch {
+      return false;
+    }
+    if (window.__codexPlusRetiredLocaleCleanupPromise) return await window.__codexPlusRetiredLocaleCleanupPromise;
+    const restore = async () => {
       try {
-        const url = new URL(typeof input === "string" ? input : input?.url ?? "", window.location.href);
-        return statsigHosts.has(url.hostname);
+        const response = await codexStateCall("get-setting", { params: { key: "localeOverride" } });
+        if (!response || !Object.prototype.hasOwnProperty.call(response, "value")) return false;
+        if (window.localStorage.getItem(managedKey) !== marker) return false;
+        if (response.value === managed.appliedLocale) {
+          const previousValue = managed.previousValue ?? null;
+          if (previousValue !== null) {
+            if (typeof previousValue !== "string" || previousValue.length > 64 || previousValue.trim() !== previousValue) return false;
+            if (Intl.getCanonicalLocales(previousValue).length !== 1) return false;
+          }
+          await codexStateCall("set-setting", { params: { key: "localeOverride", value: previousValue } });
+        }
+        if (window.localStorage.getItem(managedKey) !== marker) return false;
+        window.sessionStorage.removeItem(reloadKey);
+        window.localStorage.removeItem(managedKey);
+        return true;
       } catch {
+        // 原生 API 或存储暂时不可用时保留标记，下一次注入继续撤回。
         return false;
       }
     };
-
-    const timeoutSignal = (signal) => {
-      const controller = new AbortController();
-      const timer = window.setTimeout(() => controller.abort(), timeoutMs);
-      const clear = () => window.clearTimeout(timer);
-      if (signal) {
-        if (signal.aborted) controller.abort();
-        else signal.addEventListener("abort", () => controller.abort(), { once: true });
-      }
-      return { signal: controller.signal, clear };
-    };
-
-    const patchFetch = () => {
-      if (typeof window.fetch !== "function" || window.fetch.__codexPlusFastStartupPatched) return;
-      const originalFetch = window.fetch.bind(window);
-      const patchedFetch = (input, init = undefined) => {
-        if (!isStatsigUrl(input)) return originalFetch(input, init);
-        const { signal, clear } = timeoutSignal(init?.signal);
-        const nextInit = { ...(init || {}), signal };
-        return originalFetch(input, nextInit).finally(clear);
-      };
-      patchedFetch.__codexPlusFastStartupPatched = true;
-      window.fetch = patchedFetch;
-    };
-
-    const markStatsigReady = (client) => {
-      if (!client || typeof client !== "object" || client.__codexPlusFastStartupReadyPatched) return;
-      client.__codexPlusFastStartupReadyPatched = true;
-      const markReady = () => {
-        try {
-          if (client.loadingStatus && client.loadingStatus !== "Ready") client.loadingStatus = "Ready";
-        } catch {
-        }
-        try {
-          if (typeof client.$emt === "function") client.$emt({ name: "values_updated" });
-        } catch {
-        }
-      };
-      if (typeof client.initializeAsync === "function") {
-        const originalInitializeAsync = client.initializeAsync.bind(client);
-        client.initializeAsync = (...args) => Promise.race([
-          originalInitializeAsync(...args).catch(() => null),
-          new Promise((resolve) => window.setTimeout(() => resolve(null), timeoutMs)),
-        ]).finally(markReady);
-      }
-      markReady();
-    };
-
-    const statsigClients = () => {
-      const root = window.__STATSIG__ || globalThis.__STATSIG__;
-      if (!root || typeof root !== "object") return [];
-      const clients = [root.firstInstance, typeof root.instance === "function" ? root.instance() : null];
-      if (root.instances && typeof root.instances === "object") clients.push(...Object.values(root.instances));
-      return clients.filter((client, index, array) => client && typeof client === "object" && array.indexOf(client) === index);
-    };
-
-    const patchStatsigRoot = () => statsigClients().forEach(markStatsigReady);
-
-    patchFetch();
-    patchStatsigRoot();
-    const startedAt = Date.now();
-    const timer = window.setInterval(() => {
-      patchFetch();
-      patchStatsigRoot();
-      if (Date.now() - startedAt > 5000) window.clearInterval(timer);
-    }, 50);
+    const pending = restore();
+    window.__codexPlusRetiredLocaleCleanupPromise = pending;
+    try {
+      return await pending;
+    } finally {
+      if (window.__codexPlusRetiredLocaleCleanupPromise === pending) delete window.__codexPlusRetiredLocaleCleanupPromise;
+    }
   }
-
-  function installCodexPlusForceChineseLocale() {
-    const config = window.__CODEX_PLUS_FORCE_CHINESE_LOCALE__;
-    if (!config) return;
-    const enabled = config.enabled === true;
-    const locale = typeof config.locale === "string" && config.locale ? config.locale : "zh-CN";
-    const installationKey = `2:${enabled ? "on" : "off"}:${locale}`;
-    if (window.__codexPlusForceChineseLocaleInstalled === installationKey) return;
-    window.__codexPlusForceChineseLocaleInstalled = installationKey;
-    const languages = [locale, "zh", "en-US", "en"];
-    const managedLocaleStorageKey = "codexPlus.forceChineseLocale.managed.v1";
-    const localeReloadStorageKey = "codexPlus.forceChineseLocale.reload.v1";
-
-    const readManagedLocale = () => {
-      try {
-        const value = JSON.parse(window.localStorage.getItem(managedLocaleStorageKey) || "null");
-        return value && typeof value === "object" ? value : null;
-      } catch {
-        return null;
-      }
-    };
-
-    const writeManagedLocale = (value) => {
-      try {
-        if (value) {
-          window.localStorage.setItem(managedLocaleStorageKey, JSON.stringify(value));
-        } else {
-          window.localStorage.removeItem(managedLocaleStorageKey);
-        }
-      } catch {
-      }
-    };
-
-    const waitForElectronBridge = () => new Promise((resolve) => {
-      const startedAt = Date.now();
-      const check = () => {
-        const bridge = window.electronBridge;
-        if (bridge && typeof bridge.sendMessageFromView === "function") {
-          resolve(bridge);
-          return;
-        }
-        if (Date.now() - startedAt >= 5000) {
-          resolve(null);
-          return;
-        }
-        window.setTimeout(check, 50);
-      };
-      check();
-    });
-
-    const callCodexSettingApi = (bridge, method, params) => new Promise((resolve, reject) => {
-      const requestId = typeof crypto?.randomUUID === "function"
-        ? crypto.randomUUID()
-        : `codex-plus-locale-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-      let timeout;
-      const cleanup = () => {
-        window.clearTimeout(timeout);
-        window.removeEventListener("message", onMessage);
-      };
-      const onMessage = (event) => {
-        const message = event?.data;
-        if (!message || message.type !== "fetch-response" || message.requestId !== requestId) return;
-        cleanup();
-        if (message.responseType !== "success") {
-          reject(new Error(message.error || `Codex ${method} failed`));
-          return;
-        }
-        try {
-          resolve(JSON.parse(message.bodyJsonString || "null"));
-        } catch (error) {
-          reject(error);
-        }
-      };
-      window.addEventListener("message", onMessage);
-      timeout = window.setTimeout(() => {
-        cleanup();
-        reject(new Error(`Codex ${method} timed out`));
-      }, 5000);
-      const message = {
-        type: "fetch",
-        requestId,
-        method: "POST",
-        url: `vscode://codex/${method}`,
-        body: JSON.stringify({ params }),
-      };
-      Promise.resolve(bridge.sendMessageFromView(message)).catch((error) => {
-        cleanup();
-        reject(error);
-      });
-    });
-
-    const reloadAfterLocaleChange = (value) => {
-      const marker = JSON.stringify(value);
-      try {
-        if (window.sessionStorage.getItem(localeReloadStorageKey) === marker) return;
-        window.sessionStorage.setItem(localeReloadStorageKey, marker);
-        // 标记写不进去就不要刷新，否则下次加载读不到标记，会再次刷新。
-        if (window.sessionStorage.getItem(localeReloadStorageKey) !== marker) return;
-      } catch {
-        return;
-      }
-      window.location.reload();
-    };
-
-    const clearLocaleReloadMarker = () => {
-      try {
-        window.sessionStorage.removeItem(localeReloadStorageKey);
-      } catch {
-      }
-    };
-
-    const syncOfficialLocaleSetting = async () => {
-      const managed = readManagedLocale();
-      if (!enabled && !managed) return;
-      const bridge = await waitForElectronBridge();
-      if (!bridge) return;
-      const response = await callCodexSettingApi(bridge, "get-setting", { key: "localeOverride" });
-      const currentValue = response?.value ?? null;
-
-      if (enabled) {
-        if (currentValue === locale) {
-          clearLocaleReloadMarker();
-          return;
-        }
-        if (!managed) {
-          writeManagedLocale({ appliedLocale: locale, previousValue: currentValue });
-        }
-        await callCodexSettingApi(bridge, "set-setting", { key: "localeOverride", value: locale });
-        reloadAfterLocaleChange(locale);
-        return;
-      }
-
-      if (currentValue !== managed.appliedLocale) {
-        writeManagedLocale(null);
-        clearLocaleReloadMarker();
-        return;
-      }
-      const previousValue = managed.previousValue ?? null;
-      await callCodexSettingApi(bridge, "set-setting", {
-        key: "localeOverride",
-        value: previousValue,
-      });
-      writeManagedLocale(null);
-      reloadAfterLocaleChange(previousValue);
-    };
-
-    syncOfficialLocaleSetting().catch(() => {});
-    if (!enabled) return;
-
-    const defineNavigatorGetter = (name, value) => {
-      try {
-        Object.defineProperty(Navigator.prototype, name, {
-          configurable: true,
-          get: () => value,
-        });
-      } catch {
-        try {
-          Object.defineProperty(navigator, name, {
-            configurable: true,
-            get: () => value,
-          });
-        } catch {
-        }
-      }
-    };
-
-    defineNavigatorGetter("language", locale);
-    defineNavigatorGetter("languages", languages);
-
-    const patchI18nConfig = (dynamicConfig) => {
-      if (!dynamicConfig || typeof dynamicConfig !== "object") return dynamicConfig;
-      const value = dynamicConfig.value && typeof dynamicConfig.value === "object" ? dynamicConfig.value : {};
-      const nextValue = {
-        ...value,
-        enable_i18n: true,
-        locale_source: "SYSTEM",
-      };
-      try {
-        dynamicConfig.value = nextValue;
-      } catch {
-      }
-      if (typeof dynamicConfig.get === "function" && !dynamicConfig.__codexPlusForceChineseLocaleGetPatched) {
-        const originalGet = dynamicConfig.get.bind(dynamicConfig);
-        dynamicConfig.get = (key, fallback) => {
-          if (key === "enable_i18n") return true;
-          if (key === "locale_source") return "SYSTEM";
-          return originalGet(key, fallback);
-        };
-        dynamicConfig.__codexPlusForceChineseLocaleGetPatched = true;
-      }
-      return dynamicConfig;
-    };
-
-    const statsigClients = () => {
-      const root = window.__STATSIG__ || globalThis.__STATSIG__;
-      if (!root || typeof root !== "object") return [];
-      const clients = [root.firstInstance, typeof root.instance === "function" ? root.instance() : null];
-      if (root.instances && typeof root.instances === "object") clients.push(...Object.values(root.instances));
-      return clients.filter((client, index, array) => client && typeof client === "object" && array.indexOf(client) === index);
-    };
-
-    const patchStatsigClient = (client) => {
-      if (!client || typeof client !== "object") return;
-      if (typeof client.getDynamicConfig !== "function") return;
-      if (!client.__codexPlusForceChineseLocalePatched) {
-        const originalGetDynamicConfig = client.getDynamicConfig.bind(client);
-        client.getDynamicConfig = (name, options) => {
-          const result = originalGetDynamicConfig(name, options);
-          return name === "72216192" ? patchI18nConfig(result) : result;
-        };
-        client.__codexPlusForceChineseLocalePatched = true;
-      }
-      try {
-        patchI18nConfig(client.getDynamicConfig("72216192", { disableExposureLog: true }));
-      } catch {
-      }
-    };
-
-    const patchStatsigRoot = (root) => {
-      if (!root || typeof root !== "object" || root.__codexPlusForceChineseLocaleRootPatched) return;
-      root.__codexPlusForceChineseLocaleRootPatched = true;
-      ["firstInstance", "instance"].forEach((key) => {
-        let current;
-        try {
-          current = root[key];
-        } catch {
-          return;
-        }
-        patchStatsigClient(typeof current === "function" && key === "instance" ? current.call(root) : current);
-        try {
-          Object.defineProperty(root, key, {
-            configurable: true,
-            get: () => current,
-            set: (next) => {
-              current = next;
-              patchStatsigClient(typeof next === "function" && key === "instance" ? next.call(root) : next);
-            },
-          });
-        } catch {
-        }
-      });
-    };
-
-    const installStatsigRootSetter = () => {
-      const descriptor = Object.getOwnPropertyDescriptor(window, "__STATSIG__");
-      if (descriptor && descriptor.configurable === false) return;
-      let currentRoot = window.__STATSIG__;
-      patchStatsigRoot(currentRoot);
-      try {
-        Object.defineProperty(window, "__STATSIG__", {
-          configurable: true,
-          get: () => currentRoot,
-          set: (next) => {
-            currentRoot = next;
-            patchStatsigRoot(next);
-            statsigClients().forEach(patchStatsigClient);
-          },
-        });
-      } catch {
-      }
-    };
-
-    const patchStatsigI18nConfig = () => {
-      installStatsigRootSetter();
-      const root = window.__STATSIG__ || globalThis.__STATSIG__;
-      patchStatsigRoot(root);
-      statsigClients().forEach((client) => {
-        if (typeof client.getDynamicConfig !== "function") return;
-        patchStatsigClient(client);
-      });
-    };
-
-    patchStatsigI18nConfig();
-    const startedAt = Date.now();
-    const timer = window.setInterval(() => {
-      patchStatsigI18nConfig();
-      if (Date.now() - startedAt > 5000) window.clearInterval(timer);
-    }, 50);
-  }
-
-  installCodexPlusFastStartup();
-  installCodexPlusForceChineseLocale();
 
   const helperBase = window.__CODEX_SESSION_DELETE_HELPER__ || "http://127.0.0.1:57321";
   const buttonClass = "codex-delete-button";
@@ -391,6 +64,7 @@
   const conversationViewMaxAllowedWidth = 4000;
   const conversationViewDefaultWidth = 900;
   const conversationViewLegacyWidthKey = "codexPlus.threadCenter.maxWidth";
+  // 已发布的旧类名保留兼容；对应功能不再安装。
   const zedRemoteButtonClass = "codex-zed-remote-button";
   const zedRemoteOpenInMenuItemClass = "codex-zed-open-in-menu-item";
   const sessionCopyMenuItemClass = "codex-session-copy-menu-item";
@@ -405,14 +79,10 @@
   const zedRemoteToastClass = "codex-zed-remote-toast";
   const upstreamWorktreeDialogClass = "codex-upstream-worktree-dialog";
   const upstreamBranchOptionAttribute = "data-codex-upstream-branch-option";
-  const upstreamBranchSelectionKey = "codexUpstreamBranchSelection";
-  const upstreamProjectContextKey = "codexUpstreamProjectContext";
-  const zedRemoteOpenInMenuVersion = "1";
-  const zedRemoteOpenInMenuActivationWindowMs = 600;
   const styleId = "codex-delete-style";
   // 改 10-style.js 里的任何 CSS 都要把它 +1：installStyle 靠这个版本号判断
   // 页面里已有的 <style> 是否过期，不升的话新样式在旧标签存在时会被直接跳过。
-  const codexDeleteStyleVersion = "23";
+  const codexDeleteStyleVersion = "32";
   const codexPlusMenuId = "codex-plus-menu";
   const codexPlusMenuFloatingClass = "codex-plus-menu-floating";
   const codexPlusSidebarNavId = "codex-plus-sidebar-nav";
@@ -422,6 +92,9 @@
   // 三者各自是一个独立页面，不再作为弹窗里的二级 tab。
   const codexPlusRailNavId = "codex-plus-rail-nav";
   const codexPlusRailExtensionsId = "codex-plus-rail-extensions";
+  const codexPlusRailPluginMarketId = "codex-plus-rail-plugin-market";
+  const codexPlusSidebarPluginMarketId = "codex-plus-sidebar-plugin-market";
+  const codexPlusPluginMarketTab = "plugin-market";
   const codexPlusRailSelector = "nav[data-app-navigation-rail]";
   const codexPlusRailDestinationSelector = "[data-sidebar-destination]";
   const codexPlusExtensionsTab = "extensions";
@@ -439,47 +112,6 @@
   const codexThreadServiceTierVersion = "1";
   const codexServiceTierBadgeClass = "codex-service-tier-badge";
   const codexServiceTierBadgeVersion = "3";
-  const codexMenuLocalizationVersion = "1";
-  const codexMenuLocalizationMap = new Map([
-    ["Toggle Sidebar", "切换侧边栏"],
-    ["Toggle Bottom Panel", "切换底部面板"],
-    ["Toggle Pinned Summary", "切换置顶摘要"],
-    ["Open Terminal", "打开终端"],
-    ["Toggle File Tree", "切换文件树"],
-    ["Open Browser Tab", "打开浏览器标签页"],
-    ["Focus Browser Address Bar", "聚焦浏览器地址栏"],
-    ["Reload Browser Page", "重新加载浏览器页面"],
-    ["Force Reload Browser Page", "强制重新加载浏览器页面"],
-    ["Toggle Browser Panel", "切换浏览器面板"],
-    ["Toggle Side Panel", "切换侧边面板"],
-    ["Find", "查找"],
-    ["Previous Chat", "上一个对话"],
-    ["Next Chat", "下一个对话"],
-    ["Back", "后退"],
-    ["Forward", "前进"],
-    ["Zoom In", "放大"],
-    ["Zoom Out", "缩小"],
-    ["Actual Size", "实际大小"],
-    ["Toggle Full Screen", "切换全屏"],
-    ["Keyboard Shortcuts", "键盘快捷键"],
-    ["Open command menu", "打开命令菜单"],
-    ["Search Chats…", "搜索对话…"],
-    ["Search Files…", "搜索文件…"],
-    ["New Chat", "新建对话"],
-    ["Quick Chat", "快速对话"],
-    ["Open in New Window", "在新窗口打开"],
-    ["Archive chat", "归档对话"],
-    ["Pin/unpin chat", "置顶/取消置顶对话"],
-    ["Settings…", "设置…"],
-    ["Open Folder…", "打开文件夹…"],
-    ["Close Tab", "关闭标签页"],
-    ["Close", "关闭"],
-    ["New Window", "新建窗口"],
-    ["Copy conversation path", "复制对话路径"],
-    ["Copy deeplink", "复制深层链接"],
-    ["Copy session id", "复制会话 ID"],
-    ["Copy working directory", "复制工作目录"],
-  ]);
   let codexPlusVersion = window.__CODEX_PLUS_VERSION__ || "unknown";
   const codexPlusBuild = window.__CODEX_PLUS_BUILD__ || "unknown";
   let lastSessionActionTrigger = null;
@@ -489,11 +121,11 @@
   const codexThreadServiceTierMaxEntries = 120;
   const codexThreadServiceTierDraftBindWindowMs = 60 * 1000;
   const codexServiceTierRequestOverrideVersion = "9";
-  const codexAppServerModelRequestPatchVersion = "9";
+  const codexAppServerModelRequestPatchVersion = "12";
   const codexAppServerClientCaptureMarker = "AppServerRequestClient is missing a message dispatcher";
   const codexAppServerClientCaptureAnchor = "async sendRequest(";
   const codexRemoteSessionRecoveryVersion = "5";
-  const codexPluginMarketplaceUnlockVersion = "15";
+  const codexPluginMarketplaceUnlockVersion = "17";
   const codexPluginAutoExpandVersion = "1";
   const codexPluginAutoExpandMaxClicks = 80;
   const codexPluginAutoExpandClickDelayMs = 90;
@@ -583,12 +215,6 @@
 
   scheduleCodexPlusImageOverlay();
   window.__codexThreadScrollSyncRevision = (window.__codexThreadScrollSyncRevision || 0) + 1;
-  let upstreamBranchDefaultsCache = new Map();
-  const upstreamBranchDefaultsCacheTtlMs = 5000;
-  const upstreamRemoteBranchDefaultsCacheTtlMs = 30000;
-  let upstreamBranchDefaultsInflight = new Map();
-  const upstreamProjectContextTtlMs = 10 * 60 * 1000;
-  const branchWorktreePathAttribute = "data-codex-branch-worktree-path";
   ["__codexPlusHtmlCenteredThreadWidth", "__codexPlusViewportCenteredThreadWidth", "__codexPlusBoundedThreadCenter"].forEach((key) => {
     try {
       window[key]?.cleanup?.();
@@ -606,9 +232,13 @@
     disabledInstallButton: 'button:disabled, button[aria-disabled="true"], [role="button"][aria-disabled="true"], button[data-disabled], [role="button"][data-disabled], button.cursor-not-allowed, [role="button"].cursor-not-allowed, button.pointer-events-none, [role="button"].pointer-events-none',
     pluginNavButton: 'nav[role="navigation"] button.h-token-nav-row.w-full',
     pluginSvgPath: 'svg path[d^="M7.94562 14.0277"]',
+    // 会话视图对齐的目标锚点。全部走 data-* / 结构性写法，不绑 Codex 的哈希类名，
+    // 见 90-action-groups.js 的候选链说明（issue #2258）。
+    conversationViewScrollContainer: ".thread-scroll-container",
+    conversationViewContentAnchor: "[data-thread-user-message-navigation-content]",
+    conversationViewFooter: "[data-thread-scroll-footer]",
   };
   const headerContextButtonClass = "border-token-border user-select-none no-drag cursor-interaction flex items-center gap-1 border whitespace-nowrap focus:outline-none disabled:cursor-not-allowed disabled:opacity-40 rounded-lg border-token-border text-token-button-tertiary-foreground bg-token-bg-fog enabled:hover:bg-token-list-hover-background data-[state=open]:bg-token-list-hover-background border h-token-button-composer px-2 py-0 text-base leading-[18px]";
-
   /**
    * 拓展注册中心。
    *
@@ -816,7 +446,7 @@
         border: 0;
         border-radius: 6px;
         background: transparent;
-        color: var(--codex-session-action-color, var(--token-text-tertiary, rgba(255,255,255,.5)));
+        color: var(--codex-session-action-color, var(--color-token-text-tertiary, var(--codex-plus-text-tertiary, rgba(255,255,255,.5))));
         font: 14px/1 system-ui, sans-serif;
         padding: 0;
         cursor: default;
@@ -830,7 +460,7 @@
       .${actionButtonClass}:hover,
       .${actionButtonClass}:focus-visible {
         background: var(--codex-session-action-hover-background, transparent);
-        color: var(--codex-session-action-hover-color, var(--codex-session-action-color, var(--token-text-default, #f4f4f5)));
+        color: var(--codex-session-action-hover-color, var(--codex-session-action-color, var(--color-token-text-primary, #f4f4f5)));
         outline: none;
       }
       .${moreMenuClass} {
@@ -879,7 +509,7 @@
         align-items: center;
         max-width: 152px;
         margin-right: 8px;
-        color: var(--text-secondary, var(--token-text-secondary, rgba(142,142,160,.95)));
+        color: var(--text-secondary, var(--color-token-text-secondary, var(--codex-plus-text-secondary, rgba(142,142,160,.95))));
         font: 11px/1.1 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
         letter-spacing: .01em;
         opacity: .9;
@@ -898,10 +528,10 @@
         min-width: 0;
       }
       .codex-archive-row-button {
-        border: 1px solid var(--color-token-border-light, var(--token-border, rgba(0,0,0,.12)));
+        border: 1px solid var(--color-token-border-light, var(--color-token-border-default, rgba(0,0,0,.12)));
         border-radius: var(--border-radius-sm, 6px);
-        background: var(--color-token-bg-secondary, var(--token-bg-fog, transparent));
-        color: var(--color-token-text-secondary, var(--token-text-secondary, inherit));
+        background: var(--color-token-bg-secondary, transparent);
+        color: var(--color-token-text-secondary, inherit);
         font: inherit;
         font-size: 13px;
         line-height: 16px;
@@ -914,29 +544,9 @@
         color: var(--color-text-danger, #dc2626);
       }
       .codex-archive-row-button.${exportButtonClass} {
-        border-color: var(--color-token-border-light, var(--token-border, rgba(0,0,0,.12)));
-        background: var(--color-token-bg-secondary, var(--token-bg-fog, transparent));
-        color: var(--color-token-text-primary, var(--token-text-primary, inherit));
-      }
-      .${zedRemoteButtonClass} {
-        border: 1px solid var(--color-token-border-light, var(--token-border, rgba(0,0,0,.12)));
-        border-radius: var(--border-radius-sm, 6px);
-        background: var(--color-token-bg-secondary, var(--token-bg-fog, transparent));
-        color: var(--color-token-text-primary, var(--token-text-primary, inherit));
-        font: inherit;
-        font-size: 13px;
-        line-height: 16px;
-        margin-left: 6px;
-        padding: 2px 7px;
-        cursor: pointer;
-      }
-      .${zedRemoteButtonClass}:hover,
-      .${zedRemoteButtonClass}:focus-visible {
-        background: var(--color-token-interactive-bg-secondary-hover, var(--token-list-hover-background, rgba(0,0,0,.06)));
-        outline: none;
-      }
-      .${zedRemoteOpenInMenuItemClass} {
-        cursor: pointer;
+        border-color: var(--color-token-border-light, var(--color-token-border-default, rgba(0,0,0,.12)));
+        background: var(--color-token-bg-secondary, transparent);
+        color: var(--color-token-text-primary, inherit);
       }
       .${sessionCopyMenuItemClass} {
         cursor: pointer;
@@ -958,38 +568,13 @@
       }
       .${sessionShareButtonClass}:hover,
       .${sessionShareButtonClass}:focus-visible {
-        background: var(--token-list-hover-background, rgba(70,70,70,.96));
-        color: var(--token-text-default, #fff);
+        background: var(--color-token-list-hover-background, var(--codex-plus-bg-hover));
+        color: var(--color-token-text-primary, var(--codex-plus-text));
         outline: none;
       }
       .${sessionShareButtonClass}[aria-busy="true"] {
         cursor: wait;
         opacity: .65;
-      }
-      .codex-zed-open-in-menu-icon {
-        width: 18px;
-        height: 18px;
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        object-fit: contain;
-      }
-      .${zedRemoteToastClass} {
-        position: fixed;
-        right: 18px;
-        bottom: 58px;
-        z-index: 2147483000;
-        max-width: min(420px, calc(100vw - 36px));
-        border: 1px solid var(--codex-plus-border);
-        border-radius: var(--border-radius-lg, 8px);
-        background: var(--codex-plus-bg-elevated);
-        color: var(--codex-plus-text);
-        font: inherit;
-        font-size: 13px;
-        line-height: 18px;
-        padding: 10px 12px;
-        box-shadow: var(--ui-menu-shadow, var(--shadow-300, 0 8px 24px rgba(0,0,0,.16)));
-        pointer-events: none;
       }
       [data-codex-delete-row="true"]:hover .${actionGroupClass} {
         opacity: 1;
@@ -1017,7 +602,7 @@
         max-width: min(220px, calc(100vw - 32px));
         border: 1px solid var(--codex-plus-border);
         border-radius: var(--border-radius-md, 6px);
-        background: var(--color-token-bg-tooltip, var(--codex-plus-bg-elevated));
+        background: var(--codex-plus-bg-elevated);
         color: var(--codex-plus-text);
         font: inherit;
         font-size: 13px;
@@ -1200,9 +785,39 @@
       #${codexPlusSidebarNavId} .codex-plus-sidebar-nav-status[data-status="failed"] { background: #ef4444; }
       #${codexPlusSidebarNavId} .codex-plus-sidebar-nav-status[data-status="checking"] { background: #fbbf24; }
       #${codexPlusSidebarNavId} button[data-active="true"] {
-        background: var(--token-list-hover-background, rgba(255,255,255,.08));
-        color: var(--token-text-primary, inherit);
+        background: var(--codex-plus-bg-selected);
+        color: var(--codex-plus-text);
       }
+      .codex-plus-plugin-sidebar { position: relative; flex: 0 0 auto; }
+      .codex-plus-plugin-sidebar .codex-plus-sidebar-nav-icon { width: 20px; height: 20px; flex: 0 0 20px; display: inline-flex; align-items: center; justify-content: center; }
+      .codex-plus-plugin-sidebar .codex-plus-sidebar-nav-icon svg { width: 19px; height: 19px; }
+      .codex-plus-plugin-sidebar-label { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; min-width: 0; }
+      .codex-plus-plugin-sidebar button[data-active="true"] { background: var(--codex-plus-bg-selected); color: var(--codex-plus-text); }
+      .codex-plus-plugin-market-panel { max-width: 1140px; width: 100%; margin: 0 auto; box-sizing: border-box; }
+      .codex-plus-plugin-intro { margin: 0 0 18px; color: var(--codex-plus-text-secondary); font-size: 13px; line-height: 1.6; }
+      .codex-plus-plugin-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 14px; }
+      .codex-plus-plugin-sources { display: flex; gap: 4px; flex: 1 1 auto; }
+      .codex-plus-plugin-sources button { border: 1px solid var(--codex-plus-border); border-radius: 7px; padding: 7px 12px; color: var(--codex-plus-text-secondary); background: transparent; cursor: pointer; }
+      .codex-plus-plugin-sources button[data-active="true"] { background: var(--codex-plus-bg-selected); color: var(--codex-plus-text); }
+      .codex-plus-plugin-search { flex: 1 1 240px; min-width: 120px; border: 1px solid var(--codex-plus-border); border-radius: 8px; background: var(--codex-plus-bg-secondary); color: var(--codex-plus-text); padding: 9px 12px; font-size: 14px; }
+      .codex-plus-plugin-filter { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--codex-plus-text-secondary); }
+      .codex-plus-plugin-status { font-size: 12px; color: var(--codex-plus-text-secondary); white-space: pre-wrap; margin-bottom: 14px; }
+      .codex-plus-plugin-results { display: flex; flex-direction: column; gap: 10px; }
+      .codex-plus-plugin-card { display: flex; align-items: flex-start; gap: 18px; padding: 16px; border: 1px solid var(--codex-plus-border); border-radius: 10px; background: var(--codex-plus-bg-secondary); }
+      .codex-plus-plugin-card-info { flex: 1 1 auto; min-width: 0; }
+      .codex-plus-plugin-name { font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
+      .codex-plus-plugin-id, .codex-plus-plugin-meta { color: var(--codex-plus-text-tertiary); font-size: 11px; margin-top: 4px; overflow-wrap: anywhere; }
+      .codex-plus-plugin-description { color: var(--codex-plus-text-secondary); font-size: 13px; line-height: 1.55; margin: 7px 0; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; overflow-wrap: anywhere; }
+      .codex-plus-plugin-tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+      .codex-plus-plugin-tags span { border-radius: 5px; padding: 2px 6px; background: var(--codex-plus-bg-selected); color: var(--codex-plus-text-secondary); font-size: 10px; overflow-wrap: anywhere; }
+      .codex-plus-plugin-install { flex: 0 0 auto; white-space: nowrap; }
+      .codex-plus-plugin-market-page button:disabled { opacity: .55; cursor: default; }
+      .codex-plus-plugin-job-message { font-size: 12px; color: var(--codex-plus-text-secondary); margin-top: 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
+      .codex-plus-plugin-job-message[data-status="failed"] { color: var(--codex-plus-danger); }
+      .codex-plus-plugin-pagination { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 10px; margin-top: 20px; font-size: 12px; color: var(--codex-plus-text-secondary); }
+      .codex-plus-plugin-pagination > span { margin-right: auto; }
+      .codex-plus-plugin-empty { padding: 40px 16px; text-align: center; color: var(--codex-plus-text-secondary); }
+      @media (max-width: 600px) { .codex-plus-plugin-card { flex-direction: column; gap: 10px; } .codex-plus-plugin-install { align-self: flex-end; } }
       [data-codex-plus-rail] {
         position: relative;
         flex: 0 0 auto;
@@ -1244,33 +859,44 @@
        * 主题切换时下次同步会重算。
        */
       html[data-codex-plus-page-open] nav[data-app-navigation-rail] [data-sidebar-destination][aria-current="page"] {
-        color: var(--codex-plus-rail-dim, rgba(255,255,255,.498)) !important;
+        color: var(--codex-plus-rail-dim, var(--codex-plus-text-tertiary, currentColor)) !important;
       }
       html[data-codex-plus-page-open] nav[data-app-navigation-rail] [data-sidebar-destination][aria-current="page"]::before {
         opacity: 0 !important;
       }
       html[data-codex-plus-page-open] nav[data-app-navigation-rail] [data-sidebar-destination][aria-current="page"] * {
-        color: var(--codex-plus-rail-dim, rgba(255,255,255,.498)) !important;
+        color: var(--codex-plus-rail-dim, var(--codex-plus-text-tertiary, currentColor)) !important;
       }
       /*
        * 页面 overlay 的 left 由 positionCodexPlusPage 按图标栏右边界算好写进来。
        *
        * 关键：写进来的必须是**布局坐标**（视觉值 / zoom），因为 overlay 自己在缩放
-       * 空间里布局，宽度也要用同一个空间的量。width 的 calc(100vw / zoom - left)
-       * 把右边贴到视口右边缘；两个量都除过 zoom，缩放后才正好补齐。
+       * 空间里布局，宽度也要用同一个空间的量。width 的 calc(100vw / zoom - left - right)
+       * 把右边贴到原生内容区的右边缘；三个量都除过 zoom，缩放后才正好补齐。
        * 注意：本段在 JS 模板字符串里，注释里不能出现反引号，否则会提前闭合。
+       *
+       * 右/下各留一圈槽（原生是 4px）并给四角加圆角，对齐官方面板的观感：
+       * 官方页面面板 [_PageSurface_] 的 rect 与我们这块 overlay 完全相同（都是
+       * [52, 44, 1663, 940]），四角 12px；它外面套了一个 padding: 0 4px 4px 0 的槽，
+       * 右、下能看到底色。我们原先 right/bottom 贴 0 且无圆角，于是方角并且比官方
+       * 多占 4px，用户反馈「少一个圆角」就是这个。
+       * 圆角值由 positionCodexPlusPage 量官方面板写入，四个角一起用，不做左右区分。
+       * overflow: hidden 让圆角真正裁到内容；内容都在 .codex-plus-modal-content 内，
+       * 没有依赖溢出显示的全屏浮层，切掉是安全的。
        */
       .${codexPlusPageClass} {
         position: fixed;
-        top: 0;
-        right: 0;
-        bottom: 0;
-        left: 0;
-        width: calc(100vw / var(--codex-plus-zoom, 1) - var(--codex-plus-page-left, 0px));
-        height: calc(100vh / var(--codex-plus-zoom, 1));
+        top: var(--codex-plus-page-top, 0px);
+        right: var(--codex-plus-page-right, 0px);
+        bottom: var(--codex-plus-page-bottom, 0px);
+        left: var(--codex-plus-page-left, 0px);
+        width: calc(100vw / var(--codex-plus-zoom, 1) - var(--codex-plus-page-left, 0px) - var(--codex-plus-page-right, 0px));
+        height: calc(100vh / var(--codex-plus-zoom, 1) - var(--codex-plus-page-top, 0px) - var(--codex-plus-page-bottom, 0px));
+        border-radius: var(--codex-plus-page-radius, 0px);
+        overflow: hidden;
         z-index: 2147483644;
         display: block;
-        background: var(--token-bg-primary, #212121);
+        background: var(--codex-plus-bg-primary, #fff);
         pointer-events: auto;
         -webkit-app-region: no-drag;
       }
@@ -1280,7 +906,7 @@
         max-height: none;
         border: 0;
         border-radius: 0;
-        background: var(--token-bg-primary, #212121);
+        background: var(--codex-plus-bg-primary, #fff);
         box-shadow: none;
       }
       .${codexPlusPageClass} .codex-plus-modal-header {
@@ -1559,7 +1185,8 @@
         font-size: 13px;
       }
       .codex-plus-extensions-detail-sep { margin: 0 6px; color: var(--codex-plus-text-tertiary); }
-      .codex-plus-extensions-detail-update { margin-top: 5px; color: #fbbf24; font-size: 13px; }
+      /* issue #2359：原 #fbbf24 在浅色主题下对比度仅 1.56:1，改为随主题走的警告色。 */
+      .codex-plus-extensions-detail-update { margin-top: 5px; color: var(--codex-plus-warning); font-size: 13px; }
       .codex-plus-extensions-detail-actions {
         flex: 0 0 auto;
         display: inline-flex;
@@ -1617,13 +1244,13 @@
         line-height: 1.7;
       }
       .codex-plus-extensions-detail-link { margin-top: 16px; font-size: 13px; }
-      .codex-plus-extensions-detail-link a { color: #10a37f; word-break: break-all; }
+      .codex-plus-extensions-detail-link a { color: var(--codex-plus-success); word-break: break-all; }
       .codex-plus-extensions-detail-error {
         margin-top: 14px;
         padding: 8px 10px;
         border-radius: 8px;
-        background: rgba(239,68,68,.12);
-        color: #ef4444;
+        background: var(--codex-plus-danger-bg);
+        color: var(--codex-plus-danger);
         font-size: 13px;
       }
       .codex-plus-page-nav-group { margin-bottom: 10px; }
@@ -1735,9 +1362,6 @@
       .codex-plus-toggle[data-enabled="true"] span { transform: translateX(18px); }
       .codex-plus-toggle[data-pending="true"],
       .codex-plus-toggle:disabled { cursor: not-allowed; opacity: .55; }
-      .codex-plus-toggle[data-relay-unneeded="true"] { width: 72px; cursor: default; background: rgba(16,163,127,.16); color: #6ee7b7; }
-      .codex-plus-toggle[data-relay-unneeded="true"] span { display: none; }
-      .codex-plus-toggle[data-relay-unneeded="true"]::after { content: "无需开启"; font-size: 13px; font-weight: 650; line-height: 1; }
       .codex-plus-width-control { display: flex; align-items: center; justify-content: flex-end; gap: 8px; min-width: 176px; align-self: center; }
       .codex-plus-width-input {
         width: 78px;
@@ -1752,6 +1376,15 @@
         padding: 0 8px;
       }
       .codex-plus-width-input:disabled { opacity: .55; cursor: not-allowed; }
+      .codex-plus-typing-effect-select {
+        flex-shrink: 0;
+        align-self: center;
+        min-width: 112px;
+        height: 32px;
+        padding: 0 8px;
+        font-size: 13px;
+      }
+      .codex-plus-typing-effect-select:disabled { opacity: .55; cursor: not-allowed; }
       .codex-plus-service-tier-control { display: grid; gap: 6px; min-width: 316px; justify-items: end; align-self: center; }
       .codex-plus-service-tier-status { color: #a1a1aa; font-size: 13px; line-height: 1.3; text-align: right; }
       .codex-plus-service-tier-status[data-status="ok"] { color: #34d399; }
@@ -1797,16 +1430,13 @@
       .codex-plus-action-button,
       .codex-plus-issue-button { border: 1px solid rgba(255,255,255,.18); border-radius: 7px; background: #3f3f46; color: #f3f4f6; font-size: 13px;
         font-family: inherit; padding: 6px 8px; }
-      .codex-plus-worktree-actions {
-        display: inline-flex;
-        align-items: center;
-        gap: 8px;
-      }
       .codex-plus-form-field {
         display: grid;
         gap: 4px;
         margin-top: 10px;
-        color: #d4d4d8;
+        /* issue #2359：原来是写死的 #d4d4d8，浅色主题下对比度只有 1.38:1（≈看不见）。
+           标签文字改跟主题走。 */
+        color: var(--codex-plus-text-secondary);
         font-size: 13px;
         font-family: inherit;
         text-align: left;
@@ -1840,25 +1470,37 @@
       /* 简介不再压成一行：卡片按内容撑高，最多 3 行，超出才省略。
          nowrap 会让「提供 Claude 与 ...」这类较长简介只露前几个字。 */
       /* 底部优惠条：撑满卡片宽度，长文本截断。 */
-      /* Keep injected surfaces on Codex's own semantic palette in both themes. */
+      /*
+       * 注入面板的语义色板：前景/背景必须取自同一套 token，且都要能被主题切换带走。
+       *
+       * issue #2359（Windows 浅色主题下黑底黑字）：旧写法在中间塞了一整层
+       * --token-* 回退名（--token-bg-primary / --token-text-primary /
+       * --token-border / --token-list-hover-background / --token-text-default /
+       * --token-bg-fog / --token-text-tertiary …）。实测 Codex 客户端（26.9xx）
+       * 的产物里这些名字**一个都不存在**——真正在用的一套是 --color-token-*。
+       * 于是三级回退链的中间那级永远落空，浅色主题下只靠最后一级写死的深色值
+       * 兜底，前景与背景各自独立兜底时明度撞在一起，就成了黑底黑字。
+       * 这里把死名删掉，直接接到确实存在、且**由 Codex 自己按主题重算**的
+       * --color-token-* 上；末级兜底仅作最后保险，不再承担主题判断。
+       */
       :root {
-        --codex-plus-bg-primary: var(--color-token-bg-primary, var(--token-bg-primary, #fff));
-        --codex-plus-bg-secondary: var(--color-token-bg-secondary, var(--token-bg-secondary, #f7f7f7));
-        --codex-plus-bg-elevated: var(--color-token-dropdown-background, var(--color-token-bg-elevated-secondary, var(--codex-plus-bg-primary)));
-        --codex-plus-bg-hover: var(--color-token-interactive-bg-secondary-hover, var(--token-list-hover-background, rgba(0,0,0,.06)));
+        --codex-plus-bg-primary: var(--color-token-bg-primary, var(--color-token-main-surface-primary, #fff));
+        --codex-plus-bg-secondary: var(--color-token-bg-secondary, var(--codex-plus-bg-primary));
+        --codex-plus-bg-elevated: var(--color-token-dropdown-background, var(--color-token-bg-secondary, var(--codex-plus-bg-primary)));
+        --codex-plus-bg-hover: var(--color-token-interactive-bg-secondary-hover, var(--color-token-list-hover-background, rgba(0,0,0,.06)));
         --codex-plus-bg-selected: var(--color-token-interactive-bg-secondary-selected, var(--codex-plus-bg-hover));
-        --codex-plus-text: var(--color-token-text-primary, var(--token-text-primary, #171717));
-        --codex-plus-text-secondary: var(--color-token-text-secondary, var(--token-text-secondary, #5d5d5d));
-        --codex-plus-text-tertiary: var(--color-token-text-tertiary, var(--token-text-tertiary, #8a8a8a));
-        --codex-plus-border: var(--color-token-border-light, var(--color-token-border, var(--token-border, rgba(0,0,0,.12))));
-        --codex-plus-border-subtle: var(--color-token-border-subtle, var(--codex-plus-border));
+        --codex-plus-text: var(--color-token-text-primary, var(--color-token-foreground, #171717));
+        --codex-plus-text-secondary: var(--color-token-text-secondary, var(--codex-plus-text));
+        --codex-plus-text-tertiary: var(--color-token-text-tertiary, var(--codex-plus-text-secondary));
+        --codex-plus-border: var(--color-token-border-light, var(--color-token-border, var(--color-token-border-default, rgba(0,0,0,.12))));
+        --codex-plus-border-subtle: var(--codex-plus-border);
         --codex-plus-focus: var(--color-token-focus-border, var(--color-border-focus, currentColor));
-        --codex-plus-danger: var(--color-text-danger, var(--color-token-text-error, #dc2626));
+        --codex-plus-danger: var(--color-text-danger, #dc2626);
         --codex-plus-danger-bg: var(--color-background-danger-soft, rgba(220,38,38,.1));
         --codex-plus-success: var(--color-text-success, #15803d);
         --codex-plus-warning: var(--color-text-warning, #a16207);
       }
-      :where(.${moreMenuClass}, .${actionTooltipClass}, .${zedRemoteToastClass}, .codex-delete-toast, .codex-delete-confirm-overlay, .codex-plus-modal-overlay, .${codexPlusPageClass}) {
+      :where(.${moreMenuClass}, .${actionTooltipClass}, .codex-delete-toast, .codex-delete-confirm-overlay, .codex-plus-modal-overlay, .${codexPlusPageClass}) {
         color: var(--codex-plus-text);
         font-family: inherit;
       }
@@ -1892,7 +1534,7 @@
       .${actionTooltipClass} {
         border-color: var(--codex-plus-border);
         border-radius: var(--border-radius-md, 6px);
-        background: var(--color-token-bg-tooltip, var(--codex-plus-bg-elevated));
+        background: var(--codex-plus-bg-elevated);
         color: var(--codex-plus-text);
         font-family: inherit;
         font-size: 13px;
@@ -1954,8 +1596,8 @@
       .codex-plus-toggle { background: var(--color-background-secondary-solid, var(--codex-plus-text-tertiary)); }
       .codex-plus-toggle span { background: var(--color-token-bg-primary, #fff); box-shadow: var(--switch-thumb-shadow, 0 1px 2px rgba(0,0,0,.16)); }
       .codex-plus-toggle[data-enabled="true"] { background: var(--color-background-primary-solid, var(--color-background-success-solid, #10a37f)); }
-      .codex-plus-toggle[data-relay-unneeded="true"] { background: var(--color-background-primary-soft, var(--codex-plus-bg-hover)); color: var(--codex-plus-success); }
       .codex-plus-width-input,
+      .codex-plus-typing-effect-select,
       .codex-plus-form-field input {
         border: 1px solid var(--codex-plus-border);
         border-radius: var(--border-radius-lg, 8px);
@@ -1964,6 +1606,7 @@
         font-family: inherit;
       }
       .codex-plus-width-input:focus,
+      .codex-plus-typing-effect-select:focus,
       .codex-plus-form-field input:focus { border-color: var(--codex-plus-focus); outline: 2px solid color-mix(in srgb, var(--codex-plus-focus) 25%, transparent); outline-offset: 0; }
       .codex-plus-service-tier-button[data-active="true"] {
         border-color: var(--color-border-primary, var(--codex-plus-focus));
@@ -2003,12 +1646,533 @@
       .codex-plus-form-message[data-status="failed"], .codex-plus-service-tier-status[data-status="failed"], .codex-plus-backend-label[data-status="failed"] { color: var(--codex-plus-danger); }
       .codex-plus-backend-label[data-status="degraded"] { color: var(--codex-plus-warning); }
       .codex-plus-form-message[data-status="loading"], .codex-plus-service-tier-status[data-status="unsupported"], .codex-plus-model-compat-warning { color: var(--codex-plus-warning); }
+      /* Codex++ 设置主页：对齐原生设置页，保持其它页面与弹窗的布局独立。 */
+      .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="home"] {
+        background: var(--codex-plus-settings-page-bg, var(--codex-plus-bg-primary)) !important;
+      }
+      .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="home"] .codex-plus-modal-body {
+        box-sizing: border-box;
+        padding: 72px 32px 64px;
+      }
+      .codex-plus-settings {
+        width: 100%;
+        max-width: 740px;
+        min-width: 0;
+        margin: 0 auto;
+        container: codex-plus-settings / inline-size;
+      }
+      .codex-plus-settings > .codex-plus-modal-header {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 0;
+        margin: 0 0 48px;
+        gap: 16px;
+      }
+      .codex-plus-settings .codex-plus-modal-title {
+        min-width: 0;
+        font-size: 28px;
+        font-weight: 600;
+        line-height: 36px;
+        letter-spacing: -.02em;
+        overflow-wrap: anywhere;
+      }
+      .codex-plus-settings-section { margin: 0 0 48px; }
+      .codex-plus-settings-section:last-child { margin-bottom: 0; }
+      .codex-plus-settings-section-title {
+        margin: 0 0 16px;
+        color: var(--codex-plus-text);
+        font-size: 14px;
+        font-weight: 550;
+        line-height: 20px;
+      }
+      .codex-plus-settings-card,
+      .codex-plus-settings > [data-codex-plus-ext-menu] {
+        box-sizing: border-box;
+        min-width: 0;
+        padding: 0 16px;
+        border: 1px solid var(--codex-plus-border);
+        border-radius: 16px;
+        background: var(--codex-plus-settings-card-bg, var(--codex-plus-bg-secondary));
+      }
+      .codex-plus-settings > [data-codex-plus-ext-menu] { margin-top: 48px; }
+      .codex-plus-settings .codex-plus-row {
+        box-sizing: border-box;
+        min-height: 60px;
+        align-items: center;
+        gap: 24px;
+        padding: 10px 0;
+        font-size: 14px;
+        line-height: 20px;
+      }
+      .codex-plus-settings .codex-plus-row[hidden] { display: none; }
+      .codex-plus-settings .codex-plus-row > :first-child {
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow-wrap: anywhere;
+      }
+      .codex-plus-settings .codex-plus-row > :not(:first-child) { max-width: 48%; }
+      .codex-plus-settings .codex-plus-row-title { font-weight: 500; line-height: 20px; }
+      .codex-plus-settings .codex-plus-row-description,
+      .codex-plus-settings .codex-plus-about {
+        margin-top: 2px;
+        color: var(--codex-plus-text-secondary);
+        font-size: 13px;
+        line-height: 18px;
+        overflow-wrap: anywhere;
+      }
+      .codex-plus-settings .codex-plus-toggle {
+        flex: 0 0 32px;
+        width: 32px;
+        height: 20px;
+        min-height: 20px;
+        box-sizing: border-box;
+        padding: 2px;
+        background: var(--codex-plus-switch-off, #3a3a3a);
+        cursor: pointer;
+      }
+      .codex-plus-settings .codex-plus-toggle span {
+        width: 16px;
+        height: 16px;
+        background: var(--codex-plus-switch-thumb, #fff);
+      }
+      .codex-plus-settings .codex-plus-toggle[data-enabled="true"] { background: var(--codex-plus-switch-on, #3485ff); }
+      .codex-plus-settings .codex-plus-toggle[data-enabled="true"] span { transform: translateX(12px); }
+      .codex-plus-settings .codex-plus-toggle[data-pending="true"],
+      .codex-plus-settings .codex-plus-toggle:disabled { cursor: not-allowed; opacity: .55; }
+      .codex-plus-settings .codex-plus-width-control {
+        flex: 0 1 auto;
+        min-width: 0;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+      .codex-plus-settings .codex-plus-service-tier-control {
+        flex: 0 1 300px;
+        min-width: 0;
+      }
+      .codex-plus-settings .codex-plus-service-tier-status { overflow-wrap: anywhere; }
+      .codex-plus-settings .codex-plus-backend-status { overflow-wrap: anywhere; text-align: right; }
+      .codex-plus-settings .codex-plus-action-button,
+      .codex-plus-settings .codex-plus-issue-button,
+      .codex-plus-settings .codex-plus-service-tier-button,
+      .codex-plus-settings .codex-plus-width-input,
+      .codex-plus-settings .codex-plus-typing-effect-select {
+        box-sizing: border-box;
+        min-height: 32px;
+        border: 1px solid var(--codex-plus-border);
+        border-radius: 8px;
+        background: var(--codex-plus-bg-secondary);
+        color: var(--codex-plus-text);
+        font-family: inherit;
+        font-size: 13px;
+        line-height: 18px;
+      }
+      .codex-plus-settings .codex-plus-width-input,
+      .codex-plus-settings .codex-plus-typing-effect-select { height: 32px; }
+      .codex-plus-settings .codex-plus-width-input { width: 72px; min-width: 48px; }
+      .codex-plus-settings .codex-plus-typing-effect-select { min-width: 0; }
+      .codex-plus-settings .codex-plus-typing-effect-select[hidden] { display: none; }
+      .codex-plus-settings .codex-plus-dropdown-trigger {
+        display: inline-flex;
+        flex: 0 0 auto;
+        align-items: center;
+        align-self: center;
+        justify-content: space-between;
+        gap: 8px;
+        height: 28px;
+        min-width: 112px;
+        box-sizing: border-box;
+        border: 1px solid var(--codex-plus-border);
+        border-radius: 8px;
+        padding: 3px 10px;
+        background: var(--codex-plus-bg-secondary);
+        color: var(--codex-plus-text);
+        font: inherit;
+        font-size: 13px;
+        line-height: 20px;
+        cursor: pointer;
+      }
+      .codex-plus-settings .codex-plus-dropdown-trigger > svg {
+        flex: 0 0 16px;
+        width: 16px;
+        height: 16px;
+        color: var(--codex-plus-text-secondary);
+      }
+      .codex-plus-settings .codex-plus-dropdown-trigger:hover:not(:disabled),
+      .codex-plus-settings .codex-plus-dropdown-trigger[aria-expanded="true"] { background: var(--codex-plus-bg-hover); }
+      .codex-plus-settings .codex-plus-dropdown-trigger:disabled { cursor: not-allowed; opacity: .55; }
+      /* 菜单挂在 overlay 上，避免设置卡片或滚动容器裁切。 */
+      .codex-plus-dropdown-menu {
+        position: absolute;
+        z-index: 2;
+        overflow-y: auto;
+        overscroll-behavior: contain;
+        width: 220px;
+        max-width: calc(100% - 16px);
+        box-sizing: border-box;
+        padding: 6px;
+        border: 1px solid var(--codex-plus-border);
+        border-radius: 14px;
+        background: var(--codex-plus-bg-elevated);
+        color: var(--codex-plus-text);
+        font-family: inherit;
+        box-shadow: var(--ui-menu-shadow, var(--shadow-300, 0 8px 24px rgba(0,0,0,.16)));
+      }
+      .codex-plus-dropdown-menu[hidden] { display: none; }
+      .codex-plus-dropdown-option {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        width: 100%;
+        min-height: 28px;
+        box-sizing: border-box;
+        border: 0;
+        border-radius: 8px;
+        padding: 4px 12px;
+        background: transparent;
+        color: inherit;
+        font: inherit;
+        font-size: 14px;
+        line-height: 20px;
+        text-align: left;
+        cursor: pointer;
+      }
+      .codex-plus-dropdown-option > svg {
+        flex: 0 0 16px;
+        width: 16px;
+        height: 16px;
+        visibility: hidden;
+      }
+      .codex-plus-dropdown-option[aria-selected="true"] > svg { visibility: visible; }
+      .codex-plus-dropdown-option:hover,
+      .codex-plus-dropdown-option:focus-visible {
+        background: var(--codex-plus-bg-hover);
+        outline: none;
+      }
+      .codex-plus-settings .codex-plus-action-button,
+      .codex-plus-settings .codex-plus-issue-button { white-space: normal; overflow-wrap: anywhere; }
+      .codex-plus-settings .codex-plus-action-button:hover,
+      .codex-plus-settings .codex-plus-action-button:focus-visible,
+      .codex-plus-settings .codex-plus-issue-button:hover,
+      .codex-plus-settings .codex-plus-issue-button:focus-visible,
+      .codex-plus-settings .codex-plus-service-tier-button:hover,
+      .codex-plus-settings .codex-plus-service-tier-button:focus-visible {
+        border-color: var(--codex-plus-border);
+        background: var(--codex-plus-bg-hover);
+        color: var(--codex-plus-text);
+      }
+      .codex-plus-settings .codex-plus-service-tier-button[data-active="true"] {
+        border-color: var(--codex-plus-switch-on, #3485ff);
+        background: color-mix(in srgb, var(--codex-plus-switch-on, #3485ff) 16%, var(--codex-plus-settings-card-bg, var(--codex-plus-bg-secondary)));
+        color: var(--codex-plus-text);
+      }
+      .codex-plus-settings button:focus-visible,
+      .codex-plus-settings input:focus-visible,
+      .codex-plus-settings select:focus-visible {
+        outline: 2px solid var(--codex-plus-switch-on, #3485ff);
+        outline-offset: 3px;
+      }
+      .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="home"] { container: codex-plus-settings-page / inline-size; }
+      @container codex-plus-settings-page (max-width: 800px) {
+        .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="home"] .codex-plus-modal-body { padding: 48px 24px; }
+      }
+      @container codex-plus-settings-page (max-width: 480px) {
+        .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="home"] .codex-plus-modal-body { padding: 32px 16px; }
+      }
+      @container codex-plus-settings (max-width: 560px) {
+        .codex-plus-settings .codex-plus-row { gap: 16px; }
+        .codex-plus-settings .codex-plus-row[data-codex-service-tier-controls="true"] { flex-wrap: wrap; }
+        .codex-plus-settings .codex-plus-row[data-codex-service-tier-controls="true"] > :first-child { flex-basis: 100%; }
+        .codex-plus-settings .codex-plus-row[data-codex-service-tier-controls="true"] > .codex-plus-service-tier-control { flex-basis: 100%; max-width: 100%; }
+      }
+      .${codexPlusPageClass} .codex-plus-modal-content:is([data-codex-plus-active-tab="extensions"], [data-codex-plus-active-tab="sponsor"]) {
+        background: var(--codex-plus-settings-page-bg, var(--codex-plus-bg-primary)) !important;
+        container: codex-plus-discovery-page / inline-size;
+      }
+      .${codexPlusPageClass} .codex-plus-modal-content:is([data-codex-plus-active-tab="extensions"], [data-codex-plus-active-tab="sponsor"]) > .codex-plus-modal-header { display: none; }
+      .${codexPlusPageClass} .codex-plus-modal-content:is([data-codex-plus-active-tab="extensions"], [data-codex-plus-active-tab="sponsor"]) .codex-plus-modal-body {
+        box-sizing: border-box;
+        padding: 32px 32px 56px;
+      }
+      .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="extensions"] .codex-plus-page-nav {
+        box-sizing: border-box;
+        width: 312px;
+        flex-basis: 312px;
+        background: var(--codex-plus-nav-bg, var(--codex-plus-bg-secondary));
+      }
+      .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="extensions"] .codex-plus-page-nav-item[data-active="true"] { background: var(--codex-plus-nav-selected-bg, var(--codex-plus-bg-selected)); }
+      .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="extensions"] .codex-plus-page-nav-header { padding: 16px; }
+      .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="extensions"] .codex-plus-page-nav-title { font-size: 18px; line-height: 24px; }
+      .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="extensions"] .codex-plus-page-nav-body { padding: 0 12px 20px; }
+      .codex-plus-extensions-nav-entry {
+        min-height: 36px;
+        gap: 10px;
+        box-sizing: border-box;
+        padding: 8px 12px;
+        font-size: 14px;
+        font-weight: 400;
+        line-height: 20px;
+      }
+      .codex-plus-extensions-nav-entry .codex-plus-page-nav-item-icon,
+      .codex-plus-extensions-nav-entry .codex-plus-extensions-icon {
+        flex: 0 0 20px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 20px;
+        height: 20px;
+        padding: 0;
+        background: transparent;
+      }
+      .codex-plus-extensions-nav-entry .codex-plus-page-nav-item-icon svg,
+      .codex-plus-extensions-nav-entry .codex-plus-extensions-icon svg,
+      .codex-plus-extensions-nav-entry .codex-plus-extensions-icon-img { width: 20px; height: 20px; }
+      .codex-plus-extensions-nav-entry .codex-plus-extensions-icon-img { display: block; object-fit: contain; }
+      .codex-plus-extensions-nav-entry .codex-plus-extensions-item-name { font-weight: 400; }
+      .codex-plus-extensions-nav-entry + .codex-plus-page-nav-group { margin-top: 24px; }
+      .codex-plus-extensions-nav-entry:hover .codex-plus-extensions-item-name { text-decoration: none; }
+      .codex-plus-discovery {
+        width: 100%;
+        max-width: 900px;
+        min-width: 0;
+        margin: 0 auto;
+        padding: 0;
+        container: codex-plus-discovery / inline-size;
+      }
+      .codex-plus-discovery-header {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 24px;
+      }
+      .codex-plus-discovery-header > :first-child { flex: 1 1 auto; min-width: 0; }
+      .codex-plus-discovery-title {
+        margin: 0;
+        color: var(--codex-plus-text);
+        font-size: 26px;
+        font-weight: 600;
+        line-height: 34px;
+        letter-spacing: -.02em;
+        overflow-wrap: anywhere;
+      }
+      .codex-plus-discovery-description {
+        margin: 12px 0 0;
+        color: var(--codex-plus-text-secondary);
+        font-size: 14px;
+        line-height: 20px;
+        overflow-wrap: anywhere;
+      }
+      .codex-plus-discovery-toolbar { display: flex; flex: 0 1 auto; align-items: center; gap: 8px; min-width: 0; }
+      .codex-plus-discovery-search {
+        display: flex;
+        flex: 0 1 240px;
+        align-items: center;
+        gap: 8px;
+        width: 240px;
+        max-width: 100%;
+        min-width: 0;
+        box-sizing: border-box;
+        border: 1px solid var(--codex-plus-border);
+        border-radius: 999px;
+        padding: 8px 12px;
+        background: transparent;
+        color: var(--codex-plus-text-secondary);
+      }
+      .codex-plus-discovery-search > svg { flex: 0 0 16px; width: 16px; height: 16px; }
+      .codex-plus-discovery-search input {
+        width: 100%;
+        min-width: 0;
+        border: 0;
+        padding: 0;
+        outline: none;
+        background: transparent;
+        color: var(--codex-plus-text);
+        font: inherit;
+        font-size: 13px;
+        line-height: 18px;
+      }
+      .codex-plus-discovery-search input::placeholder { color: var(--codex-plus-text-tertiary); }
+      .codex-plus-discovery-search:focus-within {
+        outline: 2px solid var(--codex-plus-switch-on, #3485ff);
+        outline-offset: 2px;
+      }
+      .codex-plus-discovery-icon-button {
+        display: inline-flex;
+        flex: 0 0 32px;
+        align-items: center;
+        justify-content: center;
+        width: 32px;
+        height: 32px;
+        box-sizing: border-box;
+        border: 0;
+        border-radius: 8px;
+        padding: 0;
+        background: transparent;
+        color: var(--codex-plus-text-secondary);
+        cursor: pointer;
+      }
+      .codex-plus-discovery-icon-button svg { width: 16px; height: 16px; }
+      .codex-plus-discovery-icon-button:hover { background: var(--codex-plus-bg-hover); color: var(--codex-plus-text); }
+      .codex-plus-discovery-icon-button:disabled { opacity: .55; cursor: not-allowed; }
+      .codex-plus-extensions-filter { display: flex; align-items: center; gap: 8px; margin-top: 16px; }
+      .codex-plus-extensions-filter button {
+        border: 0;
+        border-radius: 999px;
+        padding: 8px 16px;
+        background: transparent;
+        color: var(--codex-plus-text-secondary);
+        font: inherit;
+        font-size: 13px;
+        line-height: 20px;
+        cursor: pointer;
+      }
+      .codex-plus-extensions-filter button[data-active="true"] { background: var(--codex-plus-bg-selected); color: var(--codex-plus-text); }
+      .codex-plus-extensions-filter button:hover { background: var(--codex-plus-bg-hover); }
+      .codex-plus-discovery-section-title {
+        margin: 32px 0 16px;
+        color: var(--codex-plus-text);
+        font-size: 16px;
+        font-weight: 550;
+        line-height: 24px;
+      }
+      .codex-plus-extensions-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 32px; }
+      .codex-plus-extensions-grid > .codex-plus-extensions-detail-empty { grid-column: 1 / -1; }
+      .codex-plus-extension-card {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        min-width: 0;
+        min-height: 56px;
+        box-sizing: border-box;
+        border: 0;
+        padding: 8px 0;
+        background: transparent;
+      }
+      .codex-plus-extension-card-select {
+        display: flex;
+        flex: 1 1 auto;
+        align-items: center;
+        gap: 12px;
+        min-width: 0;
+        border: 0;
+        border-radius: 8px;
+        padding: 0;
+        background: transparent;
+        color: var(--codex-plus-text);
+        font: inherit;
+        text-align: left;
+        cursor: pointer;
+      }
+      .codex-plus-extension-card-icon {
+        display: inline-flex;
+        flex: 0 0 36px;
+        align-items: center;
+        justify-content: center;
+        width: 36px;
+        height: 36px;
+        box-sizing: border-box;
+        border: 1px solid var(--codex-plus-border);
+        border-radius: 10px;
+        color: var(--codex-plus-text-secondary);
+      }
+      .codex-plus-extension-card-icon svg { width: 24px; height: 24px; }
+      .codex-plus-extension-card-icon img { width: 32px; height: 32px; object-fit: contain; border-radius: 8px; }
+      .codex-plus-extension-card-copy { display: flex; flex: 1 1 auto; flex-direction: column; gap: 2px; min-width: 0; }
+      .codex-plus-extension-card-title {
+        overflow: hidden;
+        color: var(--codex-plus-text);
+        font-size: 14px;
+        font-weight: 500;
+        line-height: 20px;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+      }
+      .codex-plus-extension-card-description {
+        display: block;
+        overflow: hidden;
+        color: var(--codex-plus-text-secondary);
+        font-size: 13px;
+        line-height: 18px;
+        white-space: nowrap;
+        text-overflow: ellipsis;
+      }
+      .codex-plus-extension-card-actions { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 4px; }
+      .codex-plus-discovery .codex-plus-extensions-detail { max-width: 900px; margin: 0 auto; padding: 0 0 24px; }
+      .codex-plus-discovery .codex-plus-extensions-detail-head { align-items: center; border-bottom: 0; gap: 20px; padding-bottom: 20px; }
+      .codex-plus-discovery .codex-plus-extensions-detail-title { font-size: 26px; line-height: 34px; overflow-wrap: anywhere; }
+      .codex-plus-discovery .codex-plus-extensions-detail-icon img { width: 40px; height: 40px; object-fit: contain; border-radius: 8px; }
+      .codex-plus-discovery .codex-plus-extensions-detail-description { font-size: 14px; line-height: 20px; overflow-wrap: anywhere; }
+      .codex-plus-discovery .codex-plus-extensions-detail-actions { flex-wrap: wrap; }
+      .codex-plus-discovery .codex-plus-extensions-detail-button { min-height: 32px; box-sizing: border-box; }
+      .codex-plus-discovery .codex-plus-extensions-detail-primary {
+        border-color: var(--codex-plus-text);
+        background: var(--codex-plus-text);
+        color: var(--codex-plus-settings-page-bg, var(--codex-plus-bg-primary));
+      }
+      .codex-plus-discovery .codex-plus-extensions-detail-primary:hover {
+        background: color-mix(in srgb, var(--codex-plus-text) 90%, transparent);
+        color: var(--codex-plus-settings-page-bg, var(--codex-plus-bg-primary));
+      }
+      .codex-plus-discovery .codex-plus-extensions-detail-link a { color: var(--color-text-link, var(--color-token-text-link, var(--codex-plus-switch-on, #3485ff))); }
+      .codex-plus-discovery .codex-plus-toggle { flex: 0 0 32px; width: 32px; height: 20px; min-height: 20px; box-sizing: border-box; padding: 2px; background: var(--codex-plus-switch-off, #3a3a3a); cursor: pointer; }
+      .codex-plus-discovery .codex-plus-toggle span { width: 16px; height: 16px; background: var(--codex-plus-switch-thumb, #fff); }
+      .codex-plus-discovery .codex-plus-toggle[data-enabled="true"] { background: var(--codex-plus-switch-on, #3485ff); }
+      .codex-plus-discovery .codex-plus-toggle[data-enabled="true"] span { transform: translateX(12px); }
+      .codex-plus-discovery .codex-plus-toggle[data-pending="true"],
+      .codex-plus-discovery .codex-plus-toggle:disabled { cursor: not-allowed; opacity: .55; }
+      .codex-plus-extensions-back {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        margin: 0 0 24px;
+        border: 0;
+        border-radius: 8px;
+        padding: 4px 0;
+        background: transparent;
+        color: var(--codex-plus-text-secondary);
+        font: inherit;
+        font-size: 13px;
+        line-height: 20px;
+        cursor: pointer;
+      }
+      .codex-plus-extensions-back svg { width: 16px; height: 16px; }
+      .codex-plus-extensions-back:hover { color: var(--codex-plus-text); }
+      .codex-plus-discovery button:focus-visible,
+      .codex-plus-discovery a:focus-visible,
+      .codex-plus-extensions-nav-entry:focus-visible { outline: 2px solid var(--codex-plus-switch-on, #3485ff); outline-offset: 3px; }
+      @container codex-plus-discovery-page (max-width: 900px) {
+        .codex-plus-discovery-header { flex-wrap: wrap; gap: 20px; }
+        .codex-plus-discovery-toolbar { flex-basis: 100%; }
+        .codex-plus-discovery .codex-plus-extensions-detail-head { flex-wrap: wrap; }
+        .codex-plus-discovery .codex-plus-extensions-detail-actions { flex-basis: 100%; }
+      }
+      @container codex-plus-discovery (max-width: 600px) {
+        .codex-plus-extensions-grid { grid-template-columns: minmax(0, 1fr); }
+      }
+      @container codex-plus-discovery-page (max-width: 700px) {
+        .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="extensions"] .codex-plus-page-nav { width: 180px; flex-basis: 180px; }
+        .${codexPlusPageClass} .codex-plus-modal-content:is([data-codex-plus-active-tab="extensions"], [data-codex-plus-active-tab="sponsor"]) .codex-plus-modal-body { padding: 24px 20px 40px; }
+      }
+      @container codex-plus-discovery-page (max-width: 480px) {
+        .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="extensions"] .codex-plus-page-nav { width: 56px; flex-basis: 56px; }
+        .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="extensions"] .codex-plus-page-nav-header { display: none; }
+        .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="extensions"] .codex-plus-page-nav-body { padding: 12px 8px; }
+        .codex-plus-extensions-nav-entry { justify-content: center; padding: 8px; }
+        .codex-plus-extensions-nav-entry .codex-plus-page-nav-item-text,
+        .codex-plus-extensions-nav-entry .codex-plus-page-nav-item-name,
+        .codex-plus-extensions-nav-entry .codex-plus-extensions-item-name,
+        .codex-plus-extensions-nav-entry .codex-plus-page-nav-item-state,
+        .codex-plus-extensions-nav-entry .codex-plus-extensions-item-state { display: none; }
+        .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="extensions"] .codex-plus-page-nav-group-head,
+        .${codexPlusPageClass} .codex-plus-modal-content[data-codex-plus-active-tab="extensions"] .codex-plus-page-nav-empty { display: none; }
+        .${codexPlusPageClass} .codex-plus-modal-content:is([data-codex-plus-active-tab="extensions"], [data-codex-plus-active-tab="sponsor"]) .codex-plus-modal-body { padding: 24px 16px 40px; }
+      }
     `;
     document.documentElement.appendChild(style);
   }
 
   function defaultCodexPlusSettings() {
-    return { pluginMarketplaceUnlock: true, pluginAutoExpand: true, modelWhitelistUnlock: true, sessionDelete: true, markdownExport: true, pasteFix: false, threadIdBadge: false, conversationView: false, conversationViewMaxWidth: conversationViewDefaultWidth, threadScrollRestore: true, zedRemoteOpen: true, upstreamWorktreeCreate: true, nativeMenuPlacement: true, serviceTierControls: false, petRealMouseLook: false, stepwise: false, answerOutline: false, dreamSkinEnabled: false, dreamSkinPaused: false, dreamSkinThemeConfig: window.__CODEX_PLUS_DREAM_SKIN_THEME__ || {}, dreamSkinImagePath: "" };
+    return { pluginMarketplaceUnlock: true, pluginAutoExpand: true, modelWhitelistUnlock: true, sessionDelete: true, markdownExport: true, sessionShare: true, pasteFix: false, typingEffect: "off", threadIdBadge: false, conversationView: false, whaleWidget: false, conversationViewMaxWidth: conversationViewDefaultWidth, threadScrollRestore: true, nativeMenuPlacement: true, serviceTierControls: false, petRealMouseLook: false, stepwise: false, answerOutline: false, dreamSkinEnabled: false, dreamSkinPaused: false, dreamSkinThemeConfig: window.__CODEX_PLUS_DREAM_SKIN_THEME__ || {}, dreamSkinImagePath: "" };
   }
 
   const codexPlusBackendSettingMap = {
@@ -2017,17 +2181,18 @@
     modelWhitelistUnlock: "codexAppModelWhitelistUnlock",
     sessionDelete: "codexAppSessionDelete",
     markdownExport: "codexAppMarkdownExport",
+    sessionShare: "codexAppSessionShare",
     threadIdBadge: "codexAppThreadIdBadge",
     conversationView: "codexAppConversationView",
+    whaleWidget: "codexAppWhaleWidgetEnabled",
     threadScrollRestore: "codexAppThreadScrollRestore",
-    zedRemoteOpen: "codexAppZedRemoteOpen",
-    upstreamWorktreeCreate: "codexAppUpstreamWorktreeCreate",
     nativeMenuPlacement: "codexAppNativeMenuPlacement",
     serviceTierControls: "codexAppServiceTierControls",
     petRealMouseLook: "codexAppPetRealMouseLook",
     stepwise: "codexAppStepwiseEnabled",
     answerOutline: "codexAppAnswerOutlineEnabled",
     pasteFix: "codexAppPasteFix",
+    typingEffect: "codexAppTypingEffect",
     dreamSkinEnabled: "codexAppDreamSkinEnabled",
     dreamSkinPaused: "codexAppDreamSkinPaused",
     dreamSkinThemeConfig: "codexAppDreamSkinThemeConfig",
@@ -2047,7 +2212,6 @@
   }
 
   function codexPlusSettings() {
-    const relayPatchDisabled = codexPlusBackendSettings.launchMode === "relay";
     if (codexPlusBackendSettings.enhancementsEnabled === false) {
       return {
         pluginMarketplaceUnlock: false,
@@ -2055,13 +2219,14 @@
         modelWhitelistUnlock: false,
         sessionDelete: false,
         markdownExport: false,
+        sessionShare: false,
         pasteFix: false,
+        typingEffect: "off",
         threadIdBadge: false,
         conversationView: false,
+        whaleWidget: false,
         conversationViewMaxWidth: conversationViewDefaultWidth,
         threadScrollRestore: false,
-        zedRemoteOpen: false,
-        upstreamWorktreeCreate: false,
         nativeMenuPlacement: false,
         serviceTierControls: false,
         petRealMouseLook: false,
@@ -2075,17 +2240,10 @@
     }
     try {
       const settings = { ...defaultCodexPlusSettings(), ...JSON.parse(localStorage.getItem(codexPlusSettingsKey) || "{}"), ...backendCodexPlusSettings() };
-      if (relayPatchDisabled) {
-        settings.pluginMarketplaceUnlock = false;
-        settings.pluginAutoExpand = false;
-      }
+      delete settings.customLayout;
       return settings;
     } catch {
       const settings = { ...defaultCodexPlusSettings(), ...backendCodexPlusSettings() };
-      if (relayPatchDisabled) {
-        settings.pluginMarketplaceUnlock = false;
-        settings.pluginAutoExpand = false;
-      }
       return settings;
     }
   }
@@ -2928,21 +3086,26 @@
     if (!width) return;
     setCodexPlusSetting("conversationViewMaxWidth", width);
   }
-
   function renderCodexPlusMenu() {
     const settings = codexPlusSettings();
     document.querySelectorAll(".codex-plus-toggle[data-codex-plus-setting]").forEach((button) => {
       const key = button.getAttribute("data-codex-plus-setting");
       const waitsForBackend = codexPlusBackendMappedSettings.has(key) && !codexPlusBackendSettingsLoaded;
       button.dataset.enabled = String(!!settings[key]);
+      button.setAttribute("aria-checked", button.dataset.enabled);
       button.dataset.pending = String(waitsForBackend);
       button.disabled = waitsForBackend || button.dataset.relayUnneeded === "true";
     });
     refreshConversationViewControls();
     refreshCodexServiceTierControls();
+    document.querySelectorAll("[data-codex-plus-typing-effect]").forEach((select) => {
+      select.value = ["rainbow", "fireworks", "stars"].includes(settings.typingEffect) ? settings.typingEffect : "off";
+      select.disabled = !codexPlusBackendSettingsLoaded || codexPlusBackendSettings.enhancementsEnabled === false;
+      if (typeof syncCodexPlusTypingEffectDropdown === "function") syncCodexPlusTypingEffectDropdown(select);
+    });
   }
 
-  let codexPlusBackendSettings = { providerSyncEnabled: false, enhancementsEnabled: true, launchMode: "patch", codexAppVersion: "" };
+  let codexPlusBackendSettings = { providerSyncEnabled: false, enhancementsEnabled: true, codexAppVersion: "" };
   let codexPlusBackendSettingsSeq = 0;
   const codexPluginLegacyEntryUnlockBeforeVersion = "26.601.2237";
   const codexPluginBridgeRequestUnlockFromVersion = "26.616.0";
@@ -3027,7 +3190,12 @@
   const codexServiceTierReadTimeoutMs = 5000;
   const codexServiceTierModulePromises = new Map();
   // namePart -> { at, attempts, error }，见 loadCodexAppModule 里的说明。
-  const codexAppModuleFailures = new Map();
+  // 挂在 window 上跨重注入保留：否则每次重注入都会清空失败记录，重新全量 fetch asset
+  // （issue #2330 / #2169：桥接看门狗重注入后 asset rescan 被重新跑满）。
+  const codexAppModuleFailures = window.__codexPlusAppModuleFailures || (window.__codexPlusAppModuleFailures = new Map());
+  // namePart -> { at, url }：codexAppAssetUrlFromScriptText 的查找结果，未命中也缓存，
+  // 同样跨重注入保留（有调用方会绕过 asset loader 直接调它）。
+  const codexAppAssetUrlLookups = window.__codexPlusAssetUrlLookups || (window.__codexPlusAssetUrlLookups = new Map());
   const codexAppModuleRetryCooldownMs = 30000;
   const codexAppModuleMaxAttempts = 8;
   const codexServiceTierSupportedFastModels = new Set(["gpt-5.4", "gpt-5.5"]);
@@ -3058,6 +3226,19 @@
 
   async function codexAppAssetUrlFromScriptText(namePart) {
     if (!namePart) return "";
+    // 有调用方会绕过 asset loader 直接调这里，
+    // 没有缓存时每次注入都要把全部 app asset fetch 一遍（issue #2330）。
+    // 未命中同样缓存：冷却期内不重复扫描。
+    const cached = codexAppAssetUrlLookups.get(namePart);
+    if (cached && (cached.url || Date.now() - cached.at < codexAppModuleRetryCooldownMs)) {
+      return cached.url;
+    }
+    const url = await scanCodexAppAssetUrlFromScriptText(namePart);
+    codexAppAssetUrlLookups.set(namePart, { at: Date.now(), url });
+    return url;
+  }
+
+  async function scanCodexAppAssetUrlFromScriptText(namePart) {
     const scripts = codexAppAssetCandidateUrls();
     const escaped = String(namePart).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const patterns = [
@@ -3088,6 +3269,22 @@
   // 实测空闲时 301 次请求/秒，主线程 TaskOtherDuration 占满一半 CPU，JS 堆每秒涨约 1MB，
   // Sentry 又给每个请求记一条 breadcrumb 并回同步一次 scope，把量再翻一倍推给 browser 进程。
   // 记住失败 + 冷却重试，让下游即便还在轮询也只会周期性地试一次。
+  // 「这个 asset 找不到」是可预期的、会随 Codex 版本变化的情形，
+  // 不是异常。用结构化标记而不是靠 message 字符串比对来区分：字符串比对让
+  // loadOptionalCodexAppModule 的「可选」语义只对精确复刻了那段 message 的调用方生效，
+  // 任何一个自己抛错或包了一层的调用方都会漏判，把可选依赖的缺失当成硬失败中断整条流程
+  // （issue #1316 的「未找到 Codex App asset: vscode-api-」就是这么冒到用户面前的）。
+  function codexAppAssetMissingError(namePart) {
+    const error = new Error(`未找到 Codex App asset: ${namePart}`);
+    error.code = "CODEX_PLUS_ASSET_MISSING";
+    error.assetNamePart = namePart;
+    return error;
+  }
+
+  function isCodexAppAssetMissingError(error) {
+    return !!error && (error.code === "CODEX_PLUS_ASSET_MISSING" || error.name === "CodexPlusAssetMissingError");
+  }
+
   async function loadCodexAppModule(namePart) {
     if (!codexServiceTierModulePromises.has(namePart)) {
       const failure = codexAppModuleFailures.get(namePart);
@@ -3098,7 +3295,7 @@
       }
       const promise = Promise.resolve().then(async () => {
         const url = codexAppAssetUrl(namePart) || await codexAppAssetUrlFromScriptText(namePart);
-        if (!url) throw new Error(`未找到 Codex App asset: ${namePart}`);
+        if (!url) throw codexAppAssetMissingError(namePart);
         return await import(url);
       }).then((module) => {
         // Codex 更新后 asset 可能又出现，成功时把失败记录清掉，冷却计数重新开始。
@@ -3122,8 +3319,9 @@
     try {
       return await loadCodexAppModule(namePart);
     } catch (error) {
-      const message = String(error?.message || error);
-      if (message.includes(`未找到 Codex App asset: ${namePart}`)) return null;
+      // 结构化标记优先；保留字符串兜底以便老缓存里的 Error 也能被认出来。
+      if (isCodexAppAssetMissingError(error)) return null;
+      if (String(error?.message || error).includes(`未找到 Codex App asset: ${namePart}`)) return null;
       throw error;
     }
   }
@@ -3324,6 +3522,39 @@
     return codexServiceTierModelFromValue(codexModelCatalog.model) || codexServiceTierModelFromValue(codexModelCatalog.default_model);
   }
 
+  // threadId -> 模型名。挂在 window 上跨重注入保留（重注入不该丢掉已知的线程模型）。
+  // 只在请求路径观测到模型时写入，用于让界面判定跟上线程当前模型（issue #1463）。
+  const codexServiceTierThreadModels = window.__codexPlusServiceTierThreadModels
+    || (window.__codexPlusServiceTierThreadModels = new Map());
+
+  // 线程中途换模型后，全局 catalog 的 model 字段往往还没更新，直接拿它判 Fast 可用性
+  // 会落后一拍。因此界面优先读「当前线程最近一次实际请求用的模型」，读不到才回落全局。
+  function codexServiceTierUiModelName(threadId = "") {
+    const key = typeof validThreadScrollSessionKey === "function"
+      ? validThreadScrollSessionKey(threadId)
+      : String(threadId || "");
+    if (key) {
+      const cached = codexServiceTierThreadModels.get(key);
+      if (cached) return cached;
+    }
+    return codexServiceTierCurrentModelName();
+  }
+
+  function codexServiceTierRememberThreadModel(threadId, modelName) {
+    const key = typeof validThreadScrollSessionKey === "function"
+      ? validThreadScrollSessionKey(threadId)
+      : String(threadId || "");
+    const model = codexServiceTierModelFromValue(modelName);
+    if (!key || !model) return;
+    codexServiceTierThreadModels.set(key, model);
+    // 简易上界，避免长会话里 Map 无限增长；Map 的插入序即写入序，删最旧的即可。
+    while (codexServiceTierThreadModels.size > 64) {
+      const oldest = codexServiceTierThreadModels.keys().next().value;
+      if (oldest === undefined) break;
+      codexServiceTierThreadModels.delete(oldest);
+    }
+  }
+
   function codexServiceTierModelForRequest(params, modelHint = "") {
     return codexServiceTierModelFromValue(params) || codexServiceTierModelFromValue(modelHint) || codexServiceTierCurrentModelName();
   }
@@ -3358,11 +3589,20 @@
     });
   }
 
-  function codexServiceTierFastAvailability(modelName = codexServiceTierCurrentModelName()) {
+  // UI 侧「Fast 是否可用」的唯一判据。这里必须复用 codexServiceTierFastSupportedForModel，
+  // 不能再自己对照 codexServiceTierSupportedFastModels：那套只认内置名单，中转场景下
+  // 模型名带前缀（或仅靠上游元数据声明 priority）时，界面会判「不支持/未读取」，而真正
+  // 发请求的路径却按同一模型放了 service_tier=priority——两条判据不一致就会自相矛盾
+  // （issue #772）。
+  //
+  // 默认模型名优先取最近一次在线程里观测到的模型（见 codexServiceTierRememberThreadModel），
+  // 只有完全没观测过时才回落到全局 catalog——否则线程中途换模型后 UI 会落后一拍
+  // （issue #1463）。
+  function codexServiceTierFastAvailability(modelName = codexServiceTierUiModelName()) {
     const normalizedModel = normalizeCodexServiceTierModelName(modelName);
     return {
       modelName: modelName || "",
-      supported: !!normalizedModel && codexServiceTierSupportedFastModels.has(normalizedModel),
+      supported: !!normalizedModel && codexServiceTierFastSupportedForModel(modelName),
     };
   }
 
@@ -3400,7 +3640,6 @@
   function codexServiceTierEffectiveMode(value) {
     return isFastServiceTierValue(value) ? "fast" : "standard";
   }
-
   function normalizeCodexThreadServiceTierMode(mode) {
     const normalized = String(mode || "").trim().toLowerCase();
     return codexThreadServiceTierModes.has(normalized) ? normalized : "inherit";
@@ -3604,7 +3843,13 @@
       return;
     }
     const activeThreadId = validThreadScrollSessionKey(currentSessionRef().session_id);
-    if (activeThreadId) bindDraftServiceTierToThread(activeThreadId);
+    if (activeThreadId) {
+      bindDraftServiceTierToThread(activeThreadId);
+      // 界面判 Fast 用「当前线程的模型」，不再回落全局 catalog：线程中途换模型后
+      // 全局值可能是旧的，会让 UI 落后一拍（issue #1463）。
+      const activeModel = codexServiceTierUiModelName(activeThreadId);
+      if (activeModel) codexServiceTierRememberThreadModel(activeThreadId, activeModel);
+    }
     const storedState = readThreadServiceTierState();
     const controlMode = normalizeCodexServiceTierControlMode(storedState.mode);
     const defaultMode = normalizeCodexThreadServiceTierMode(storedState.defaultMode);
@@ -3841,6 +4086,9 @@
     const threadId = codexServiceTierThreadIdForRequest(method, params, threadIdHint);
     const requestedFast = isFastServiceTierValue(requestedServiceTier);
     const modelName = codexServiceTierModelForRequest(params, modelHint);
+    // 请求路径是唯一能拿到「本 turn 真正用的模型」的地方，顺手记下来供界面判定使用，
+    // 这样线程中途换模型后 UI 下一次刷新就跟得上（issue #1463）。
+    codexServiceTierRememberThreadModel(threadId, modelName);
     const fastSupported = !requestedFast || codexServiceTierFastSupportedForModel(modelName);
     return {
       threadId,
@@ -4401,77 +4649,39 @@
     serviceTierDispatcherPatchPromise = patch();
   }
 
-  // --- Dictation / Voice patch for apikey (ported from v1.2.34 preload) ---
-  const codexDictationSupportVersion = "1";
-  function codexDictationSupportModuleCandidates() {
-    const prefixes = ["use-is-dictation-supported-", "use-dictation-", "app-initial-", "setting-storage-", "vscode-api-"];
-    return prefixes;
-  }
-  async function installDictationSupportPatch() {
-    if (window.__codexDictationSupportPatched === codexDictationSupportVersion) return;
-    for (const prefix of codexDictationSupportModuleCandidates()) {
-      try {
-        const module = await loadOptionalCodexAppModule(prefix);
-        if (!module) continue;
-        for (const key of Object.keys(module)) {
-          const fn = module[key];
-          if (typeof fn !== "function") continue;
-          let src = "";
-          try { src = String(fn); } catch {}
-          if (!src.includes("authMethod") || !src.includes("chatgpt")) continue;
-          if (fn.__codexDictationPatched === codexDictationSupportVersion) continue;
-          const original = fn;
-          const wrapped = function(...args) {
-            try {
-              const result = original.apply(this, args);
-              if (result === false) {
-                const hasApikey = args.some(arg => arg && typeof arg === "object" && (arg.authMethod === "apikey" || arg.authMethod === "apiKey"));
-                if (hasApikey) return true;
-                if (typeof codexPlusSettings === "function" && codexPlusSettings().serviceTierControls) return true;
-              }
-              return result;
-            } catch (e) {
-              return original.apply(this, args);
-            }
-          };
-          wrapped.__codexDictationPatched = codexDictationSupportVersion;
-          try { module[key] = wrapped; } catch {}
-          sendCodexPlusDiagnostic("dictation_support_patched", { prefix, key, version: codexDictationSupportVersion });
-          window.__codexDictationSupportPatched = codexDictationSupportVersion;
-          return;
-        }
-      } catch {}
-    }
-    // Fallback: DOM enforcement for voice button when module patch not found
-    try {
-      if (!window.__codexDictationDomPatched) {
-        window.__codexDictationDomPatched = true;
-        const enforceVoice = () => {
-          const selectors = ['button[aria-label*="Voice"]','button[aria-label*="Dictation"]','button[aria-label*="voice"]','[data-testid*="voice"]','[data-testid*="dictation"]','button:has(svg)'];
-          // generic: find buttons with microphone icon
-          document.querySelectorAll('button').forEach(btn => {
-            const label = (btn.getAttribute("aria-label") || btn.textContent || "").toLowerCase();
-            if (label.includes("voice") || label.includes("dictation") || label.includes("microphone") || label.includes("mic")) {
-              if (btn.hasAttribute("disabled")) {
-                btn.removeAttribute("disabled");
-                btn.setAttribute("aria-disabled","false");
-                btn.style.opacity = "";
-                btn.style.pointerEvents = "";
-              }
-            }
-          });
-        };
-        setInterval(enforceVoice, 1500);
-        enforceVoice();
-      }
-    } catch {}
+  // 保留旧调用入口，语音能力由独立的 opt-in 控件提供。
+  function installDictationSupportPatch() {
+    installCodexPlusDictation();
   }
 
-  async function loadBackendSettingsState() {
+  const codexAppServerPreparationTimeoutMs = 2000;
+
+  // 发送前只读取辅助配置；桥接无回包时及时降级，迟到的结果也不再应用。
+  // 写 RPC（尤其 thread/resume）不能这样竞速，否则会在 turn/start 后迟到修改会话。
+  async function readCodexAppServerPreparation(path, payload, timeoutMs = codexAppServerPreparationTimeoutMs) {
+    let timeoutId;
+    try {
+      return await Promise.race([
+        postJson(path, payload),
+        new Promise((_, reject) => {
+          timeoutId = setTimeout(() => {
+            sendCodexPlusDiagnostic("app_server_preparation_read_timeout", { path, timeoutMs });
+            reject(new Error(`Codex++ preparation read timed out: ${path}`));
+          }, timeoutMs);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  async function loadBackendSettingsState(timeoutMs = 0) {
     const seq = codexPlusBackendSettingsSeq;
     try {
-      const settings = await postJson("/settings/get", {});
-      if (!settings || typeof settings !== "object" || (!("launchMode" in settings) && !("enhancementsEnabled" in settings) && !("providerSyncEnabled" in settings))) {
+      const settings = await (timeoutMs > 0
+        ? readCodexAppServerPreparation("/settings/get", {}, timeoutMs)
+        : postJson("/settings/get", {}));
+      if (!settings || typeof settings !== "object" || (!("enhancementsEnabled" in settings) && !("providerSyncEnabled" in settings))) {
         throw new Error("invalid backend settings response");
       }
       if (seq !== codexPlusBackendSettingsSeq) {
@@ -4479,12 +4689,14 @@
       }
       codexPlusBackendSettings = { ...codexPlusBackendSettings, ...settings };
       codexPlusBackendSettingsLoaded = true;
-      return true;
     } catch (_) {
       return false;
     }
+    // 设置已加载成功；语音 UI 的异常不应使 provider/Fast 刷新误判为失败。
+    // service-tier harness 在 70 分片提前返回，尚未初始化 93 分片的录音状态。
+    if (!window.__CODEX_PLUS_TEST_SERVICE_TIER__) runScanStep(installCodexPlusDictation);
+    return true;
   }
-
   async function loadBackendSettings() {
     const loaded = await loadBackendSettingsState();
     if (loaded && codexRemoteSessionProviderOverrideEnabled()) {
@@ -4492,6 +4704,8 @@
     }
     refreshCodexPlusBackendToggles();
     if (loaded) syncOfficialUsagePolicy();
+    if (loaded) runScanStep(syncCodexPlusTypingEffects);
+    if (loaded && typeof syncCodexPlusWhaleWidget === "function") runScanStep(syncCodexPlusWhaleWidget);
     return loaded;
   }
 
@@ -4516,6 +4730,10 @@
       const loaded = await loadBackendSettingsState();
       if (loaded) {
         syncOfficialUsagePolicy();
+        runScanStep(syncCodexPlusTypingEffects);
+        if (typeof syncCodexPlusWhaleWidget === "function") runScanStep(syncCodexPlusWhaleWidget);
+        if (typeof installSessionShareButton === "function") runScanStep(installSessionShareButton);
+        renderCodexPlusMenu();
         if (previousConversationView !== !!codexPlusSettings().conversationView) {
           refreshConversationView();
         }
@@ -4544,8 +4762,12 @@
     document.querySelectorAll(".codex-plus-toggle[data-codex-backend-setting]").forEach((button) => {
       const key = button.getAttribute("data-codex-backend-setting");
       button.dataset.enabled = String(!!codexPlusBackendSettings[key]);
+      button.setAttribute("aria-checked", button.dataset.enabled);
     });
     syncStepwisePanel();
+    runScanStep(syncCodexPlusTypingEffects);
+    if (typeof syncCodexPlusWhaleWidget === "function") runScanStep(syncCodexPlusWhaleWidget);
+    if (typeof installSessionShareButton === "function") runScanStep(installSessionShareButton);
     renderCodexPlusMenu();
     scan();
   }
@@ -4558,6 +4780,7 @@
   let codexPlusScriptMarket = { scripts: [], loaded: false, loading: false, message: "" };
   // 「拓展」页左面板的搜索关键词，纯前端过滤。
   let codexPlusExtensionsQuery = "";
+  let codexPlusExtensionsFilter = "market";
   // 当前选中的拓展（左面板点开后右侧显示详情）。空 = 还没选。
   let codexPlusExtensionsSelected = null;
   // 默认扩展图标：VSCode codicon 的 `extensions` 字形（\eae6），
@@ -4686,132 +4909,102 @@
     return { loaded: "已加载", failed: "失败", disabled: "已禁用", not_loaded: "未加载", loading: "加载中" }[status] || status || "未知";
   }
 
-  /**
-   * 「拓展」页面左面板：搜索框 + 已安装/市场两个分组。
-   *
-   * 点击复用已有的事件委托：已安装走向 `data-codex-user-script-key` 的开关，
-   * 市场项走 `data-codex-market-install`。搜索是纯前端过滤，不发请求。
-   */
-  function renderCodexPlusExtensionsNav() {
-    const { installed, market } = codexPlusExtensionsEntries();
-    const shownInstalled = filterCodexPlusExtensionsEntries(installed);
-    const shownMarket = filterCodexPlusExtensionsEntries(market);
-    const loading = codexPlusScriptMarket.loading && !codexPlusScriptMarket.loaded;
-    const searching = !!codexPlusExtensionsQuery.trim();
+  // 使用已安装 Lucide Search / RotateCw / Plus / ArrowLeft 的 ISC 图标路径。
+  const codexPlusDiscoveryIcons = {
+    search: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>',
+    refresh: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></svg>',
+    plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M12 5v14"/></svg>',
+    back: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 19-7-7 7-7M19 12H5"/></svg>',
+  };
 
-    const itemHtml = (entry) => {
-      const selected = codexPlusExtensionsSelected?.kind === entry.kind
-        && codexPlusExtensionsSelected?.key === entry.key;
+  /** 原生风格侧栏：浏览入口和已安装拓展的单行名称。 */
+  function renderCodexPlusExtensionsNav() {
+    const { installed } = codexPlusExtensionsEntries();
+    const shown = filterCodexPlusExtensionsEntries(installed);
+    const rows = shown.map((entry) => {
+      const selected = codexPlusExtensionsSelected?.kind === "installed" && codexPlusExtensionsSelected.key === entry.key;
       const marketItem = codexPlusExtensionMarketItem(entry);
-      // 条目形态对齐 VSCode 扩展列表：大图标 + 名称行 + 简介行 + 底部作者/操作行。
-      // 图标优先用市场清单的 icon，没有就用默认字形（见 extensionIconMarkup）。
-      const icon = `
-        <span class="codex-plus-extensions-icon" aria-hidden="true">
-          ${extensionIconMarkup(marketItem?.icon)}
-        </span>
-      `;
-      // 选中项高亮；点击整行选中并在右侧显示详情，不再直接切换开关。
-      const base = `class="codex-plus-page-nav-item" data-active="${String(selected)}"`;
-      if (entry.kind === "market") {
-        const blurb = entry.item?.description || entry.meta || "";
-        return `
-          <button type="button" ${base} data-codex-extensions-select="market:${escapeHtml(entry.key)}" title="${escapeHtml(entry.name)}">
-            <span class="codex-plus-extensions-item-body">
-              <span class="codex-plus-extensions-item-header">
-                ${icon}
-                <span class="codex-plus-extensions-item-name">${escapeHtml(entry.name)}</span>
-                ${entry.installed ? `<span class="codex-plus-extensions-icon-badge" data-badge="installed" title="已安装">✓</span>` : ""}
-              </span>
-              ${blurb ? `<span class="codex-plus-extensions-item-description">${escapeHtml(blurb)}</span>` : ""}
-              <span class="codex-plus-extensions-item-footer">
-                <span class="codex-plus-extensions-item-publisher">${escapeHtml(entry.meta || "")}</span>
-                <span class="codex-plus-extensions-item-actions">
-                  <span class="codex-plus-extensions-item-button" data-codex-market-install="${escapeHtml(entry.key)}">安装</span>
-                </span>
-              </span>
-            </span>
-          </button>
-        `;
-      }
-      const blurb = marketItem?.description || "";
       return `
-        <button type="button" ${base} data-codex-extensions-select="installed:${escapeHtml(entry.key)}" title="${escapeHtml(entry.name)}">
-          <span class="codex-plus-extensions-item-body">
-            <span class="codex-plus-extensions-item-header">
-              ${icon}
-              <span class="codex-plus-extensions-item-name">${escapeHtml(entry.name)}</span>
-              <span class="codex-plus-extensions-item-state" data-state="${entry.enabled ? "on" : "off"}" title="${entry.enabled ? "已启用" : "已禁用"}"></span>
-            </span>
-            ${blurb ? `<span class="codex-plus-extensions-item-description">${escapeHtml(blurb)}</span>` : ""}
-            <span class="codex-plus-extensions-item-footer">
-              <span class="codex-plus-extensions-item-publisher">${escapeHtml(entry.meta || "")}</span>
-              <span class="codex-plus-extensions-item-actions"></span>
-            </span>
-          </span>
+        <button type="button" class="codex-plus-page-nav-item codex-plus-extensions-nav-entry" data-codex-extensions-select="installed:${escapeHtml(entry.key)}" data-active="${String(selected)}" title="${escapeHtml(entry.name)}" aria-label="${escapeHtml(entry.name)}">
+          <span class="codex-plus-page-nav-item-icon" aria-hidden="true">${extensionIconMarkup(marketItem?.icon)}</span>
+          <span class="codex-plus-page-nav-item-text"><span class="codex-plus-page-nav-item-name">${escapeHtml(entry.name)}</span></span>
+          <span class="codex-plus-page-nav-item-state" data-state="${entry.enabled ? "on" : "off"}" title="${entry.enabled ? "已启用" : "已禁用"}"></span>
         </button>
       `;
-    };
-
-    const group = (title, entries, emptyText, count, headAction = "") => {
-      // 只在「搜索无匹配」时省略分组；否则空分组要留着显示占位文案，
-      // 不然「正在读取拓展…」和加载失败提示都会被一起藏掉，面板全空。
-      if (!entries.length && searching) return "";
-      const body = entries.length
-        ? entries.map(itemHtml).join("")
-        : `<div class="codex-plus-page-nav-empty">${escapeHtml(emptyText)}</div>`;
-      return `
-        <div class="codex-plus-page-nav-group">
-          <div class="codex-plus-page-nav-group-head">
-            <span>${escapeHtml(title)}</span>
-            <span class="codex-plus-page-nav-group-tail">
-              ${count ? `<span class="codex-plus-page-nav-group-count">${count}</span>` : ""}
-              ${headAction}
-            </span>
-          </div>
-          ${body}
-        </div>
-      `;
-    };
-
-    const marketEmpty = loading
-      ? "正在读取拓展…"
-      : (codexPlusScriptMarket.message || "市场里没有可安装的拓展。");
-    const anyShown = shownInstalled.length || shownMarket.length;
-    const hint = searching && !anyShown
-      ? `<div class="codex-plus-page-nav-empty">没有匹配「${escapeHtml(codexPlusExtensionsQuery)}」的拓展。</div>`
-      : "";
-
+    }).join("");
+    const empty = codexPlusExtensionsQuery.trim() ? "没有匹配的已安装拓展。" : codexPlusUserScriptsLoaded ? "未发现已安装的拓展。" : "正在读取用户拓展…";
     return `
-      <div class="codex-plus-page-search">
-        <input type="search" class="codex-plus-page-search-input" data-codex-extensions-search="true"
-          placeholder="搜索拓展" value="${escapeHtml(codexPlusExtensionsQuery)}" spellcheck="false" />
+      <button type="button" class="codex-plus-page-nav-item codex-plus-extensions-nav-entry" data-codex-extensions-browse="market" data-active="${String(!codexPlusExtensionsSelected && codexPlusExtensionsFilter === "market")}" title="浏览拓展" aria-label="浏览拓展">
+        <span class="codex-plus-page-nav-item-icon" aria-hidden="true">${extensionIconSvg()}</span>
+        <span class="codex-plus-page-nav-item-text"><span class="codex-plus-page-nav-item-name">浏览拓展</span></span>
+      </button>
+      <div class="codex-plus-page-nav-group">
+        <div class="codex-plus-page-nav-group-head"><span>已安装</span><span class="codex-plus-page-nav-group-count">${installed.length}</span></div>
+        ${rows || `<div class="codex-plus-page-nav-empty">${escapeHtml(empty)}</div>`}
       </div>
-      ${hint}
-      ${group("已安装", shownInstalled, codexPlusUserScriptsLoaded ? "未发现已安装的拓展。" : "正在读取用户拓展…", installed.length)}
-      ${group("市场", shownMarket, marketEmpty, market.length,
-        `<button type="button" class="codex-plus-page-nav-group-action" data-codex-market-refresh="true" title="刷新拓展">刷新</button>`)}
     `;
   }
 
-  /** 左面板内容变了就整块重绘（搜索、安装完成、脚本状态变化都会走到这）。 */
+  /** 主区使用原生插件列表的图标、简介和独立操作列，避免嵌套按钮。 */
+  function renderCodexPlusExtensionsOverview() {
+    const { installed, market } = codexPlusExtensionsEntries();
+    const isInstalled = codexPlusExtensionsFilter === "installed";
+    const entries = filterCodexPlusExtensionsEntries(isInstalled ? installed : market);
+    const cards = entries.map((entry) => {
+      const item = codexPlusExtensionMarketItem(entry);
+      const description = item?.description || entry.script?.description || entry.meta || "";
+      const select = `${entry.kind}:${escapeHtml(entry.key)}`;
+      const action = entry.kind === "market"
+        ? `<button type="button" class="codex-plus-discovery-icon-button" data-codex-market-install="${escapeHtml(entry.key)}" aria-label="安装 ${escapeHtml(entry.name)}" title="安装 ${escapeHtml(entry.name)}">${codexPlusDiscoveryIcons.plus}</button>`
+        : `<button type="button" class="codex-plus-toggle" data-codex-user-script-key="${escapeHtml(entry.key)}" data-enabled="${String(entry.enabled)}" role="switch" aria-checked="${String(entry.enabled)}" aria-label="启用 ${escapeHtml(entry.name)}"><span></span></button>`;
+      return `
+        <article class="codex-plus-extension-card">
+          <button type="button" class="codex-plus-extension-card-select" data-codex-extensions-select="${select}" aria-label="查看 ${escapeHtml(entry.name)}">
+            <span class="codex-plus-extension-card-icon" aria-hidden="true">${extensionIconMarkup(item?.icon)}</span>
+            <span class="codex-plus-extension-card-copy">
+              <span class="codex-plus-extension-card-title">${escapeHtml(entry.name)}</span>
+              <span class="codex-plus-extension-card-description">${escapeHtml(description)}</span>
+            </span>
+          </button>
+          <div class="codex-plus-extension-card-actions">${action}</div>
+        </article>
+      `;
+    }).join("");
+    const empty = codexPlusExtensionsQuery.trim() ? `没有匹配「${codexPlusExtensionsQuery}」的拓展。`
+      : isInstalled ? (codexPlusUserScriptsLoaded ? "未发现已安装的拓展。" : "正在读取用户拓展…")
+      : codexPlusScriptMarket.loading && !codexPlusScriptMarket.loaded ? "正在读取拓展…"
+      : codexPlusScriptMarket.message || "市场里没有可安装的拓展。";
+    return `
+      <div class="codex-plus-extensions-filter" role="group" aria-label="拓展来源">
+        <button type="button" data-codex-extensions-browse="market" data-active="${String(!isInstalled)}" aria-pressed="${String(!isInstalled)}">市场</button>
+        <button type="button" data-codex-extensions-browse="installed" data-active="${String(isInstalled)}" aria-pressed="${String(isInstalled)}">已安装</button>
+      </div>
+      <h2 class="codex-plus-discovery-section-title">${isInstalled ? "已安装拓展" : "市场拓展"}</h2>
+      <div class="codex-plus-extensions-grid" data-codex-plus-extensions-list="true">
+        ${cards || `<div class="codex-plus-extensions-detail-empty" role="status">${escapeHtml(empty)}</div>`}
+      </div>
+    `;
+  }
+
+  /** 只刷新侧栏和结果区；搜索输入框保持原 DOM 与光标位置。 */
   function refreshCodexPlusExtensionsView() {
     if (codexPlusActiveEntry() !== "extensions") return;
+    if (codexPlusExtensionsSelected && !codexPlusExtensionsSelectionDetail()) codexPlusExtensionsSelected = null;
+    const active = document.activeElement;
+    const focused = active?.getAttribute?.("data-codex-user-script-key");
+    const focusedBrowse = active?.getAttribute?.("data-codex-extensions-browse");
+    const focusedNav = !!active?.closest?.("[data-codex-plus-page-nav-body]");
     const body = document.querySelector("[data-codex-plus-page-nav-body]");
-    if (body) {
-      const query = document.querySelector("[data-codex-extensions-search]")?.value;
-      if (typeof query === "string") codexPlusExtensionsQuery = query;
-      body.innerHTML = renderCodexPlusExtensionsNav();
-      // 重绘会丢焦点，搜索时要把光标放回去，否则每敲一个字就断。
-      if (codexPlusExtensionsQuery) {
-        const input = body.querySelector("[data-codex-extensions-search]");
-        if (input) {
-          input.focus();
-          input.setSelectionRange(input.value.length, input.value.length);
-        }
-      }
-    }
+    if (body) body.innerHTML = renderCodexPlusExtensionsNav();
     const detail = document.querySelector("[data-codex-plus-extensions-detail]");
     if (detail) detail.innerHTML = renderCodexPlusExtensionsDetail();
+    if (focused) {
+      Array.from(detail?.querySelectorAll("[data-codex-user-script-key]") || [])
+        .find((button) => button.getAttribute("data-codex-user-script-key") === focused)?.focus({ preventScroll: true });
+    } else if (focusedBrowse) {
+      Array.from((focusedNav ? body : detail)?.querySelectorAll("[data-codex-extensions-browse]") || [])
+        .find((button) => button.getAttribute("data-codex-extensions-browse") === focusedBrowse)?.focus({ preventScroll: true });
+    }
   }
 
   /**
@@ -4830,6 +5023,7 @@
     const marketItem = marketId
       ? (codexPlusScriptMarket.scripts || []).find((item) => item.id === marketId) || null
       : null;
+    if ((sel.kind === "installed" && !local) || (sel.kind === "market" && !marketItem)) return null;
     return { sel, local, marketItem };
   }
 
@@ -4865,17 +5059,18 @@
     if (svg) img.replaceWith(svg);
   }
 
-  /** 右上角详情：图标 + 名称 + 介绍 + 操作。形态对齐 VSCode 的扩展详情页。 */
+  /** 原生风格详情：居中展示图标、名称、介绍与管理操作。 */
   function renderCodexPlusExtensionsDetail() {
     const detail = codexPlusExtensionsSelectionDetail();
     if (!detail) {
-      return `<div class="codex-plus-extensions-detail-empty">从左侧选择一个拓展查看详情。</div>`;
+      codexPlusExtensionsSelected = null;
+      return renderCodexPlusExtensionsOverview();
     }
     const { sel, local, marketItem } = detail;
     const name = marketItem?.name || local?.name || sel.key;
     const version = marketItem?.version || local?.version || "";
     const author = marketItem?.author || "";
-    const description = marketItem?.description || "";
+    const description = marketItem?.description || local?.description || "";
     const tags = marketItem?.tags || [];
     const requirements = marketItem?.requirements || [];
     const limitations = marketItem?.limitations || [];
@@ -4883,7 +5078,7 @@
     const isInstalled = sel.kind === "installed";
     const updateAvailable = isInstalled && marketItem && version && local?.version && local.version !== version;
 
-    // 头部：图标 + 名称 + 发布者/版本行，操作按钮靠右。对齐 VSCode 扩展编辑器的头部。
+    // 详情沿用列表的内容宽度，管理操作保持独立。
     const publisherLine = [
       author ? escapeHtml(author) : "",
       version ? `v${escapeHtml(version)}` : "",
@@ -4893,7 +5088,7 @@
     const actions = [];
     if (isInstalled) {
       actions.push(`
-        <button type="button" class="codex-plus-toggle" data-codex-user-script-key="${escapeHtml(local?.key || "")}" data-enabled="${String(!!local?.enabled)}"><span></span></button>
+        <button type="button" class="codex-plus-toggle" data-codex-user-script-key="${escapeHtml(local?.key || "")}" data-enabled="${String(!!local?.enabled)}" role="switch" aria-checked="${String(!!local?.enabled)}" aria-label="启用 ${escapeHtml(name)}"><span></span></button>
       `);
       // 内置脚本在只读目录里，删不掉；只给用户目录的脚本提供卸载。
       if (local?.source === "user") {
@@ -4903,12 +5098,13 @@
       actions.push(`<button type="button" class="codex-plus-extensions-detail-button codex-plus-extensions-detail-primary" data-codex-market-install="${escapeHtml(marketItem.id)}">安装</button>`);
     }
 
-    // VSCode 的详情正文是「标题 + 正文」的滚动区，这里用同样的分区结构。
+    // 使用要求与限制保留为独立正文分区。
     const list = (title, items) => items.length
       ? `<div class="codex-plus-extensions-detail-section"><div class="codex-plus-extensions-detail-section-title">${escapeHtml(title)}</div><ul>${items.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul></div>`
       : "";
 
     return `
+      <button type="button" class="codex-plus-extensions-back" data-codex-extensions-browse="${codexPlusExtensionsFilter}" aria-label="返回拓展列表">${codexPlusDiscoveryIcons.back}<span>返回拓展列表</span></button>
       <div class="codex-plus-extensions-detail-head">
         <div class="codex-plus-extensions-detail-icon" aria-hidden="true">${extensionIconMarkup(marketItem?.icon)}</div>
         <div class="codex-plus-extensions-detail-heading">
@@ -4979,6 +5175,11 @@
     content.appendChild(layout);
     layout.appendChild(main);
     main.appendChild(body);
+    if (tab === "home") {
+      // 设置标题和卡片共用居中栏，并随内容滚动，保持原生设置页的阅读节奏。
+      const header = content.querySelector(".codex-plus-modal-header");
+      if (header) body.querySelector(".codex-plus-settings")?.prepend(header);
+    }
   }
 
   /** 页面标题：每个 rail 入口一个名字，和图标栏上的标签保持一致。 */
@@ -5000,7 +5201,7 @@
    * 脚本清单变化后同步左面板。
    *
    * 原来这里还要往「用户脚本」区块的开关与目录文本里写值，那个区块已经删掉，
-   * 脚本列表现在只存在于拓展页左面板，所以只剩刷新这一件事。
+   * 侧栏显示已安装清单，主区列表与详情由 refreshCodexPlusExtensionsView 同步。
    */
   function renderUserScripts() {
     // 左面板也要跟着刷新，否则脚本的启停/状态变化不会反映到列表上。
@@ -5070,6 +5271,10 @@
     } else {
       await loadUserScripts();
     }
+    if (codexPlusExtensionsSelected?.kind === "market" && codexPlusExtensionsSelected.key === id) {
+      const installed = (codexPlusUserScripts.scripts || []).find((script) => script.market_id === id);
+      if (installed) codexPlusExtensionsSelected = { kind: "installed", key: installed.key };
+    }
     if (codexPlusActiveEntry() === "extensions") refreshCodexPlusExtensionsView();
   }
 
@@ -5081,13 +5286,14 @@
    */
   function codexPlusExtensionsEntries() {
     const local = codexPlusUserScripts.scripts || [];
+    const marketById = new Map((codexPlusScriptMarket.scripts || []).map((item) => [item.id, item]));
     const localByMarketId = new Map(
       local.filter((script) => script.market_id).map((script) => [script.market_id, script]),
     );
     const installed = local.map((script) => ({
       kind: "installed",
       key: script.key,
-      name: script.name || script.key,
+      name: marketById.get(script.market_id)?.name || script.name || script.key,
       meta: `${script.source === "builtin" ? "内置" : script.market_id ? "市场" : "用户"} · ${userScriptStatusLabel(script.status)}`,
       enabled: !!script.enabled,
       script,
@@ -5123,13 +5329,14 @@
     if (!query) return entries;
     return entries.filter((entry) => {
       const marketItem = codexPlusExtensionMarketItem(entry);
-      return [entry.name, entry.meta, marketItem?.description, ...(marketItem?.tags || [])]
+      return [entry.name, entry.key, entry.script?.name, entry.meta, marketItem?.description, ...(marketItem?.tags || [])]
         .filter(Boolean)
         .some((text) => String(text).toLowerCase().includes(query));
     });
   }
 
   function selectCodexPlusTab(tab) {
+    closeCodexPlusTypingEffectDropdown();
     // 归一化后再比对：panel 用的是 extensions，而旧调用点仍传 userScripts，
     // 不统一就会两边都对不上、所有 panel 全被隐藏。
     const normalized = codexPlusModalTab(tab);
@@ -5153,6 +5360,7 @@
     if (!overlay) return null;
     const tab = overlay.querySelector(".codex-plus-modal-content")?.dataset?.codexPlusActiveTab;
     if (tab === codexPlusExtensionsTab) return "extensions";
+    if (tab === codexPlusPluginMarketTab) return "plugin-market";
     return "home";
   }
 
@@ -5220,7 +5428,49 @@
     const layoutLeft = zoom === 1 ? left : left / zoom;
     overlay.style.setProperty("--codex-plus-page-left", `${layoutLeft}px`);
     overlay.style.left = `${layoutLeft}px`;
-    overlay.style.top = "0px";
+    // 官方顶部有一条 header（返回/前进/隐藏侧边栏），图标栏与侧边栏都从它的下沿开始。
+    // 我们的 overlay 若从 y=0 铺满就会把整条 header 盖住——用户反馈「比官方少了一条顶部栏」
+    // 就是这个原因。这里同样量图标栏的顶边（而非硬编码高度），让 overlay 从 header 下沿开始。
+    const top = railRect && railRect.height > 0
+      ? Math.max(0, railRect.top)
+      : (rect && rect.height > 0 ? Math.max(0, rect.top) : 0);
+    const layoutTop = zoom === 1 ? top : top / zoom;
+    overlay.style.setProperty("--codex-plus-page-top", `${layoutTop}px`);
+    overlay.style.top = `${layoutTop}px`;
+    // 右侧与下方官方各留了一圈槽：整行的 [data-app-shell-workspace-row] 比视口小
+    // （真机 1715x984 / 视口 1719x988，即右、下各 4px），官方内容面板正好收在行的右下角。
+    // 我们原先 right/bottom 都贴 0，于是比官方多占这 4px。这里量取而不是硬编码 4。
+    const row = document.querySelector("[data-app-shell-workspace-row]");
+    const rowRect = row?.getBoundingClientRect?.();
+    const rightGutter = rowRect && rowRect.width > 0 ? Math.max(0, window.innerWidth - rowRect.right) : 0;
+    const bottomGutter = rowRect && rowRect.height > 0 ? Math.max(0, window.innerHeight - rowRect.bottom) : 0;
+    const layoutRight = zoom === 1 ? rightGutter : rightGutter / zoom;
+    const layoutBottom = zoom === 1 ? bottomGutter : bottomGutter / zoom;
+    overlay.style.setProperty("--codex-plus-page-right", `${layoutRight}px`);
+    overlay.style.setProperty("--codex-plus-page-bottom", `${layoutBottom}px`);
+    overlay.style.right = `${layoutRight}px`;
+    overlay.style.bottom = `${layoutBottom}px`;
+    // 圆角同样量取官方面板自身的值，不写死 12px。
+    // 这里量的是 _PageSurface_：官方那个与我们 overlay 同格子的页面面板（rect 都是
+    // [52, 44, 1663, 940]），它四角同为 12px，左侧那一角也真实可见——真机像素扫描确认
+    // 官方左边缘从 y=44 的 x=62 收到 y=54 的 x=52，是一条完整的弧。
+    // 别改用 main[data-app-shell-main-surface] 的 --app-shell-main-surface-clip-start-radius：
+    // 那个元素左边缘在 362（缩在侧边栏后面），左侧还用 inset 负内缩把圆角裁掉，start 恒为 0，
+    // 会让人误判左侧不该圆——第一版就是这么写错的，用户反馈「少一个圆角」正是缺了左边两个角。
+    // 类名是 CSS Modules 的哈希名，但 _PageSurface_ 这个片段稳定，且不会命中 _PageSurfaceLayout_
+    //（其后紧跟 L 而非 _）。量到的是视觉值，同样折算成布局坐标。读不到就保持 0，不做猜测。
+    const pageSurface = document.querySelector('[class*="_PageSurface_"]');
+    const pageSurfaceStyle = pageSurface ? getComputedStyle(pageSurface) : null;
+    const mainSurfaceStyle = (() => {
+      const main = document.querySelector("main[data-app-shell-main-surface]");
+      return main ? getComputedStyle(main) : null;
+    })();
+    const radius =
+      parseFloat(pageSurfaceStyle?.borderTopLeftRadius || "") ||
+      parseFloat(mainSurfaceStyle?.getPropertyValue("--app-shell-main-surface-clip-end-radius") || "") ||
+      0;
+    const layoutRadius = zoom === 1 ? radius : radius / zoom;
+    overlay.style.setProperty("--codex-plus-page-radius", `${layoutRadius}px`);
   }
 
   function codexPlusHostUsesLightTheme() {
@@ -5312,6 +5562,35 @@
         ["--color-token-dropdown-background", "--color-surface-elevated-secondary", "--color-token-bg-elevated-secondary"],
         light ? "#ffffff" : "#2f2f2f",
       ),
+      // 设置页使用独立 surface，正文背景令牌在部分版本中比原生设置页更深。
+      "--codex-plus-settings-page-bg": read(
+        ["--color-background-surface", "--app-color-background-surface"],
+        light ? "#ffffff" : "#181818",
+      ),
+      "--codex-plus-nav-bg": read(
+        ["--color-token-sidebar-background", "--color-background-sidebar"],
+        light ? "#f7f7f7" : "#1e1e1e",
+      ),
+      "--codex-plus-nav-selected-bg": read(
+        ["--color-token-interactive-bg-secondary-selected", "--color-background-primary-soft-active"],
+        light ? "#e9e9e9" : "#2f2f2f",
+      ),
+      "--codex-plus-settings-card-bg": read(
+        ["--color-background-surface-secondary", "--color-background-surface-raised"],
+        light ? "#f7f7f7" : "#232323",
+      ),
+      "--codex-plus-switch-on": read(
+        ["--color-background-accent-solid", "--color-token-bg-accent"],
+        "#3485ff",
+      ),
+      "--codex-plus-switch-off": read(
+        ["--color-background-switch-off", "--color-background-secondary-solid"],
+        light ? "#dedede" : "#3a3a3a",
+      ),
+      "--codex-plus-switch-thumb": read(
+        ["--color-background-switch-thumb"],
+        "#ffffff",
+      ),
       "--codex-plus-bg-hover": read(
         ["--color-token-interactive-bg-secondary-hover", "--color-background-primary-soft-hover", "--token-list-hover-background"],
         light ? "rgba(0,0,0,.06)" : "rgba(255,255,255,.08)",
@@ -5368,9 +5647,83 @@
     return "home";
   }
 
+  let codexPlusTypingEffectDropdownCleanup = null;
+
+  /** 保留 select 的值与 change 契约，只替换原生系统菜单的呈现。 */
+  function syncCodexPlusTypingEffectDropdown(select) {
+    const overlay = select.closest(".codex-plus-modal-overlay, .codex-plus-page-overlay");
+    const trigger = overlay?.querySelector("[data-codex-plus-typing-effect-trigger]");
+    if (!trigger) return;
+    trigger.disabled = select.disabled;
+    const label = trigger.querySelector("[data-codex-plus-dropdown-label]");
+    if (label) label.textContent = select.selectedOptions[0]?.textContent || "关闭";
+    overlay.querySelectorAll("[data-codex-plus-typing-effect-option]").forEach((option) => {
+      const selected = option.dataset.codexPlusTypingEffectOption === select.value;
+      option.setAttribute("aria-selected", String(selected));
+      option.tabIndex = selected ? 0 : -1;
+    });
+    if (select.disabled) closeCodexPlusTypingEffectDropdown();
+  }
+
+  function closeCodexPlusTypingEffectDropdown(restoreFocus = false) {
+    const menu = document.querySelector("[data-codex-plus-typing-effect-menu]");
+    const trigger = menu?.parentElement?.querySelector("[data-codex-plus-typing-effect-trigger]");
+    if (menu) menu.hidden = true;
+    trigger?.setAttribute("aria-expanded", "false");
+    codexPlusTypingEffectDropdownCleanup?.();
+    codexPlusTypingEffectDropdownCleanup = null;
+    if (restoreFocus && trigger?.isConnected && !trigger.disabled) trigger.focus();
+  }
+
+  function openCodexPlusTypingEffectDropdown(overlay, last = false) {
+    const select = overlay.querySelector("[data-codex-plus-typing-effect]");
+    const trigger = overlay.querySelector("[data-codex-plus-typing-effect-trigger]");
+    const menu = overlay.querySelector("[data-codex-plus-typing-effect-menu]");
+    if (!select || select.disabled || !trigger || !menu) return;
+    closeCodexPlusTypingEffectDropdown();
+    syncCodexPlusTypingEffectDropdown(select);
+    menu.hidden = false;
+    trigger.setAttribute("aria-expanded", "true");
+    // 菜单直接挂 overlay，避开滚动内容的裁剪；坐标换算与页面缩放保持同源。
+    const frame = overlay.getBoundingClientRect();
+    const anchor = trigger.getBoundingClientRect();
+    const zoom = codexPlusWindowZoom();
+    const width = frame.width / zoom;
+    const height = frame.height / zoom;
+    menu.style.maxHeight = `${Math.max(0, height - 16)}px`;
+    const left = (anchor.right - frame.left) / zoom - menu.offsetWidth;
+    const below = (anchor.bottom - frame.top) / zoom + 4;
+    const above = (anchor.top - frame.top) / zoom - menu.offsetHeight - 4;
+    const top = below + menu.offsetHeight > height - 8 && above >= 8 ? above : below;
+    menu.style.left = `${Math.max(8, Math.min(left, width - menu.offsetWidth - 8))}px`;
+    menu.style.top = `${Math.max(8, Math.min(top, height - menu.offsetHeight - 8))}px`;
+    const options = Array.from(menu.querySelectorAll("[role=option]"));
+    const focused = last ? options[options.length - 1] : options.find((option) => option.getAttribute("aria-selected") === "true") || options[0];
+    focused?.focus({ preventScroll: true });
+    const controller = new AbortController();
+    const close = () => closeCodexPlusTypingEffectDropdown();
+    document.addEventListener("pointerdown", (event) => {
+      if (!menu.contains(event.target) && !trigger.contains(event.target)) close();
+    }, { capture: true, signal: controller.signal });
+    overlay.addEventListener("scroll", (event) => {
+      if (!menu.contains(event.target)) close();
+    }, { capture: true, signal: controller.signal });
+    window.addEventListener("resize", close, { signal: controller.signal });
+    window.addEventListener("blur", close, { signal: controller.signal });
+    const observer = new MutationObserver(() => {
+      if (!overlay.isConnected) close();
+    });
+    observer.observe(document.body, { childList: true });
+    codexPlusTypingEffectDropdownCleanup = () => {
+      controller.abort();
+      observer.disconnect();
+    };
+  }
+
   function openCodexPlusModal(options = {}) {
     const pageMode = options.page === true;
     const initialTab = codexPlusModalTab(options.tab);
+    closeCodexPlusTypingEffectDropdown();
     document.querySelectorAll(".codex-plus-modal-overlay").forEach((node) => node.remove());
     document.querySelectorAll(`.${codexPlusPageClass}, [data-codex-plus-dialog="true"]`).forEach((node) => node.remove());
     const overlay = document.createElement("div");
@@ -5380,6 +5733,7 @@
     // 跟随 Codex 的界面缩放。必须在写 innerHTML 之前设好，否则内部那些
     // calc(100% / var(--codex-plus-zoom-inverse)) 会先按 1 算一遍再被 zoom 放大。
     applyCodexPlusZoom(overlay);
+    // 下拉箭头与勾选图标使用已安装的 Lucide ChevronDown / Check（ISC）路径。
     overlay.innerHTML = `
       <div class="codex-plus-modal-content" role="dialog" aria-modal="true" aria-label="Codex++">
         <div class="codex-plus-modal-header">
@@ -5387,124 +5741,180 @@
           ${pageMode ? "" : `<button type="button" class="codex-plus-modal-close" aria-label="关闭">×</button>`}
         </div>
         <div class="codex-plus-modal-body">
-          <div class="codex-plus-panel" data-codex-plus-panel="home">
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">后端连接</div><div class="codex-plus-row-description">每 5 秒检查一次 launcher 后端状态。</div></div>
-              <div class="codex-plus-backend-status">
-                <div class="codex-plus-backend-label" data-codex-backend-status="true" data-status="checking">正在检查后端…</div>
-              </div>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">Codex增强</div><div class="codex-plus-row-description">关闭后停用删除、导出、插件相关和菜单位置增强。</div></div>
-              <button type="button" class="codex-plus-toggle" data-codex-backend-setting="enhancementsEnabled"><span></span></button>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">插件市场解锁</div><div class="codex-plus-row-description">${codexPlusBackendSettings.launchMode === "relay" ? "兼容增强模式下无需开启；ChatGPT 登录态会保留官方插件市场。" : "API Key 模式下扩展插件市场请求，尽量显示完整插件列表。"}</div></div>
-              <button type="button" class="codex-plus-toggle" data-codex-plus-setting="pluginMarketplaceUnlock" ${codexPlusBackendSettings.launchMode === "relay" ? 'disabled data-relay-unneeded="true"' : ""}><span></span></button>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">模型白名单解锁</div><div class="codex-plus-row-description">从环境变量和 Codex config.toml 中的中转站 /v1/models 拉取模型，并补进模型选择列表。</div></div>
-              <button type="button" class="codex-plus-toggle" data-codex-plus-setting="modelWhitelistUnlock"><span></span></button>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">Fast 按钮</div><div class="codex-plus-row-description">显示服务模式切换按钮；Fast 仅支持 ${codexServiceTierFastModelListLabel()}，其他模型按 Standard 发送。</div></div>
-              <button type="button" class="codex-plus-toggle" data-codex-plus-setting="serviceTierControls"><span></span></button>
-            </div>
-            ${codexPlusIsWindowsPlatform ? `<div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">桌宠跟随真实鼠标</div><div class="codex-plus-row-description">仅支持 V2 桌宠；不会修改宠物文件。将 V2 的 Computer Use 光标朝向动作映射到真实鼠标，V1 开启后安全不生效；拖拽、原生悬停或 Computer Use 活跃时自动让步。</div></div>
-              <button type="button" class="codex-plus-toggle" data-codex-plus-setting="petRealMouseLook"><span></span></button>
-            </div>` : ""}
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">悬浮球 · Stepwise</div><div class="codex-plus-row-description">生成下一步建议。</div></div>
-              <button type="button" class="codex-plus-toggle" data-codex-plus-setting="stepwise"><span></span></button>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">悬浮球 · 回答大纲</div><div class="codex-plus-row-description">整理回答结构。</div></div>
-              <button type="button" class="codex-plus-toggle" data-codex-plus-setting="answerOutline"><span></span></button>
-            </div>
-            <div class="codex-plus-row" data-codex-service-tier-controls="true">
-              <div><div class="codex-plus-row-title">服务模式</div><div class="codex-plus-row-description">继承优先读取 Codex 应用内设置，其次读取 config.toml 的 service_tier；全局模式覆盖全部 thread；自定义允许按 thread 覆盖。</div></div>
-              <div class="codex-plus-service-tier-control">
-                <div class="codex-plus-service-tier-status" data-codex-service-tier-status="true" data-status="loading">正在读取…</div>
-                <div class="codex-plus-service-tier-actions">
-                  <button type="button" class="codex-plus-service-tier-button" data-codex-service-tier-inherit="true">继承</button>
-                  <button type="button" class="codex-plus-service-tier-button" data-codex-service-tier-standard="true">全局 Standard</button>
-                  <button type="button" class="codex-plus-service-tier-button" data-codex-service-tier-fast="true">全局 Fast</button>
-                  <button type="button" class="codex-plus-service-tier-button" data-codex-service-tier-custom="true">自定义</button>
+          <div class="codex-plus-panel codex-plus-settings" data-codex-plus-panel="home">
+            <section class="codex-plus-settings-section" aria-label="常规">
+              <h2 class="codex-plus-settings-section-title">常规</h2>
+              <div class="codex-plus-settings-card">
+                <div class="codex-plus-row">
+                  <div><div class="codex-plus-row-title">后端连接</div><div class="codex-plus-row-description">每 5 秒检查一次 launcher 后端状态。</div></div>
+                  <div class="codex-plus-backend-status">
+                    <div class="codex-plus-backend-label" data-codex-backend-status="true" data-status="checking">正在检查后端…</div>
+                  </div>
                 </div>
-                <div class="codex-plus-service-tier-actions codex-plus-service-tier-thread-actions">
-                  <span class="codex-plus-service-tier-thread-label">当前 thread 覆盖</span>
-                  <button type="button" class="codex-plus-service-tier-button" data-codex-service-tier-thread-inherit="true" title="当前 thread 不单独覆盖，继承 Codex 默认设置">继承</button>
-                  <button type="button" class="codex-plus-service-tier-button" data-codex-service-tier-thread-standard="true" title="仅当前 thread 使用 Standard，并切到自定义模式">Standard</button>
-                  <button type="button" class="codex-plus-service-tier-button" data-codex-service-tier-thread-fast="true" title="仅当前 thread 使用 Fast，并切到自定义模式">Fast</button>
+                <div class="codex-plus-row">
+                  <div><div class="codex-plus-row-title">Codex增强</div><div class="codex-plus-row-description">关闭后停用删除、导出、插件相关和菜单位置增强。</div></div>
+                  <button type="button" class="codex-plus-toggle" data-codex-backend-setting="enhancementsEnabled"><span></span></button>
+                </div>
+                <div class="codex-plus-row">
+                  <div><div class="codex-plus-row-title">插件市场解锁</div><div class="codex-plus-row-description">扩展插件市场请求，尽量显示完整插件列表。</div></div>
+                  <button type="button" class="codex-plus-toggle" data-codex-plus-setting="pluginMarketplaceUnlock"><span></span></button>
+                </div>
+                <div class="codex-plus-row">
+                  <div><div class="codex-plus-row-title">模型白名单解锁</div><div class="codex-plus-row-description">从环境变量和 Codex config.toml 中的中转站 /v1/models 拉取模型，并补进模型选择列表。</div></div>
+                  <button type="button" class="codex-plus-toggle" data-codex-plus-setting="modelWhitelistUnlock"><span></span></button>
                 </div>
               </div>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">会话删除</div><div class="codex-plus-row-description">在会话列表悬停显示删除按钮，并支持撤销。</div></div>
-              <button type="button" class="codex-plus-toggle" data-codex-plus-setting="sessionDelete"><span></span></button>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">Markdown 导出</div><div class="codex-plus-row-description">在会话列表显示导出按钮，按本地 rollout 导出带时间戳的 Markdown。</div></div>
-              <button type="button" class="codex-plus-toggle" data-codex-plus-setting="markdownExport"><span></span></button>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">粘贴修复</div><div class="codex-plus-row-description">从 Word 等富文本来源粘贴到 Codex composer 时只保留纯文本，避免被识别为图片/文件附件。需重启 Codex 才生效。</div></div>
-              <button type="button" class="codex-plus-toggle" data-codex-plus-setting="pasteFix"><span></span></button>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">会话 ID 标识</div><div class="codex-plus-row-description">在侧边栏会话标题前显示短 ID 和 UUIDv7 创建时间，方便定位历史会话。</div></div>
-              <button type="button" class="codex-plus-toggle" data-codex-plus-setting="threadIdBadge"><span></span></button>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">对话居中宽度</div><div class="codex-plus-row-description">开启后把主对话和输入框限制到固定最大宽度，适合大屏阅读。</div></div>
-              <div class="codex-plus-width-control">
-                <input class="codex-plus-width-input" data-codex-plus-conversation-view-width="true" min="${conversationViewMinWidth}" max="${conversationViewMaxAllowedWidth}" step="10" type="number" value="${conversationViewWidth()}">
-                <button type="button" class="codex-plus-toggle" data-codex-plus-setting="conversationView"><span></span></button>
+            </section>
+            <section class="codex-plus-settings-section" aria-label="模型与服务">
+              <h2 class="codex-plus-settings-section-title">模型与服务</h2>
+              <div class="codex-plus-settings-card">
+                <div class="codex-plus-row">
+                  <div><div class="codex-plus-row-title">Fast 按钮</div><div class="codex-plus-row-description">显示服务模式切换按钮；Fast 仅支持 ${codexServiceTierFastModelListLabel()}，其他模型按 Standard 发送。</div></div>
+                  <button type="button" class="codex-plus-toggle" data-codex-plus-setting="serviceTierControls"><span></span></button>
+                </div>
+                <div class="codex-plus-row" data-codex-service-tier-controls="true">
+                  <div><div class="codex-plus-row-title">服务模式</div><div class="codex-plus-row-description">继承优先读取 Codex 应用内设置，其次读取 config.toml 的 service_tier；全局模式覆盖全部 thread；自定义允许按 thread 覆盖。</div></div>
+                  <div class="codex-plus-service-tier-control">
+                    <div class="codex-plus-service-tier-status" data-codex-service-tier-status="true" data-status="loading">正在读取…</div>
+                    <div class="codex-plus-service-tier-actions">
+                      <button type="button" class="codex-plus-service-tier-button" data-codex-service-tier-inherit="true">继承</button>
+                      <button type="button" class="codex-plus-service-tier-button" data-codex-service-tier-standard="true">全局 Standard</button>
+                      <button type="button" class="codex-plus-service-tier-button" data-codex-service-tier-fast="true">全局 Fast</button>
+                      <button type="button" class="codex-plus-service-tier-button" data-codex-service-tier-custom="true">自定义</button>
+                    </div>
+                    <div class="codex-plus-service-tier-actions codex-plus-service-tier-thread-actions">
+                      <span class="codex-plus-service-tier-thread-label">当前 thread 覆盖</span>
+                      <button type="button" class="codex-plus-service-tier-button" data-codex-service-tier-thread-inherit="true" title="当前 thread 不单独覆盖，继承 Codex 默认设置">继承</button>
+                      <button type="button" class="codex-plus-service-tier-button" data-codex-service-tier-thread-standard="true" title="仅当前 thread 使用 Standard，并切到自定义模式">Standard</button>
+                      <button type="button" class="codex-plus-service-tier-button" data-codex-service-tier-thread-fast="true" title="仅当前 thread 使用 Fast，并切到自定义模式">Fast</button>
+                    </div>
+                  </div>
+                </div>
               </div>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">切换对话保留位置</div><div class="codex-plus-row-description">开启后在不同 thread 之间切换时恢复到上一次浏览位置，不再自动跳到底部。</div></div>
-              <button type="button" class="codex-plus-toggle" data-codex-plus-setting="threadScrollRestore"><span></span></button>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">Zed Remote open</div><div class="codex-plus-row-description">Open supported remote SSH file references in Zed without patching Codex.app.</div></div>
-              <button type="button" class="codex-plus-toggle" data-codex-plus-setting="zedRemoteOpen"><span></span></button>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">Upstream worktree</div><div class="codex-plus-row-description">Create a Git worktree from a fresh upstream branch, equivalent to git worktree add -b branch path upstream/base.</div></div>
-              <div class="codex-plus-worktree-actions">
-                <button type="button" class="codex-plus-action-button" data-codex-upstream-worktree-open="true">创建</button>
-                <button type="button" class="codex-plus-toggle" data-codex-plus-setting="upstreamWorktreeCreate"><span></span></button>
+            </section>
+            <section class="codex-plus-settings-section" aria-label="对话与输入">
+              <h2 class="codex-plus-settings-section-title">对话与输入</h2>
+              <div class="codex-plus-settings-card">
+                <div class="codex-plus-row">
+                  <div><div class="codex-plus-row-title">悬浮球 · 下一步建议</div><div class="codex-plus-row-description">生成下一步建议。</div></div>
+                  <button type="button" class="codex-plus-toggle" data-codex-plus-setting="stepwise"><span></span></button>
+                </div>
+                <div class="codex-plus-row">
+                  <div><div class="codex-plus-row-title">悬浮球 · 回答大纲</div><div class="codex-plus-row-description">整理回答结构。</div></div>
+                  <button type="button" class="codex-plus-toggle" data-codex-plus-setting="answerOutline"><span></span></button>
+                </div>
+                <div class="codex-plus-row">
+                  <div><div class="codex-plus-row-title">会话删除</div><div class="codex-plus-row-description">在会话列表悬停显示删除按钮，并支持撤销。</div></div>
+                  <button type="button" class="codex-plus-toggle" data-codex-plus-setting="sessionDelete"><span></span></button>
+                </div>
+                <div class="codex-plus-row">
+                  <div><div class="codex-plus-row-title">Markdown 导出</div><div class="codex-plus-row-description">在会话列表显示导出按钮，按本地 rollout 导出带时间戳的 Markdown。</div></div>
+                  <button type="button" class="codex-plus-toggle" data-codex-plus-setting="markdownExport"><span></span></button>
+                </div>
+                <div class="codex-plus-row">
+                  <div><div class="codex-plus-row-title">分享会话按钮</div><div class="codex-plus-row-description">在当前会话工具栏显示分享按钮，关闭后立即隐藏。</div></div>
+                  <button type="button" class="codex-plus-toggle" data-codex-plus-setting="sessionShare"><span></span></button>
+                </div>
+                <div class="codex-plus-row">
+                  <div><div class="codex-plus-row-title">粘贴修复</div><div class="codex-plus-row-description">从 Word 等富文本来源粘贴到 Codex composer 时只保留纯文本，避免被识别为图片/文件附件。需重启 Codex 才生效。</div></div>
+                  <button type="button" class="codex-plus-toggle" data-codex-plus-setting="pasteFix"><span></span></button>
+                </div>
               </div>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">历史会话修复</div><div class="codex-plus-row-description">切换官方登录、混合 API 或纯 API 后，让旧对话重新显示在当前模式下。</div></div>
-              <button type="button" class="codex-plus-toggle" data-codex-backend-setting="providerSyncEnabled"><span></span></button>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">页面增强模式</div><div class="codex-plus-row-description">${codexPlusBackendSettings.launchMode === "relay" ? "兼容增强：保留会话删除、导出和用户拓展，仅关闭插件市场相关增强。" : "完整增强：加载插件市场、会话管理等全部页面能力。"}</div></div>
-              <button type="button" class="codex-plus-action-button" data-codex-open-manager="true">打开管理工具</button>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">打开 DevTools</div><div class="codex-plus-row-description">打开当前 Codex 页面开发者工具，方便查看用户拓展报错。</div></div>
-              <button type="button" class="codex-plus-action-button" data-codex-open-devtools="true">打开 DevTools</button>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">关于 Codex++</div><div class="codex-plus-about">Codex++ 是通过外部 launcher 注入的增强菜单，不修改 Codex App 原始安装文件。<br>Build: <span data-codex-plus-build="true">${codexPlusBuild}</span><br>仓库: <a href="https://github.com/chenchen-777/CodexPlusPlus" target="_blank" rel="noreferrer">chenchen-777/CodexPlusPlus</a></div></div>
-            </div>
-            <div class="codex-plus-row">
-              <div><div class="codex-plus-row-title">项目仓库</div><div class="codex-plus-row-description">打开 Codex++ 777 定制仓库。</div></div>
-              <button type="button" class="codex-plus-issue-button" data-codex-plus-issue="true">打开仓库</button>
-            </div>
+            </section>
+            <section class="codex-plus-settings-section" aria-label="外观与布局">
+              <h2 class="codex-plus-settings-section-title">外观与布局</h2>
+              <div class="codex-plus-settings-card">
+                ${codexPlusIsWindowsPlatform ? `<div class="codex-plus-row">
+                  <div><div class="codex-plus-row-title">桌宠跟随真实鼠标</div><div class="codex-plus-row-description">仅支持 V2 桌宠；不会修改宠物文件。将 V2 的 Computer Use 光标朝向动作映射到真实鼠标，V1 开启后安全不生效；拖拽、原生悬停或 Computer Use 活跃时自动让步。</div></div>
+                  <button type="button" class="codex-plus-toggle" data-codex-plus-setting="petRealMouseLook"><span></span></button>
+                </div>` : ""}
+                <div class="codex-plus-row">
+                  <div><div class="codex-plus-row-title">打字特效（彩虹 P）</div><div class="codex-plus-row-description">在输入框的光标附近显示彩虹粒子、烟花或星光。系统减少动态效果时暂停。</div></div>
+                  <select class="codex-plus-typing-effect-select" data-codex-plus-typing-effect="true" aria-label="打字特效（彩虹 P）" hidden aria-hidden="true" tabindex="-1">
+                    <option value="off">关闭</option>
+                    <option value="rainbow">彩虹粒子</option>
+                    <option value="fireworks">烟花</option>
+                    <option value="stars">星光</option>
+                  </select>
+                  <button type="button" class="codex-plus-dropdown-trigger" data-codex-plus-typing-effect-trigger="true" aria-label="打字特效（彩虹 P）" aria-haspopup="listbox" aria-expanded="false" aria-controls="codex-plus-typing-effect-menu">
+                    <span data-codex-plus-dropdown-label="true">关闭</span>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+                  </button>
+                </div>
+                <div class="codex-plus-row">
+                  <div><div class="codex-plus-row-title">会话 ID 标识</div><div class="codex-plus-row-description">在侧边栏会话标题前显示短 ID 和 UUIDv7 创建时间，方便定位历史会话。</div></div>
+                  <button type="button" class="codex-plus-toggle" data-codex-plus-setting="threadIdBadge"><span></span></button>
+                </div>
+                <div class="codex-plus-row">
+                  <div><div class="codex-plus-row-title">对话居中宽度</div><div class="codex-plus-row-description">开启后把主对话和输入框限制到固定最大宽度，适合大屏阅读。</div></div>
+                  <div class="codex-plus-width-control">
+                    <input class="codex-plus-width-input" data-codex-plus-conversation-view-width="true" min="${conversationViewMinWidth}" max="${conversationViewMaxAllowedWidth}" step="10" type="number" value="${conversationViewWidth()}">
+                    <button type="button" class="codex-plus-toggle" data-codex-plus-setting="conversationView"><span></span></button>
+                  </div>
+                </div>
+                <div class="codex-plus-row">
+                  <div><div class="codex-plus-row-title">切换对话保留位置</div><div class="codex-plus-row-description">开启后在不同 thread 之间切换时恢复到上一次浏览位置，不再自动跳到底部。</div></div>
+                  <button type="button" class="codex-plus-toggle" data-codex-plus-setting="threadScrollRestore"><span></span></button>
+                </div>
+                <div class="codex-plus-row">
+                  <div><div class="codex-plus-row-title">Codex 用量挂件</div><div class="codex-plus-row-description">显示当前 Codex 会话用量、任务状态与可用的供应商余额。可拖动、上传角色图片和设置提醒；默认静音。</div></div>
+                  <button type="button" class="codex-plus-toggle" data-codex-plus-setting="whaleWidget"><span></span></button>
+                </div>
+              </div>
+            </section>
+            <section class="codex-plus-settings-section" aria-label="工具与关于">
+              <h2 class="codex-plus-settings-section-title">工具与关于</h2>
+              <div class="codex-plus-settings-card">
+                <div class="codex-plus-row">
+                  <div><div class="codex-plus-row-title">历史会话修复</div><div class="codex-plus-row-description">切换官方登录、混合 API 或纯 API 后，让旧对话重新显示在当前模式下。</div></div>
+                  <button type="button" class="codex-plus-toggle" data-codex-backend-setting="providerSyncEnabled"><span></span></button>
+                </div>
+                <div class="codex-plus-row">
+                  <div><div class="codex-plus-row-title">管理工具</div><div class="codex-plus-row-description">配置增强功能、模型和语音服务。</div></div>
+                  <button type="button" class="codex-plus-action-button" data-codex-open-manager="true">打开管理工具</button>
+                </div>
+                <div class="codex-plus-row">
+                  <div><div class="codex-plus-row-title">打开 DevTools</div><div class="codex-plus-row-description">打开当前 Codex 页面开发者工具，方便查看用户拓展报错。</div></div>
+                  <button type="button" class="codex-plus-action-button" data-codex-open-devtools="true">打开 DevTools</button>
+                </div>
+                <div class="codex-plus-row">
+                  <div><div class="codex-plus-row-title">关于 Codex++</div><div class="codex-plus-about">Codex++ 是通过外部 launcher 注入的增强菜单，不修改 Codex App 原始安装文件。<br>Build: <span data-codex-plus-build="true">${codexPlusBuild}</span><br>仓库: <a href="https://github.com/chenchen-777/CodexPlusPlus" target="_blank" rel="noreferrer">chenchen-777/CodexPlusPlus</a></div></div>
+                </div>
+                <div class="codex-plus-row">
+                  <div><div class="codex-plus-row-title">提出问题</div><div class="codex-plus-row-description">打开 GitHub Issues 反馈问题或建议。</div></div>
+                  <button type="button" class="codex-plus-issue-button" data-codex-plus-issue="true">提出问题</button>
+                </div>
+              </div>
+            </section>
             ${renderCodexPlusExtensionMenuRows()}
           </div>
           <div class="codex-plus-panel" data-codex-plus-panel="${codexPlusExtensionsTab}" hidden>
-            <div class="codex-plus-extensions-detail" data-codex-plus-extensions-detail="true">${pageMode ? renderCodexPlusExtensionsDetail() : ""}</div>
+            <div class="codex-plus-discovery codex-plus-extensions-page">
+              <div class="codex-plus-discovery-header">
+                <div><h1 class="codex-plus-discovery-title">拓展</h1><p class="codex-plus-discovery-description">为 Codex 添加更多增强功能。</p></div>
+                <div class="codex-plus-discovery-toolbar">
+                  <label class="codex-plus-discovery-search">${codexPlusDiscoveryIcons.search}<input type="search" data-codex-extensions-search="true" aria-label="搜索拓展" placeholder="搜索拓展" value="${escapeHtml(codexPlusExtensionsQuery)}" spellcheck="false" /></label>
+                  <button type="button" class="codex-plus-discovery-icon-button" data-codex-market-refresh="true" title="刷新拓展" aria-label="刷新拓展">${codexPlusDiscoveryIcons.refresh}</button>
+                </div>
+              </div>
+              <div class="codex-plus-extensions-detail" data-codex-plus-extensions-detail="true">${renderCodexPlusExtensionsDetail()}</div>
+            </div>
           </div>
         </div>
       </div>
+      <div id="codex-plus-typing-effect-menu" class="codex-plus-dropdown-menu" data-codex-plus-typing-effect-menu="true" role="listbox" aria-label="打字特效（彩虹 P）" hidden>
+        ${[["off", "关闭"], ["rainbow", "彩虹粒子"], ["fireworks", "烟花"], ["stars", "星光"]].map(([value, label]) => `
+          <button type="button" class="codex-plus-dropdown-option" data-codex-plus-typing-effect-option="${value}" role="option" aria-selected="false" tabindex="-1">
+            <span>${label}</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
+          </button>
+        `).join("")}
+      </div>
     `;
+    overlay.querySelectorAll(".codex-plus-toggle[data-codex-plus-setting], .codex-plus-toggle[data-codex-backend-setting]").forEach((button) => {
+      button.setAttribute("role", "switch");
+      button.setAttribute("aria-checked", "false");
+      button.setAttribute("aria-label", button.closest(".codex-plus-row")?.querySelector(".codex-plus-row-title")?.textContent || "设置");
+    });
     const closeButton = overlay.querySelector(".codex-plus-modal-close");
     closeButton?.addEventListener("click", (event) => {
       event.preventDefault();
@@ -5517,16 +5927,8 @@
       const searchInput = target?.closest("[data-codex-extensions-search]");
       if (searchInput) {
         codexPlusExtensionsQuery = searchInput.value;
-        // 只重绘列表，不重建输入框本身，否则每敲一个字就丢焦点。
-        const body = document.querySelector("[data-codex-plus-page-nav-body]");
-        if (body) {
-          body.innerHTML = renderCodexPlusExtensionsNav();
-          const next = body.querySelector("[data-codex-extensions-search]");
-          if (next) {
-            next.focus();
-            next.setSelectionRange(next.value.length, next.value.length);
-          }
-        }
+        codexPlusExtensionsSelected = null;
+        refreshCodexPlusExtensionsView();
         return;
       }
       const widthInput = target?.closest("[data-codex-plus-conversation-view-width]");
@@ -5534,6 +5936,13 @@
     }, true);
     overlay.addEventListener("change", (event) => {
       const target = event.target instanceof Element ? event.target : event.target?.parentElement;
+      const typingEffectSelect = target?.closest("[data-codex-plus-typing-effect]");
+      if (typingEffectSelect) {
+        if (!typingEffectSelect.disabled && ["off", "rainbow", "fireworks", "stars"].includes(typingEffectSelect.value)) {
+          setCodexPlusSetting("typingEffect", typingEffectSelect.value);
+        }
+        return;
+      }
       const widthInput = target?.closest("[data-codex-plus-conversation-view-width]");
       if (widthInput) {
         const width = normalizeConversationViewWidth(widthInput.value);
@@ -5546,6 +5955,33 @@
       // 拓展注册的菜单项。放在最前面是因为它的判定完全基于自己的 data 属性，
       // 与下面那些内置分支不会重叠；万一将来重叠，也应当由拓展优先拿到。
       if (handleCodexPlusExtensionMenuClick(target)) return;
+      const typingEffectTrigger = target?.closest("[data-codex-plus-typing-effect-trigger]");
+      if (typingEffectTrigger) {
+        const menu = overlay.querySelector("[data-codex-plus-typing-effect-menu]");
+        if (menu?.hidden) openCodexPlusTypingEffectDropdown(overlay);
+        else closeCodexPlusTypingEffectDropdown();
+        return;
+      }
+      const typingEffectOption = target?.closest("[data-codex-plus-typing-effect-option]");
+      if (typingEffectOption) {
+        const select = overlay.querySelector("[data-codex-plus-typing-effect]");
+        if (select && !select.disabled) {
+          const value = typingEffectOption.dataset.codexPlusTypingEffectOption;
+          if (select.value !== value) {
+            select.value = value;
+            select.dispatchEvent(new Event("change", { bubbles: true }));
+          }
+        }
+        closeCodexPlusTypingEffectDropdown(true);
+        return;
+      }
+      const extensionsBrowse = target?.closest("[data-codex-extensions-browse]");
+      if (extensionsBrowse) {
+        codexPlusExtensionsFilter = extensionsBrowse.dataset.codexExtensionsBrowse === "installed" ? "installed" : "market";
+        codexPlusExtensionsSelected = null;
+        refreshCodexPlusExtensionsView();
+        return;
+      }
       // 左面板的分组导航（仅拓展页有左面板）。
       const pageNav = target?.closest("[data-codex-plus-page-nav]");
       if (pageNav) {
@@ -5622,14 +6058,7 @@
         const [kind, ...rest] = extensionsSelect.getAttribute("data-codex-extensions-select").split(":");
         codexPlusExtensionsSelected = { kind, key: rest.join(":") };
         refreshCodexPlusExtensionsView();
-        return;
-      }
-      if (target?.closest("[data-codex-upstream-worktree-open]")) {
-        if (!codexPlusSettings().upstreamWorktreeCreate) {
-          showToast("Upstream worktree enhancement is disabled", null);
-          return;
-        }
-        openUpstreamWorktreeDialog();
+        overlay.querySelector(".codex-plus-extensions-back")?.focus({ preventScroll: true });
         return;
       }
       const toggle = target?.closest("[data-codex-plus-setting]");
@@ -5644,6 +6073,32 @@
         const key = backendToggle.getAttribute("data-codex-backend-setting");
         setBackendSetting(key, !codexPlusBackendSettings[key]);
         return;
+      }
+    }, true);
+    overlay.addEventListener("keydown", (event) => {
+      const target = event.target instanceof Element ? event.target : event.target?.parentElement;
+      if (target?.closest("[data-codex-plus-typing-effect-trigger]") && ["ArrowDown", "ArrowUp"].includes(event.key)) {
+        event.preventDefault();
+        openCodexPlusTypingEffectDropdown(overlay, event.key === "ArrowUp");
+        return;
+      }
+      const menu = target?.closest("[data-codex-plus-typing-effect-menu]");
+      if (!menu || menu.hidden) return;
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        closeCodexPlusTypingEffectDropdown(true);
+      } else if (event.key === "Tab") {
+        // 回到触发器后让浏览器处理 Tab，焦点会自然进入下一项而不会停在隐藏菜单里。
+        closeCodexPlusTypingEffectDropdown(true);
+      } else if (["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+        event.preventDefault();
+        const options = Array.from(menu.querySelectorAll("[role=option]"));
+        const current = options.indexOf(document.activeElement);
+        const next = event.key === "Home" ? 0 : event.key === "End" ? options.length - 1
+          : (current + (event.key === "ArrowDown" ? 1 : -1) + options.length) % options.length;
+        options.forEach((option, index) => { option.tabIndex = index === next ? 0 : -1; });
+        options[next]?.focus({ preventScroll: true });
       }
     }, true);
     // 图标加载失败的回退：error 不冒泡，只能捕获阶段委托。
@@ -5675,10 +6130,12 @@
 
   /** 「拓展」页面：从弹窗里拆出来的用户脚本，形态对齐 VSCode 的扩展面板。 */
   function openCodexPlusExtensions() {
+    codexPlusExtensionsSelected = null;
     openCodexPlusModal({ page: true, tab: codexPlusExtensionsTab });
   }
 
   function closeCodexPlusPage() {
+    closeCodexPlusTypingEffectDropdown();
     document.querySelectorAll(`.${codexPlusPageClass}`).forEach((node) => node.remove());
     setCodexPlusSidebarNavActive(false);
   }
@@ -5765,14 +6222,16 @@
     const status = wrapper.querySelector(".codex-plus-sidebar-nav-status");
     if (status) status.dataset.status = codexPlusBackendStatus.status || "checking";
     const active = !!document.querySelector(`.${codexPlusPageClass}`);
-    setCodexPlusSidebarNavActive(active);
+    setCodexPlusSidebarNavActive(active, codexPlusActiveEntry() || "home");
   }
 
   function removeCodexPlusRailNavigation() {
+    [codexPlusRailNavId, codexPlusRailExtensionsId, codexPlusRailPluginMarketId].forEach((id) => document.getElementById(id)?.remove());
   }
 
   function detachCodexPlusSidebarNavigation() {
     document.getElementById(codexPlusSidebarNavId)?.remove();
+    document.getElementById(codexPlusSidebarPluginMarketId)?.remove();
   }
 
   /**
@@ -5828,6 +6287,7 @@
     button.removeAttribute("data-selected");
     button.removeAttribute("aria-current");
     button.setAttribute("aria-label", label);
+    button.setAttribute("title", label);
     button.textContent = "";
     // 原生 rail 按钮是纯图标，没有文字标签，所以只放图标 + 状态点。
     button.innerHTML = `<span class="codex-plus-rail-icon" aria-hidden="true">${iconMarkup}</span>`
@@ -5912,6 +6372,9 @@
 
   /** 图标栏存在时走它，否则回退到旧版宽面板侧边栏入口。两条路径互斥，不会重复出现。 */
   function installCodexPlusNavigationEntries() {
+    // 插件入口沿用原生按钮，清理旧注入留下的重复商店入口。
+    document.getElementById(codexPlusRailPluginMarketId)?.remove();
+    document.getElementById(codexPlusSidebarPluginMarketId)?.remove();
     if (installCodexPlusRailNavigation()) {
       detachCodexPlusSidebarNavigation();
       return;
@@ -5997,16 +6460,20 @@
     if (name === "openai-curated") return "OpenAI插件2(Codex++)";
     if (name === "openai-primary-runtime") return "OpenAI插件3(Codex++)";
     if (name === "openai-api-curated") return "OpenAI插件4(Codex++)";
-    // 内置插件包的注册名。曾经叫 openai-curated-remote，但那是 codex 的保留名，
-    // 注册在它下面会被静默忽略，已改为 codex-plus-curated；旧名保留以兼容
-    // 尚未升级的配置。
+    // 兼容原生返回的既有旧配置名称；这里不会注入、缓存或注册插件市场。
     if (name === "codex-plus-curated" || name === "openai-curated-remote") return "OpenAI插件5(Codex++)";
     return fallback;
   }
 
   function patchPluginMarketplaceObject(marketplace) {
     if (!marketplace || typeof marketplace !== "object" || marketplace.__codexPlusMarketplaceUnlockPatched) return false;
-    const displayName = displayNameForPluginMarketplaceName(marketplace.name, marketplace.displayName || marketplace.title || marketplace.label || marketplace.name);
+    // 上游已经给了显示名就用上游的（issue #692：此前无条件用上面的中文编号覆盖，
+    // 用户看到的是「OpenAI插件1(Codex++)」而不是市场真实名字）。
+    // 编号映射只在市场上游确实没给显示名时兜底；去重仍走 restorePluginMarketplaceName，
+    // 与显示名无关，所以不会因此退回重复条目。
+    const upstreamDisplayName = marketplace.displayName || marketplace.title || marketplace.label || "";
+    const displayName = upstreamDisplayName
+      || displayNameForPluginMarketplaceName(marketplace.name, marketplace.name);
     if (!displayName || displayName === marketplace.name) return false;
     marketplace.displayName = displayName;
     marketplace.title = displayName;
@@ -6024,92 +6491,6 @@
     }
     marketplace.__codexPlusMarketplaceUnlockPatched = true;
     return true;
-  }
-
-  function cloneCodexPluginMarketplace(value) {
-    if (!value || typeof value !== "object") return null;
-    try {
-      return JSON.parse(JSON.stringify(value));
-    } catch {
-      return null;
-    }
-  }
-
-  function pluginMarketplacePluginKey(plugin) {
-    if (!plugin || typeof plugin !== "object") return "";
-    return String(plugin.name || plugin.id || plugin.pluginName || "").trim();
-  }
-
-  function normalizeLocalPluginMarketplacePlugin(plugin, marketplaceName) {
-    const cloned = cloneCodexPluginMarketplace(plugin);
-    if (!cloned || typeof cloned !== "object") return null;
-    const name = String(cloned.name || cloned.id || cloned.pluginName || "").trim();
-    if (!name) return null;
-    if (!cloned.name) cloned.name = name;
-    if (!cloned.id) cloned.id = `${name}@${marketplaceName}`;
-    if (!cloned.marketplaceName) cloned.marketplaceName = marketplaceName;
-    if (!cloned.marketplacePath) cloned.marketplacePath = marketplaceName;
-    if (!cloned.interface || typeof cloned.interface !== "object") cloned.interface = {};
-    if (!cloned.interface.displayName) cloned.interface.displayName = name;
-    if (!Array.isArray(cloned.keywords)) cloned.keywords = [];
-    return cloned;
-  }
-
-  function mergePluginMarketplacePlugins(target, source) {
-    if (!target || !source || !Array.isArray(source.plugins)) return 0;
-    if (!Array.isArray(target.plugins)) target.plugins = [];
-    const marketplaceName = restorePluginMarketplaceName(target.name || source.name || "");
-    const existing = new Set(target.plugins.map(pluginMarketplacePluginKey).filter(Boolean));
-    let added = 0;
-    source.plugins.forEach((plugin) => {
-      const key = pluginMarketplacePluginKey(plugin);
-      if (!key || existing.has(key)) return;
-      const cloned = normalizeLocalPluginMarketplacePlugin(plugin, marketplaceName);
-      if (!cloned) return;
-      target.plugins.push(cloned);
-      existing.add(key);
-      added += 1;
-    });
-    return added;
-  }
-
-  function mergeLocalPluginMarketplaces(result) {
-    if (!result || typeof result !== "object" || !Array.isArray(result.marketplaces)) {
-      return { addedMarketplaces: 0, addedPlugins: 0 };
-    }
-    const localMarketplaces = Array.isArray(window.__CODEX_PLUS_PLUGIN_MARKETPLACES__)
-      ? window.__CODEX_PLUS_PLUGIN_MARKETPLACES__
-      : [];
-    if (!localMarketplaces.length) return { addedMarketplaces: 0, addedPlugins: 0 };
-    const byName = new Map();
-    result.marketplaces.forEach((marketplace) => {
-      const name = restorePluginMarketplaceName(marketplace?.name || "");
-      if (name) byName.set(name, marketplace);
-    });
-    let addedMarketplaces = 0;
-    let addedPlugins = 0;
-    localMarketplaces.forEach((marketplace) => {
-      const name = restorePluginMarketplaceName(marketplace?.name || "");
-      if (!name) return;
-      const existing = byName.get(name);
-      if (existing) {
-        addedPlugins += mergePluginMarketplacePlugins(existing, marketplace);
-        return;
-      }
-      const cloned = cloneCodexPluginMarketplace(marketplace);
-      if (!cloned) return;
-      cloned.plugins = Array.isArray(cloned.plugins)
-        ? cloned.plugins.map((plugin) => normalizeLocalPluginMarketplacePlugin(plugin, name)).filter(Boolean)
-        : [];
-      result.marketplaces.push(cloned);
-      byName.set(name, cloned);
-      addedMarketplaces += 1;
-      addedPlugins += Array.isArray(cloned.plugins) ? cloned.plugins.length : 0;
-    });
-    if (addedMarketplaces > 0 || addedPlugins > 0) {
-      sendCodexPlusDiagnostic("plugin_marketplace_local_merged", { addedMarketplaces, addedPlugins });
-    }
-    return { addedMarketplaces, addedPlugins };
   }
 
   function restorePluginMarketplaceName(name) {
@@ -6141,19 +6522,42 @@
     return source;
   }
 
+  // 这三种 marketplace 过滤器由 Codex 打包后压缩，标识符每版都会换名
+  // （历史形态: !u(e.marketplaceName)||e.marketplaceName===r / !ne(...) / !Eu(...) /
+  // 26.928.31416 起: !Mj(e.marketplaceName)||e.marketplaceName===n）。
+  // 所以按「结构」而不是按字面量识别，避免每次发版都要补一个新变体。
+  const codexPluginBuildFlavorFilterSourcePattern =
+    /!\s*([A-Za-z_$][\w$]*)\s*\(\s*([A-Za-z_$][\w$]*)\s*\.marketplaceName\s*\)\s*\|\|\s*\2\s*\.marketplaceName\s*===\s*[A-Za-z_$][\w$]*/;
+  // featuredPluginIds 那条：{let t=Gj(e);return t==null||!Mj(t)||t===n}
+  // 入参是 plugin id 字符串（不是对象），先取 marketplace 再判，形态和上面不同，需单独认。
+  // 三个 X 必须同一个标识符，且 `===` 右边是标识符而非调用——否则会误伤 bundle 里
+  // 形如 `t==null||r==null||!ds(r)||r===SFe(t)` 的无关函数（实测存在）。
+  // 右值后面必须紧跟非标识符字符（`(?![\w$(])`），光写 `(?!\s*\()` 会被贪婪回溯绕过：
+  // `===SFe(t)` 里 `SFe` 可退回 `SF`，后面 `e` 不是 `(`，前瞻就放行了。实测踩过。
+  const codexPluginFeaturedFilterSourcePattern =
+    /([A-Za-z_$][\w$]*)\s*==\s*null\s*\|\|\s*!\s*[A-Za-z_$][\w$]*\s*\(\s*\1\s*\)\s*\|\|\s*\1\s*===\s*[A-Za-z_$][\w$]*(?![\w$(])/;
+
   function isCodexPluginBuildFlavorFilter(callback, sample, filtered = null) {
     if (!Array.isArray(sample) || sample.length === 0 || typeof callback !== "function") return false;
     if (!sample.some((plugin) => codexPluginOfficialMarketplaceName(plugin?.marketplaceName))) return false;
     const source = codexPluginFilterCallbackSource(callback);
     if (!source) return false;
-    const isKnownFilterSource = source.includes("!u(e.marketplaceName)||e.marketplaceName===r")
-      || source.includes("!ne(e.marketplaceName)||e.marketplaceName===n")
-      || source.includes("!Eu(e.marketplaceName)||e.marketplaceName===n");
-    if (!isKnownFilterSource) return false;
+    if (!codexPluginBuildFlavorFilterSourcePattern.test(source)) return false;
     return sample.some((plugin) => codexPluginOfficialMarketplaceName(plugin?.marketplaceName)
       && (Array.isArray(filtered) ? !filtered.includes(plugin) : !callback(plugin)));
   }
 
+  // featuredPluginIds 过滤：sample 是字符串数组，回调按 id 反查 marketplace 后剔除官方目录。
+  // 外部拿不到 id→marketplace 的映射，所以这里只做「结构 + 确实过滤掉了元素」的判定。
+  function isCodexPluginFeaturedFilter(callback, sample, filtered = null) {
+    if (!Array.isArray(sample) || sample.length === 0 || typeof callback !== "function") return false;
+    if (!sample.every((id) => typeof id === "string")) return false;
+    const source = codexPluginFilterCallbackSource(callback);
+    if (!source) return false;
+    if (!codexPluginFeaturedFilterSourcePattern.test(source)) return false;
+    if (Array.isArray(filtered) && filtered.length >= sample.length) return false;
+    return true;
+  }
   function pluginAutoExpandVisibleElement(el) {
     if (!(el instanceof HTMLElement) || !el.isConnected) return false;
     const style = getComputedStyle(el);
@@ -6249,20 +6653,26 @@
     clickNext();
   }
 
+  // 结构式匹配 `<arr>.filter(p => !<list>.includes(p.name))`：
+  // list 标识符每版都换名，写死会失效（历史写死过 "!t.includes(e.name)"）。
+  // 必须锚定 filter 箭头形态且箭头参数与 `.name` 的宿主同名，
+  // 否则会误伤 bundle 里 `!w4.includes(t.name)` 这类与插件无关的守卫（实测存在）。
+  const codexPluginHiddenFilterSourcePattern =
+    /filter\s*\(\s*([A-Za-z_$][\w$]*)\s*=>\s*!\s*[A-Za-z_$][\w$]*\s*\.includes\s*\(\s*\1\s*\.name\s*\)/;
+
   function isCodexPluginMarketplaceHiddenFilter(callback, sample, filtered = null) {
     if (!Array.isArray(sample) || sample.length === 0 || typeof callback !== "function") return false;
     if (!sample.some((marketplace) => codexPluginOfficialMarketplaceName(marketplace?.name))) return false;
     const source = codexPluginFilterCallbackSource(callback);
     if (!source) return false;
-    if (!source.includes("!t.includes(e.name)")) return false;
+    if (!codexPluginHiddenFilterSourcePattern.test(source)) return false;
     return sample.some((marketplace) => codexPluginOfficialMarketplaceName(marketplace?.name)
       && (Array.isArray(filtered) ? !filtered.includes(marketplace) : !callback(marketplace)));
   }
 
   function installPluginBuildFlavorFilterPatch() {
     if (window.__codexPluginBuildFlavorFilterPatch === codexPluginMarketplaceUnlockVersion) return;
-    if (pluginPatchDisabledInRelayMode()) return;
-    if (!codexPlusSettings().pluginMarketplaceUnlock) return;
+    if (!codexPluginMarketplacePatchEnabled()) return;
     const originalFilter = Array.prototype.__codexPluginBuildFlavorOriginalFilter || Array.prototype.filter;
     if (!Array.prototype.__codexPluginBuildFlavorOriginalFilter) {
       Object.defineProperty(Array.prototype, "__codexPluginBuildFlavorOriginalFilter", {
@@ -6284,6 +6694,10 @@
       }
       if (isCodexPluginMarketplaceHiddenFilter(callback, this, filtered)) {
         sendCodexPlusDiagnostic("plugin_marketplace_hidden_filter_bypassed", { marketplaceCount: this.length });
+        return Array.from(this);
+      }
+      if (isCodexPluginFeaturedFilter(callback, this, filtered)) {
+        sendCodexPlusDiagnostic("plugin_featured_filter_bypassed", { featuredCount: this.length });
         return Array.from(this);
       }
       return filtered;
@@ -6316,14 +6730,12 @@
     return next;
   }
 
-  function patchPluginMarketplaceResult(method, result, options = {}) {
+  function patchPluginMarketplaceResult(method, result) {
     if (method !== "list-plugins") return result;
-    const mergeLocal = options.mergeLocal !== false;
     let patchedCount = 0;
     try {
       const pluginMarketplaceCounts = {};
       if (Array.isArray(result?.marketplaces)) {
-        if (mergeLocal) mergeLocalPluginMarketplaces(result);
         result.marketplaces.forEach((marketplace) => {
           if (Array.isArray(marketplace?.plugins)) {
             marketplace.plugins.forEach((plugin) => {
@@ -6342,7 +6754,6 @@
             remoteMarketplaceName: marketplace?.remoteMarketplaceName || null,
           })),
           pluginMarketplaceCounts,
-          mergeLocal,
         });
       }
       if (patchedCount > 0) {
@@ -6384,20 +6795,20 @@
     });
   }
 
-  function pluginMarketplaceFallbackResult(mergeLocal = true) {
+  function pluginMarketplaceFallbackResult() {
     return patchPluginMarketplaceResult("list-plugins", {
       marketplaces: [],
       marketplaceLoadErrors: [],
       featuredPluginIds: [],
-    }, { mergeLocal });
+    });
   }
 
   function localPluginMarketplaceFallbackResult() {
-    return pluginMarketplaceFallbackResult(true);
+    return pluginMarketplaceFallbackResult();
   }
 
   function remoteOnlyPluginMarketplaceFallbackResult() {
-    return pluginMarketplaceFallbackResult(false);
+    return pluginMarketplaceFallbackResult();
   }
 
   function patchPluginMarketplaceRequestClient(client) {
@@ -6406,6 +6817,9 @@
     const originalSendRequest = client.__codexPluginMarketplaceOriginalSendRequest || client.sendRequest.bind(client);
     client.__codexPluginMarketplaceOriginalSendRequest = originalSendRequest;
     client.sendRequest = async function codexPluginMarketplacePatchedSendRequest(method, params, options) {
+      const managed = codexPlusPluginNativeInterceptClient(method, params, options,
+        (nextOptions) => originalSendRequest(method, params, nextOptions), client.hostId);
+      if (managed) return await managed;
       const requestMethod = appServerModelRequestMethod(String(method || ""), params);
       const restoredRequestParams = restorePluginMarketplaceRequestParams(params, requestMethod);
       const requestProfile = pluginMarketplaceRequestProfile(restoredRequestParams);
@@ -6424,7 +6838,7 @@
       }
       try {
         const result = await originalSendRequest(method, requestParams, options);
-        return patchPluginMarketplaceResult(requestMethod, result, { mergeLocal: !requestProfile.remoteOnly });
+        return patchPluginMarketplaceResult(requestMethod, result);
       } catch (error) {
         if (requestMethod === "list-plugins" && pluginMarketplaceRemoteAuthError(error)) {
           markPluginMarketplaceRemoteCatalogUnavailable(error);
@@ -6551,9 +6965,8 @@
             result = fallback;
           }
         } else if (result && typeof result === "object") {
-          const patchOptions = { mergeLocal: requestProfile?.remoteOnly !== true };
-          patchPluginMarketplaceResult("list-plugins", result, patchOptions);
-          patchPluginMarketplaceResult("list-plugins", result.data, patchOptions);
+          patchPluginMarketplaceResult("list-plugins", result);
+          patchPluginMarketplaceResult("list-plugins", result.data);
         }
         data.bodyJsonString = JSON.stringify(result);
         return true;
@@ -6590,9 +7003,8 @@
     }
     const result = message?.result;
     if (!result || typeof result !== "object") return false;
-    const patchOptions = { mergeLocal: requestProfile?.remoteOnly !== true };
-    patchPluginMarketplaceResult("list-plugins", result, patchOptions);
-    patchPluginMarketplaceResult("list-plugins", result.data, patchOptions);
+    patchPluginMarketplaceResult("list-plugins", result);
+    patchPluginMarketplaceResult("list-plugins", result.data);
     return true;
   }
 
@@ -6634,9 +7046,10 @@
   }
 
   function installPluginMarketplaceBridgePatch() {
+    ensureCodexPlusPluginNativeTransportReinjection();
     if (window.__codexPluginMarketplaceBridgePatch === codexPluginMarketplaceUnlockVersion) return;
-    if (pluginPatchDisabledInRelayMode()) return;
-    if (!codexPlusSettings().pluginMarketplaceUnlock) return;
+    if (!codexPluginMarketplacePatchEnabled()) return;
+    installCodexPlusPluginNativeTransportListener();
     installPluginMarketplaceWindowEventPatchOnly();
     const bridge = window.electronBridge;
     if (!bridge || typeof bridge.sendMessageFromView !== "function") {
@@ -6646,6 +7059,7 @@
     if (!bridge.__codexPluginMarketplaceOriginalSendMessageFromView) {
       bridge.__codexPluginMarketplaceOriginalSendMessageFromView = bridge.sendMessageFromView.bind(bridge);
       bridge.sendMessageFromView = function codexPluginMarketplacePatchedSendMessageFromView(message) {
+        if (codexPlusPluginNativeInterceptOutgoing(message)) return Promise.resolve();
         let nextMessage = message;
         try {
           nextMessage = patchPluginMarketplaceRequestMessage(message);
@@ -6665,14 +7079,18 @@
 
   function installPluginMarketplaceWindowEventPatchOnly() {
     if (window.__codexPluginMarketplaceWindowEventPatch === codexPluginMarketplaceUnlockVersion) return;
-    if (pluginPatchDisabledInRelayMode()) return;
-    if (!codexPlusSettings().pluginMarketplaceUnlock) return;
+    if (!codexPluginMarketplacePatchEnabled()) return;
     const originalDispatchEvent = window.__codexPluginMarketplaceOriginalDispatchEvent || window.dispatchEvent;
     if (!window.__codexPluginMarketplaceOriginalDispatchEvent) {
       window.__codexPluginMarketplaceOriginalDispatchEvent = originalDispatchEvent;
       window.dispatchEvent = function patchedCodexPluginMarketplaceDispatchEvent(event) {
         try {
           const detail = event?.detail;
+          if (event?.type === "codex-message-from-view" && event.__codexForwardedViaBridge
+              && codexPlusPluginNativeSuppressForwarded(detail)) return true;
+          if (event?.type === "codex-message-from-view" && !event.__codexForwardedViaBridge
+              && codexPlusPluginNativeInterceptOutgoing(detail)) return true;
+          if (event?.type === "message" && codexPlusPluginNativeInterceptIncoming(event.data)) return true;
           if (event?.type === "codex-message-from-view" && detail?.type === "mcp-request") {
             const patched = patchPluginMarketplaceRequestMessage(detail);
             if (patched !== detail) {
@@ -6738,8 +7156,7 @@
 
   function installPluginMarketplaceRequestPatch() {
     if (window.__codexPluginMarketplaceUnlockInstalled === codexPluginMarketplaceUnlockVersion) return;
-    if (pluginPatchDisabledInRelayMode()) return;
-    if (!codexPlusSettings().pluginMarketplaceUnlock) return;
+    if (!codexPluginMarketplacePatchEnabled()) return;
     if (pluginMarketplaceRequestPatchDisabled) return;
     // 上一轮还没跑完就不要再起一轮:loadAppServerRequestCandidates() 会把所有 app asset 拉一遍,
     // 没有这道去重时 scan 的频率直接变成并发 fetch 的频率。
@@ -6781,11 +7198,8 @@
     pluginMarketplaceRequestPatchPromise = patch();
   }
 
-  function pluginPatchDisabledInRelayMode() {
-    return !codexPlusBackendSettingsLoaded || codexPlusBackendSettings.launchMode === "relay";
-  }
-
-  function clearPluginPatchArtifacts() {
+  function codexPluginMarketplacePatchEnabled() {
+    return codexPlusBackendSettingsLoaded && !!codexPlusSettings().pluginMarketplaceUnlock;
   }
 
   let cachedSessionRows = [];
@@ -6872,6 +7286,7 @@
     const href = row.getAttribute("href") || row.querySelector("a")?.getAttribute("href") || "";
     const idMatch = href.match(/(?:session|conversation|thread)[=/:-]([A-Za-z0-9_.-]+)/i) || href.match(/([A-Za-z0-9_-]{8,})$/);
     const codexThreadId = row.getAttribute("data-app-action-sidebar-thread-id") || "";
+    const scopedThread = codexThreadId.match(/^(.+):([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i);
     const fallbackId = row.getAttribute("data-session-id") || row.getAttribute("data-testid") || "";
     const placeholderThreadId = isClientNewThreadId(codexThreadId);
     const hrefId = idMatch && idMatch[1];
@@ -6882,6 +7297,7 @@
     const sessionId = placeholderThreadId
       ? canonicalHrefId || (!hrefIsTemporary ? reactConversationIdFromRow(row) : "")
       : normalizedCodexThreadUuid(codexThreadId)
+        || (scopedThread ? scopedThread[2] : "")
         || canonicalHrefId
         || codexThreadId
         || hrefId
@@ -6889,13 +7305,192 @@
     const titleNode = row.querySelector(`${selectors.threadTitle}, .truncate.select-none, .truncate.text-base`);
     const rawTitle = (titleNode?.textContent || (titleNode ? "" : (row.textContent || "Untitled session")));
     const title = (titleNode ? rawTitle : rawTitle.replace(/\s*(导出|删除|移动|移出项目)(\s*(导出|删除|移动|移出项目))*$/g, "")).trim().slice(0, 160);
-    return { session_id: sessionId, title };
+    return { session_id: sessionId, title, host_id: sessionHostIdFromRow(row, sessionId, scopedThread?.[1]) };
+  }
+
+  function sessionHostIdFromRow(row, sessionId, scopedHost) {
+    return sessionHostEvidenceFromRow(row, sessionId, scopedHost).hostId;
+  }
+
+  function sessionHostEvidenceFromRow(row, sessionId, scopedHost) {
+    const hosts = new Set();
+    let matchingMetadata = 0;
+    let identityConflict = false;
+    const add = (value) => {
+      if (typeof value === "string" && value.trim()) hosts.add(value.trim());
+    };
+    const identity = (value) => {
+      if (typeof value !== "string" || !value.trim()) return null;
+      const raw = value.trim();
+      const scoped = raw.match(/^(.+):([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i);
+      const id = normalizedCodexThreadUuid(raw) || scoped?.[2];
+      return id ? { id: id.toLowerCase(), host: scoped?.[1] } : raw === sessionId ? { id: raw, host: null } : null;
+    };
+    const canonicalWanted = normalizedCodexThreadUuid(sessionId);
+    const wanted = canonicalWanted ? canonicalWanted.toLowerCase() : sessionId || "";
+    const identities = (record) => [record?.conversationId, record?.threadId, record?.id].map(identity).filter(Boolean);
+    const collect = (record) => {
+      if (!record || typeof record !== "object") return;
+      const ownIds = identities(record);
+      const matched = ownIds.some((candidate) => candidate.id === wanted);
+      const nested = [record.threadSummary, record.thread, record.target].filter((value) => value && typeof value === "object");
+      const allIds = [...ownIds, ...nested.flatMap(identities)];
+      if (allIds.some((candidate) => candidate.id === wanted) && allIds.some((candidate) => candidate.id !== wanted)) {
+        identityConflict = true;
+        return;
+      }
+      if (matched) {
+        matchingMetadata += 1;
+        add(record.hostId);
+        ownIds.forEach((candidate) => add(candidate.host));
+        // 26.930 原生 sidebar 行的 {conversationId,hostId,threadSummary}：
+        // hostId ?? threadSummary?.hostId。summary 没有自己的 id 时仍属于这条会话。
+        if (record.threadSummary && !["conversationId", "threadId", "id"].some((key) => typeof record.threadSummary[key] === "string" && record.threadSummary[key].trim())) add(record.threadSummary.hostId);
+      }
+      for (const child of nested) {
+        const childIds = identities(child);
+        if (!childIds.some((candidate) => candidate.id === wanted)) continue;
+        matchingMetadata += 1;
+        add(child.hostId);
+        childIds.forEach((candidate) => add(candidate.host));
+      }
+    };
+    add(row.getAttribute("data-app-action-sidebar-thread-host-id"));
+    const rowIdentity = identity(row.getAttribute("data-app-action-sidebar-thread-id"));
+    if (rowIdentity?.id === wanted) add(scopedHost || rowIdentity.host);
+    // 只接受同一条会话的成对身份。原生 locator 为 {hostId,threadId}，
+    // sidebarThreadRow 为 {hostId,id}；bare UUID 或不相关祖先的 hostId 都不说明归属。
+    const fiberKey = Object.getOwnPropertyNames(row).find((key) => key.startsWith("__reactFiber$"));
+    let fiber = fiberKey ? row[fiberKey] : null;
+    for (let depth = 0; fiber && depth < 16; depth += 1, fiber = fiber.return) {
+      for (const props of [fiber.pendingProps, fiber.memoizedProps, fiber.pendingProps?.children?.props, fiber.memoizedProps?.children?.props]) {
+        collect(props);
+      }
+    }
+    const conflict = identityConflict || hosts.size > 1;
+    return {
+      hostId: !conflict && hosts.size === 1 ? [...hosts][0] : null,
+      reason: conflict ? "conflicting" : hosts.size === 1 ? "resolved" : "unknown",
+      hostCount: hosts.size,
+      matchingMetadata,
+    };
   }
 
   if (window.__CODEX_PLUS_TEST_SESSION_REF__) {
     window.__codexPlusSessionRefTest = {
       fromRow: sessionRefFromRow,
     };
+  }
+
+  // 注册数据跨重注入保留；只存弱引用，不缓存会重建的 sidebar DOM。
+  const codexNativeHostClients = window.__codexPlusNativeHostClients instanceof Map
+    ? window.__codexPlusNativeHostClients
+    : (window.__codexPlusNativeHostClients = new Map());
+  const codexNativeHostClientLimit = 32;
+
+  function bindNativeHostClient(hostId, client, getterBound = false) {
+    if (typeof hostId !== "string" || !hostId.trim() || !client || typeof client.sendRequest !== "function") return false;
+    hostId = hostId.trim();
+    if (typeof client.hostId === "string" && client.hostId !== hostId) return false;
+    if (!getterBound && client.hostId !== hostId) return false;
+    codexNativeHostClients.delete(hostId);
+    codexNativeHostClients.set(hostId, {
+      hostId, getterBound,
+      ref: typeof WeakRef === "function" ? new WeakRef(client) : { deref: () => client },
+    });
+    while (codexNativeHostClients.size > codexNativeHostClientLimit) {
+      codexNativeHostClients.delete(codexNativeHostClients.keys().next().value);
+    }
+    return true;
+  }
+
+  function registerNativeHostClient(client) {
+    try {
+      // 已安装客户端的 RequestClient 构造器把 hostId 绑定到 dispatcher。
+      // 普通 HTTP/IPC duck-type sendRequest 对象不能充当这个删除客户端。
+      if (!Function.prototype.toString.call(client?.constructor).includes(codexAppServerClientCaptureMarker)) return false;
+      return bindNativeHostClient(client.hostId, client);
+    } catch { return false; }
+  }
+
+  function nativeHostClient(hostId) {
+    const entry = codexNativeHostClients.get(hostId);
+    const client = entry?.ref?.deref();
+    // AppScope 的 forHost RPC proxy 每次操作现取，避免跨账号/树重建复用旧 scope。
+    if (entry?.getterBound) return null;
+    if (!client || client.disposed === true || (typeof client.hostId === "string" && client.hostId !== hostId)
+        || (!entry.getterBound && client.hostId !== hostId)) {
+      codexNativeHostClients.delete(hostId);
+      return null;
+    }
+    return client;
+  }
+
+  async function discoverNativeHostClient(ref) {
+    // 原生 DeleteThreadDialog 的实装：getter(scope, hostId).sendRequest("thread/delete", {threadId})。
+    // getter 读取 AppScope 的 manager RPC，再 forHost(hostId)。只接受这个已验证的签名。
+    const module = await loadOptionalCodexAppModule("app-shared-");
+    const values = Object.values(module || {});
+    const getters = values.filter((value) => {
+      if (typeof value !== "function") return false;
+      const source = Function.prototype.toString.call(value);
+      return source.includes("AppServerManager RPC is not connected") && /\.forHost\(/.test(source);
+    });
+    if (!getters.length) return null;
+    for (const row of sessionRows(true)) {
+      const rowRef = sessionRefFromRow(row);
+      if (rowRef.session_id !== ref.session_id || rowRef.host_id !== ref.host_id) continue;
+      const fiberKey = Object.getOwnPropertyNames(row).find((key) => key.startsWith("__reactFiber$"));
+      let fiber = fiberKey ? row[fiberKey] : null;
+      for (let depth = 0; fiber && depth < 16; depth += 1, fiber = fiber.return) {
+        let hook = fiber.memoizedState;
+        for (let index = 0; hook && index < 64; index += 1, hook = hook.next) {
+          const scope = hook.memoizedState?.current;
+          if (!scope || typeof scope.get !== "function" || !values.includes(scope.scope)) continue;
+          for (const getter of getters) {
+            try {
+              const client = getter(scope, ref.host_id);
+              if (bindNativeHostClient(ref.host_id, client, true)) return client;
+            } catch {}
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  function deletePayloadHost(payload) {
+    if (!payload || typeof payload !== "object") return null;
+    const parse = (value) => typeof value === "string" && value.trim() ? value.trim() : null;
+    const snake = parse(payload?.host_id);
+    const camel = parse(payload?.hostId);
+    if (payload && "host_id" in payload && "hostId" in payload && snake !== camel) return null;
+    return snake || camel;
+  }
+
+  async function deleteRemoteSession(ref) {
+    const failed = (message) => ({ status: "failed", session_id: ref.session_id, message, undo_token: null, backup_path: null });
+    if (!ref.host_id || ref.host_id === "local" || !normalizedCodexThreadUuid(ref.session_id)) {
+      return failed("无法安全确定远端会话归属，未进行本地删除");
+    }
+    try {
+      let client = null;
+      try { client = await discoverNativeHostClient(ref); } catch {}
+      client = client || nativeHostClient(ref.host_id);
+      if (!client) return failed("当前未找到对应主机的原生删除客户端；请使用 Codex 原生删除，未进行本地回退");
+      const result = await client.sendRequest("thread/delete", { threadId: ref.session_id });
+      if (result?.error || result?.status === "failed") throw new Error("native deletion failed");
+      // 原生 thread/deleted 通知由同 host manager 清理缓存；这里不碰本地库或伪造 undo。
+      return { status: "server_deleted", session_id: ref.session_id, message: "远端任务及子任务已永久删除，无法撤销", undo_token: null, backup_path: null };
+    } catch {
+      return failed("远端删除结果未确认，未进行本地回退；请先刷新远端状态再决定是否重试");
+    }
+  }
+
+  if (window.__CODEX_PLUS_TEST_SESSION_REF__) {
+    Object.assign(window.__codexPlusSessionRefTest, {
+      registerNativeHostClient, deleteRemoteSession, deletePayloadHost,
+    });
   }
 
   function threadIdBadgeTitleNode(row) {
@@ -6933,25 +7528,31 @@
     };
   }
 
-  function wrapThreadTitleForBadge(row, titleNode) {
-    const parent = titleNode?.parentElement;
-    if (!parent) return null;
-    if (parent.dataset?.codexThreadIdBadgeWrap === "true") return parent;
-    const wrapper = document.createElement("span");
-    wrapper.dataset.codexThreadIdBadgeWrap = "true";
-    parent.insertBefore(wrapper, titleNode);
-    wrapper.appendChild(titleNode);
-    return wrapper;
+  // issue #2180：过去这里把官方 React 管理的标题节点塞进自建的 wrapper 里
+  // （parent.insertBefore(wrapper, titleNode) + wrapper.appendChild(titleNode)）。
+  // 标题节点一旦被搬走，React 的移除链路就会对着自己记录的旧父节点做
+  // removeChild，抛 `NotFoundError: The node to be removed is not a child of this node`。
+  // 新建对话几分钟后标题从临时名转正式名、侧栏重排时正好命中，页面直接进错误页。
+  // 现在不搬动任何 React 节点：徽章作为 titleNode 的**兄弟**插在它前面，
+  // 行的 flex 布局本来就按顺序排（徽章自带 flex:0 0 auto + margin-right）。
+  function threadIdBadgeInsertBefore(titleNode) {
+    return titleNode?.parentElement || titleNode?.parentNode || null;
   }
 
-  function removeThreadIdBadges(root = document) {
-    root.querySelectorAll?.(`.${threadIdBadgeClass}`).forEach((badge) => badge.remove());
+  // 存量数据清理：旧版留下的 wrapper 需要还原一次，否则标题会一直被困在里面。
+  // 只做还原，不再新建任何 wrapper。
+  function unwrapThreadIdBadgeWrappers(root = document) {
     root.querySelectorAll?.('[data-codex-thread-id-badge-wrap="true"]').forEach((wrapper) => {
       const parent = wrapper.parentElement;
       if (!parent) return;
       while (wrapper.firstChild) parent.insertBefore(wrapper.firstChild, wrapper);
       wrapper.remove();
     });
+  }
+
+  function removeThreadIdBadges(root = document) {
+    root.querySelectorAll?.(`.${threadIdBadgeClass}`).forEach((badge) => badge.remove());
+    unwrapThreadIdBadgeWrappers(root);
     const rows = root.matches?.(selectors.sidebarThread) ? [root] : Array.from(root.querySelectorAll?.(selectors.sidebarThread) || []);
     rows.forEach((row) => {
       delete row.dataset.codexThreadIdBadge;
@@ -6972,14 +7573,19 @@
       return;
     }
 
-    const wrapper = wrapThreadTitleForBadge(row, titleNode);
-    if (!wrapper) return;
+    // 旧 wrapper 先还原，保证 badge 与 titleNode 在同一个父节点下做兄弟。
+    unwrapThreadIdBadgeWrappers(row);
 
-    let badge = wrapper.querySelector(`.${threadIdBadgeClass}`);
-    if (!badge) {
+    const parent = threadIdBadgeInsertBefore(titleNode);
+    if (!parent) return;
+
+    let badge = row.querySelector(`.${threadIdBadgeClass}`);
+    if (!badge || badge.parentElement !== parent) {
+      badge?.remove();
       badge = document.createElement("span");
       badge.className = threadIdBadgeClass;
-      wrapper.insertBefore(badge, titleNode);
+      // 只插自己的节点，不碰官方节点。
+      parent.insertBefore(badge, titleNode);
     }
 
     badge.dataset.codexThreadIdBadgeVersion = codexThreadIdBadgeVersion;
@@ -7682,6 +8288,11 @@
   }
 
   async function postJson(path, payload) {
+    if (path === "/delete") {
+      const hostId = deletePayloadHost(payload);
+      if (!hostId) return { status: "failed", message: "无法确定会话主机归属，未删除", session_id: payload?.session_id || "" };
+      if (hostId !== "local") return deleteRemoteSession({ ...payload, host_id: hostId });
+    }
     async function fetchBackendStatusFromHelper(path, payload) {
       const controller = typeof AbortController === "function" ? new AbortController() : null;
       const timeoutId = setTimeout(() => controller?.abort(), 2000);
@@ -7837,13 +8448,37 @@
     if (assetPrefix.startsWith("app-initial-")) {
       return typeof module?.qut === "function" ? module.qut : null;
     }
+    if (assetPrefix.startsWith("app-shared-")) {
+      return codexStateCallByCapability(module);
+    }
     return null;
+  }
+
+  // issue #2399：26.930 起 state API 随 AppServerRequestClient 一起搬进 app-shared-*，
+  // 而这批产物每次构建都会重排压缩导出名（旧版是 qut），按字面量取必然落空。
+  // 改成按能力找：函数源码里带 get-global-state / set-global-state 的就是它。
+  function codexStateCallByCapability(module) {
+    const values = module && typeof module === "object" ? Object.values(module) : [];
+    return values.find((candidate) => {
+      if (typeof candidate !== "function") return false;
+      let source = "";
+      try {
+        source = String(candidate);
+      } catch {
+        return false;
+      }
+      return source.includes("get-global-state")
+        && source.includes("set-global-state")
+        && source.includes("params");
+    }) || null;
   }
 
   async function codexStateApi() {
     codexStateApiPromise = codexStateApiPromise || (async () => {
       const errors = [];
-      for (const assetPrefix of ["vscode-api-", "app-initial-"]) {
+      // 前三项是历史前缀（列表字面量本身是契约的一部分，不要改写）；
+      // app-shared- 是 26.930+ 的新位置，靠内容识别，不依赖压缩导出名。
+      for (const assetPrefix of [...["vscode-api-", "app-initial-"], "app-shared-"]) {
         try {
           const api = await loadCodexAppModule(assetPrefix);
           const call = codexStateApiFromModule(api, assetPrefix);
@@ -7867,7 +8502,703 @@
     const result = await codexStateCall("get-global-state", { params: { key } });
     return result && Object.prototype.hasOwnProperty.call(result, "value") ? result.value : result;
   }
+  /**
+   * 独立插件市场只加载索引；安装由 launcher 下载所选插件并写入本地安装目录。
+   * 不调用 Codex 的 plugin/install，避免在浏览目录时触发服务连接或 OAuth。
+   * 状态存数据，页面每次打开重建；请求结果通过来源/序号校验后才刷新当前页面。
+   */
+  const codexPlusPluginMarketState = window.__codexPlusPluginMarketState || {
+    source: "public", query: "", installedOnly: false, page: 1,
+    catalogs: {}, jobs: {},
+  };
+  window.__codexPlusPluginMarketState = codexPlusPluginMarketState;
+  Object.values(codexPlusPluginMarketState.jobs).forEach((job) => {
+    clearTimeout(job.timer);
+    job.timer = null;
+  });
+  const codexPlusPluginMarketPageSize = 50;
 
+  function codexPlusPluginMarketCatalog(source = codexPlusPluginMarketState.source) {
+    if (!codexPlusPluginMarketState.catalogs[source]) {
+      codexPlusPluginMarketState.catalogs[source] = {
+        plugins: [], loaded: false, loading: false, message: "", revision: 0, cached: false,
+      };
+    }
+    return codexPlusPluginMarketState.catalogs[source];
+  }
+
+  function codexPlusPluginMarketPanel() {
+    return document.querySelector('[data-codex-plugin-market-panel="true"]');
+  }
+
+  function codexPlusPluginMarketFilteredPlugins() {
+    const state = codexPlusPluginMarketState;
+    const query = state.query.trim().toLocaleLowerCase();
+    return codexPlusPluginMarketCatalog().plugins.filter((plugin) => {
+      if (state.installedOnly && !plugin.installed) return false;
+      if (!query) return true;
+      const text = [plugin.displayName, plugin.name, plugin.description, ...(Array.isArray(plugin.tags) ? plugin.tags : [])].join(" ").toLocaleLowerCase();
+      return text.includes(query);
+    });
+  }
+
+  function codexPlusPluginMarketBytes(bytes) {
+    const value = Number(bytes);
+    if (!Number.isFinite(value) || value <= 0) return "";
+    if (value < 1024 * 1024) return `${Math.ceil(value / 1024)} KB`;
+    return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+  }
+
+  function codexPlusPluginMarketStage(stage) {
+    return ({ queued: "等待下载", downloading: "下载中", extracting: "解压中", installing: "安装中", validating: "校验中", complete: "安装完成" })[stage] || "正在安装";
+  }
+
+  function codexPlusPluginMarketCard(plugin, source) {
+    const job = codexPlusPluginMarketState.jobs[`${source}:${plugin.id}`];
+    const busy = job?.busy === true;
+    const installed = plugin.installed === true;
+    const label = busy ? `${codexPlusPluginMarketStage(job.stage)}…` : plugin.updateAvailable ? "更新" : installed ? "已安装" : "下载安装";
+    const meta = [plugin.version ? `v${plugin.version}` : "", plugin.author || "", codexPlusPluginMarketBytes(plugin.bytes), Number(plugin.skills) > 0 ? `${plugin.skills} 个技能` : ""].filter(Boolean).join(" · ");
+    const tags = (Array.isArray(plugin.tags) ? plugin.tags : []).slice(0, 4);
+    return `<article class="codex-plus-plugin-card" role="listitem">
+      <div class="codex-plus-plugin-card-info">
+        <div class="codex-plus-plugin-name">${escapeHtml(plugin.displayName || plugin.name || plugin.id)}</div>
+        <div class="codex-plus-plugin-id">${escapeHtml(plugin.name || plugin.id)}</div>
+        <div class="codex-plus-plugin-description">${escapeHtml(plugin.description || "暂无介绍")}</div>
+        <div class="codex-plus-plugin-meta">${escapeHtml(meta)}</div>
+        <div class="codex-plus-plugin-tags">${tags.map((tag) => `<span>${escapeHtml(String(tag))}</span>`).join("")}${plugin.requiresAuth ? "<span>需要服务授权</span>" : ""}${plugin.license ? `<span>${escapeHtml(plugin.license)}</span>` : ""}</div>
+        ${job?.message ? `<div class="codex-plus-plugin-job-message" data-status="${job.failed ? "failed" : "ok"}">${escapeHtml(job.message)}</div>` : ""}
+      </div>
+      <button type="button" class="codex-plus-button codex-plus-plugin-install" data-codex-plugin-install="${escapeHtml(plugin.id)}" aria-label="${escapeHtml(`${label} ${plugin.displayName || plugin.name || plugin.id}`)}" ${busy || (installed && !plugin.updateAvailable) ? "disabled" : ""}>${label}</button>
+    </article>`;
+  }
+
+  function renderCodexPlusPluginMarket() {
+    const panel = codexPlusPluginMarketPanel();
+    if (!panel) return;
+    const state = codexPlusPluginMarketState;
+    const catalog = codexPlusPluginMarketCatalog();
+    const filtered = codexPlusPluginMarketFilteredPlugins();
+    const pages = Math.max(1, Math.ceil(filtered.length / codexPlusPluginMarketPageSize));
+    state.page = Math.max(1, Math.min(pages, state.page));
+    panel.querySelectorAll("[data-codex-plugin-source]").forEach((button) => {
+      const active = button.dataset.codexPluginSource === state.source;
+      button.dataset.active = String(active);
+      button.setAttribute("aria-pressed", String(active));
+    });
+    const refresh = panel.querySelector("[data-codex-plugin-refresh]");
+    if (refresh) refresh.disabled = catalog.loading;
+    const sourceNote = panel.querySelector("[data-codex-plugin-source-note]");
+    if (sourceNote) {
+      sourceNote.hidden = state.source !== "full";
+      sourceNote.textContent = "完整市场需要 GitHub 私有仓库访问权限。请使用有权限的账号执行 gh auth login 后刷新目录。";
+    }
+    const status = panel.querySelector("[data-codex-plugin-market-status]");
+    if (status) status.textContent = catalog.loading ? "正在加载插件目录…" : catalog.message || `${catalog.plugins.length.toLocaleString()} 个插件${catalog.cached ? " · 使用缓存目录" : ""}`;
+    const results = panel.querySelector("[data-codex-plugin-results]");
+    if (results) results.innerHTML = filtered.length
+      ? filtered.slice((state.page - 1) * codexPlusPluginMarketPageSize, state.page * codexPlusPluginMarketPageSize).map((plugin) => codexPlusPluginMarketCard(plugin, state.source)).join("")
+      : `<div class="codex-plus-plugin-empty">${catalog.loading ? "正在加载…" : !catalog.loaded ? "目录尚未加载，请刷新重试。" : catalog.plugins.length ? "没有找到符合条件的插件。" : "此来源暂无可显示的插件。"}</div>`;
+    const count = panel.querySelector("[data-codex-plugin-result-count]");
+    if (count) count.textContent = `${filtered.length.toLocaleString()} 个结果 · 第 ${state.page} / ${pages} 页`;
+    const previous = panel.querySelector('[data-codex-plugin-page="previous"]');
+    const next = panel.querySelector('[data-codex-plugin-page="next"]');
+    if (previous) previous.disabled = state.page <= 1;
+    if (next) next.disabled = state.page >= pages;
+  }
+
+  async function loadCodexPlusPluginMarket(source, refresh = false) {
+    const catalog = codexPlusPluginMarketCatalog(source);
+    if (catalog.loading || (catalog.loaded && !refresh)) {
+      renderCodexPlusPluginMarket();
+      return;
+    }
+    const revision = ++catalog.revision;
+    catalog.loading = true;
+    catalog.message = "";
+    renderCodexPlusPluginMarket();
+    let result;
+    try {
+      result = await postJson("/plugin-market/list", { source, refresh });
+    } catch (error) {
+      result = { status: "failed", message: error?.message || "插件目录加载失败" };
+    }
+    if (catalog.revision !== revision) return;
+    catalog.loading = false;
+    if (Array.isArray(result?.plugins)) {
+      catalog.plugins = result.plugins.filter((plugin) => plugin && typeof plugin.id === "string");
+      catalog.loaded = true;
+      catalog.cached = result.cached === true;
+      catalog.message = result.message || "";
+    } else {
+      catalog.message = result?.message || "插件目录加载失败，请刷新重试。";
+    }
+    // 切换来源后，旧请求只更新自己的数据；当前页面始终按当前来源重绘。
+    if (codexPlusPluginMarketState.source === source) renderCodexPlusPluginMarket();
+  }
+
+  function updateCodexPlusPluginMarketInstalled(source, plugin) {
+    if (!plugin || typeof plugin.id !== "string") return;
+    const catalog = codexPlusPluginMarketCatalog(source);
+    // 安装以 source + id 隔离，另一来源即使同 id 也不能被标为已安装。
+    // 丢弃此前发出的本来源清单请求，避免旧 installed 状态覆盖新结果。
+    catalog.revision += 1;
+    catalog.loading = false;
+    catalog.plugins = catalog.plugins.map((item) => {
+      if (item.id !== plugin.id) return item;
+      const installedVersion = plugin.installedVersion || plugin.version || item.version;
+      return { ...item, installed: true, installedVersion, updateAvailable: Boolean(item.version && installedVersion && item.version !== installedVersion) };
+    });
+  }
+
+  function scheduleCodexPlusPluginMarketInstallPoll(source, id, delay = 1200) {
+    const job = codexPlusPluginMarketState.jobs[`${source}:${id}`];
+    if (!job?.busy || job.polling || job.timer || !codexPlusPluginMarketPanel()) return;
+    job.timer = setTimeout(() => {
+      job.timer = null;
+      void pollCodexPlusPluginMarketInstall(source, id);
+    }, delay);
+  }
+
+  async function pollCodexPlusPluginMarketInstall(source, id) {
+    const job = codexPlusPluginMarketState.jobs[`${source}:${id}`];
+    if (!job?.busy || job.polling) return;
+    job.polling = true;
+    let result;
+    try {
+      result = await postJson("/plugin-market/install-status", { source, id });
+    } catch (error) {
+      result = { timeout: true, message: error?.message || "正在等待安装状态" };
+    }
+    job.polling = false;
+    if (result?.busy === true) {
+      job.stage = result.stage || job.stage;
+      job.message = result.message || "";
+    } else if (result?.busy === false) {
+      const completed = result.status === "ok" && result.stage === "complete"
+        && (result.plugin || (typeof result.installedVersion === "string" && result.installedVersion.length > 0));
+      job.busy = false;
+      job.failed = !completed;
+      job.message = result.message || (job.failed ? "安装未完成，请重试。" : "安装完成，重启 Codex 后加载插件。");
+      if (completed) updateCodexPlusPluginMarketInstalled(source, result.plugin || { id, installedVersion: result.installedVersion });
+    } else {
+      // 桥接超时不能重新发起安装；持续查询原任务，防止并发写同一插件。
+      job.message = result?.message || "正在等待安装状态，可稍后重新打开此页查看。";
+    }
+    renderCodexPlusPluginMarket();
+    scheduleCodexPlusPluginMarketInstallPoll(source, id, result?.timeout ? 4000 : 1200);
+  }
+
+  async function installCodexPlusPluginMarketPlugin(source, id) {
+    const key = `${source}:${id}`;
+    if (codexPlusPluginMarketState.jobs[key]?.busy) return;
+    const plugin = codexPlusPluginMarketCatalog(source).plugins.find((item) => item.id === id);
+    if (!plugin || (plugin.installed && !plugin.updateAvailable)) return;
+    const job = { busy: true, stage: "downloading", message: "正在下载所选插件…", failed: false, timer: null, polling: false };
+    codexPlusPluginMarketState.jobs[key] = job;
+    renderCodexPlusPluginMarket();
+    let result;
+    try {
+      result = await postJson("/plugin-market/install", { source, id });
+    } catch (error) {
+      result = { timeout: true, message: error?.message || "正在等待安装结果" };
+    }
+    if (result?.status === "ok" && result?.plugin && result?.busy !== true) {
+      job.busy = false;
+      job.message = result.message || "安装完成，重启 Codex 后加载插件。";
+      updateCodexPlusPluginMarketInstalled(source, result.plugin);
+    } else if (result?.status === "failed" && !result?.timeout && result?.busy !== true && !/超时|timeout/i.test(result.message || "")) {
+      job.busy = false;
+      job.failed = true;
+      job.message = result.message || "安装失败";
+    } else {
+      job.stage = result?.stage || job.stage;
+      job.message = result?.message || "正在等待下载完成…";
+      scheduleCodexPlusPluginMarketInstallPoll(source, id);
+    }
+    renderCodexPlusPluginMarket();
+  }
+
+  function openCodexPlusPluginMarket() {
+    closeCodexPlusPage();
+    document.querySelectorAll('.codex-plus-modal-overlay, [data-codex-plus-dialog="true"]').forEach((node) => node.remove());
+    const overlay = document.createElement("div");
+    overlay.className = `${codexPlusPageClass} codex-plus-plugin-market-page`;
+    overlay.dataset.codexPlusPage = "true";
+    markCodexPlusExtensionNode(overlay, "builtin-plugin-market");
+    applyCodexPlusTheme(overlay);
+    applyCodexPlusZoom(overlay);
+    const state = codexPlusPluginMarketState;
+    overlay.innerHTML = `<div class="codex-plus-modal-content" role="region" aria-label="CodeX 插件市场" data-codex-plus-active-tab="${codexPlusPluginMarketTab}">
+      <div class="codex-plus-modal-header"><div class="codex-plus-modal-title">CodeX 插件市场</div></div>
+      <div class="codex-plus-modal-body"><div class="codex-plus-panel codex-plus-plugin-market-panel" data-codex-plugin-market-panel="true">
+        <p class="codex-plus-plugin-intro">检索插件目录，选中后下载并安装。目录浏览仅获取索引，插件文件按需下载。</p>
+        <div class="codex-plus-plugin-toolbar">
+          <div class="codex-plus-plugin-sources" role="group" aria-label="插件来源"><button type="button" data-codex-plugin-source="public" aria-pressed="false">公开市场</button><button type="button" data-codex-plugin-source="full" aria-pressed="false">完整市场</button></div>
+          <button type="button" class="codex-plus-button" data-codex-plugin-refresh="true">刷新目录</button>
+        </div>
+        <div class="codex-plus-plugin-status" data-codex-plugin-source-note="true" hidden></div>
+        <div class="codex-plus-plugin-toolbar"><input type="search" class="codex-plus-plugin-search" data-codex-plugin-query="true" aria-label="搜索插件" placeholder="搜索插件名称、简介或标签" value="${escapeHtml(state.query)}"><label class="codex-plus-plugin-filter"><input type="checkbox" data-codex-plugin-installed="true" ${state.installedOnly ? "checked" : ""}>仅已安装</label></div>
+        <div class="codex-plus-plugin-status" data-codex-plugin-market-status="true" role="status" aria-live="polite"></div>
+        <div class="codex-plus-plugin-results" data-codex-plugin-results="true" role="list" aria-label="插件结果"></div>
+        <div class="codex-plus-plugin-pagination"><span data-codex-plugin-result-count="true"></span><button type="button" class="codex-plus-button" data-codex-plugin-page="previous">上一页</button><button type="button" class="codex-plus-button" data-codex-plugin-page="next">下一页</button></div>
+      </div></div></div>`;
+    overlay.addEventListener("input", (event) => {
+      if (!event.target?.matches?.("[data-codex-plugin-query]")) return;
+      state.query = event.target.value;
+      state.page = 1;
+      renderCodexPlusPluginMarket();
+    });
+    overlay.addEventListener("change", (event) => {
+      if (!event.target?.matches?.("[data-codex-plugin-installed]")) return;
+      state.installedOnly = event.target.checked;
+      state.page = 1;
+      renderCodexPlusPluginMarket();
+    });
+    overlay.addEventListener("click", (event) => {
+      const target = event.target instanceof Element ? event.target : event.target?.parentElement;
+      const source = target?.closest("[data-codex-plugin-source]");
+      if (source) {
+        state.source = source.dataset.codexPluginSource === "full" ? "full" : "public";
+        state.page = 1;
+        void loadCodexPlusPluginMarket(state.source);
+        return;
+      }
+      if (target?.closest("[data-codex-plugin-refresh]")) {
+        void loadCodexPlusPluginMarket(state.source, true);
+        return;
+      }
+      const install = target?.closest("[data-codex-plugin-install]");
+      if (install && !install.disabled) {
+        void installCodexPlusPluginMarketPlugin(state.source, install.dataset.codexPluginInstall);
+        return;
+      }
+      const page = target?.closest("[data-codex-plugin-page]");
+      if (page && !page.disabled) {
+        state.page += page.dataset.codexPluginPage === "next" ? 1 : -1;
+        renderCodexPlusPluginMarket();
+        overlay.querySelector(".codex-plus-modal-body")?.scrollTo?.({ top: 0 });
+      }
+    });
+    document.body.appendChild(overlay);
+    positionCodexPlusPage(overlay);
+    document.querySelectorAll('[data-codex-plus-ext-rail-active="true"]').forEach((node) => {
+      node.removeAttribute("data-codex-plus-ext-rail-active");
+      const button = node.querySelector("button") || node;
+      button.dataset.active = "false";
+      button.removeAttribute("data-selected");
+      button.removeAttribute("aria-current");
+    });
+    setCodexPlusSidebarNavActive(true, "plugin-market");
+    // 拓展页面可能留下捕获旧 overlay 的 resize 回调，重开后必须改为查询当前 DOM。
+    window.removeEventListener("resize", window.__codexPlusPageResizeHandler);
+    window.__codexPlusPageResizeHandler = () => positionCodexPlusPage(document.querySelector(`.${codexPlusPageClass}`));
+    window.addEventListener("resize", window.__codexPlusPageResizeHandler);
+    renderCodexPlusPluginMarket();
+    void loadCodexPlusPluginMarket(state.source);
+    Object.entries(state.jobs).forEach(([key, job]) => {
+      if (!job.busy) return;
+      const colon = key.indexOf(":");
+      scheduleCodexPlusPluginMarketInstallPoll(key.slice(0, colon), key.slice(colon + 1));
+    });
+  }
+  /**
+   * 复用原生插件页面：仅接管带独立索引标记的详情与安装，其他插件仍走原接口。
+   * 当前验证的传输有 client.sendRequest、fetch envelope 和 mcp-request envelope。
+   * 安装请求只发一次；桥接超时后查询后台任务，不能回落到原生 plugin/install。
+   */
+  const codexPlusPluginNativeVersion = "1";
+  const codexPlusPluginNativeState = window.__codexPlusPluginNativeState || {
+    bypass: Symbol("codex-plus-plugin-native-bypass"), requests: new Map(), synthetic: new WeakSet(),
+    ids: new Map(), catalogs: new Map(), installJobs: new Map(),
+  };
+  window.__codexPlusPluginNativeState = codexPlusPluginNativeState;
+  const codexPlusPluginNativeBypass = codexPlusPluginNativeState.bypass;
+  const codexPlusPluginNativeRequests = codexPlusPluginNativeState.requests;
+  const codexPlusPluginNativeSyntheticMessages = codexPlusPluginNativeState.synthetic;
+  const codexPlusPluginNativeIds = codexPlusPluginNativeState.ids;
+  const codexPlusPluginNativeCatalogs = codexPlusPluginNativeState.catalogs;
+  const codexPlusPluginNativeInstallJobs = codexPlusPluginNativeState.installJobs;
+
+  function codexPlusPluginNativeOperation(method, params, hostId) {
+    const wrapped = String(method || "") === "send-cli-request-for-host";
+    const requestParams = wrapped ? params?.params || {} : params || {};
+    const hosts = [hostId, params?.hostId, wrapped ? requestParams?.hostId : null].filter((value) => value != null);
+    return {
+      method: appServerModelRequestMethod(String(method || ""), params),
+      params: requestParams,
+      hostId: hosts.find((value) => value !== "local") ?? hosts[0],
+    };
+  }
+
+  function codexPlusPluginNativeSource(params) {
+    const path = String(params?.marketplacePath || "").replace(/\\/g, "/");
+    const pathMatch = /(?:^|\/)codex-plus-plugin-market\/virtual-(public|full)\/\.agents\/plugins\/marketplace\.json$/.exec(path);
+    if (pathMatch) return pathMatch[1];
+    const name = String(params?.remoteMarketplaceName || params?.localMarketplaceName || "");
+    const nameMatch = /^codex-plus-index-(public|full)$/.exec(name);
+    return nameMatch ? nameMatch[1] : "";
+  }
+
+  function codexPlusPluginNativeLocal(operation) {
+    return operation.hostId == null || operation.hostId === "local";
+  }
+
+  function codexPlusPluginNativeListAllowed(operation) {
+    if (!codexPlusPluginNativeLocal(operation)) return false;
+    if (operation.method === "installed-plugins") return true;
+    if (operation.method !== "list-plugins") return false;
+    const kinds = operation.params?.marketplaceKinds;
+    return !Array.isArray(kinds) || kinds.length === 0 || kinds.includes("local");
+  }
+
+  function codexPlusPluginNativeRemember(result) {
+    const marketplaces = result?.marketplaces;
+    if (!Array.isArray(marketplaces)) return;
+    marketplaces.forEach((market) => {
+      const source = codexPlusPluginNativeSource({ marketplacePath: market.path, localMarketplaceName: market.name });
+      if (!source || !Array.isArray(market.plugins)) return;
+      market.plugins.forEach((plugin) => {
+        if (typeof plugin?.name === "string" && typeof plugin?.codexPlusIndexId === "string") {
+          codexPlusPluginNativeIds.set(`${source}:${plugin.name}`, plugin.codexPlusIndexId);
+        }
+      });
+    });
+  }
+
+  async function codexPlusPluginNativeBackend(method, params, source) {
+    let result;
+    try {
+      result = await postJson("/plugin-market/native", { method, params: params || {}, ...(source ? { source } : {}) });
+    } catch (error) {
+      // 传输中断不能证明后台未接到请求；安装提交后的异常要查询原任务。
+      const failure = error instanceof Error ? error : new Error(String(error));
+      failure.outcomeUnknown = true;
+      failure.timeout = /timeout|timed out|超时|deadline/i.test(failure.message);
+      throw failure;
+    }
+    if (!result || typeof result !== "object" || result.status === "failed") {
+      const error = new Error(result?.message || "CodeX 插件市场请求失败");
+      error.timeout = result?.timeout === true || /timeout|timed out|超时/i.test(error.message);
+      throw error;
+    }
+    return result;
+  }
+
+  async function codexPlusPluginNativeCatalog(operation) {
+    const key = operation.method;
+    const now = Date.now();
+    const cached = codexPlusPluginNativeCatalogs.get(key);
+    const ttl = key === "installed-plugins" ? 1000 : 60_000;
+    if (cached?.promise) return JSON.parse(JSON.stringify(await cached.promise));
+    if (cached?.value && !operation.params?.forceRefetch && now - cached.at < ttl) {
+      return JSON.parse(JSON.stringify(cached.value));
+    }
+    const entry = { at: now, value: null, promise: null };
+    const promise = codexPlusPluginNativeBackend(operation.method, operation.params).then((result) => {
+      if (!Array.isArray(result.marketplaces)) throw new Error("CodeX 插件市场列表格式错误");
+      codexPlusPluginNativeRemember(result);
+      entry.value = result;
+      entry.at = Date.now();
+      return result;
+    }).finally(() => { entry.promise = null; });
+    entry.promise = promise;
+    codexPlusPluginNativeCatalogs.set(key, entry);
+    return JSON.parse(JSON.stringify(await promise));
+  }
+
+  function codexPlusPluginNativeMerge(original, extra, method) {
+    const base = original && typeof original === "object" ? original : {};
+    const managedIds = new Set((extra?.marketplaces || []).flatMap((market) =>
+      codexPlusPluginNativeSource({ marketplacePath: market.path, localMarketplaceName: market.name })
+        ? (market.plugins || []).map((plugin) => plugin.id) : []));
+    const markets = Array.isArray(base.marketplaces) ? base.marketplaces.map((market) => {
+      if (!/^codex-plus-plugin-market-[a-f0-9]{12}$/.test(market.name || "") || !Array.isArray(market.plugins)) return market;
+      // 已安装目录也会从原生本地市场返回；只消除我们自己 namespace 内同 id 的重复。
+      return { ...market, plugins: market.plugins.filter((plugin) => !managedIds.has(plugin.id)) };
+    }) : [];
+    for (const market of extra?.marketplaces || []) {
+      const existing = markets.find((item) => item.name === market.name && item.path === market.path);
+      if (!existing) {
+        markets.push(market);
+      } else {
+        const ids = new Set((existing.plugins || []).map((plugin) => plugin.id));
+        existing.plugins = [...(existing.plugins || []), ...(market.plugins || []).filter((plugin) => !ids.has(plugin.id))];
+      }
+    }
+    const result = {
+      ...base, marketplaces: markets,
+      marketplaceLoadErrors: [...(Array.isArray(base.marketplaceLoadErrors) ? base.marketplaceLoadErrors : []), ...(extra?.marketplaceLoadErrors || [])],
+      __codexPlusIndexMerged: true,
+    };
+    if (method === "list-plugins") result.featuredPluginIds = [...new Set([...(base.featuredPluginIds || []), ...(extra?.featuredPluginIds || [])])];
+    codexPlusPluginNativeRemember(result);
+    return result;
+  }
+
+  async function codexPlusPluginNativeExtend(operation, original) {
+    if (original?.__codexPlusIndexMerged) return original;
+    try {
+      return codexPlusPluginNativeMerge(original, await codexPlusPluginNativeCatalog(operation), operation.method);
+    } catch (error) {
+      // 自定义市场暂时离线时保留原生列表，不能把系统插件清空。
+      const fallbackPath = codexPlusIsWindowsPlatform ? "C:\\codex-plus-plugin-market" : "/codex-plus-plugin-market";
+      return codexPlusPluginNativeMerge(original, { marketplaceLoadErrors: [{ marketplacePath: fallbackPath, message: error?.message || "CodeX 插件市场暂时不可用" }] }, operation.method);
+    }
+  }
+
+  function codexPlusPluginNativeInvalidate() {
+    codexPlusPluginNativeCatalogs.clear();
+    clearPluginMarketplaceQueryCache();
+    showToast("插件已安装，新开聊天或重启 Codex 后加载。");
+  }
+
+  async function codexPlusPluginNativeManaged(operation, source) {
+    if (!codexPlusPluginNativeLocal(operation)) throw new Error("CodeX 插件市场目前仅支持本机安装，请切换到本机。");
+    if (operation.method === "read-plugin") {
+      const result = await codexPlusPluginNativeBackend(operation.method, operation.params, source);
+      const summary = result?.plugin?.summary;
+      if (typeof summary?.codexPlusIndexId === "string") codexPlusPluginNativeIds.set(`${source}:${operation.params.pluginName}`, summary.codexPlusIndexId);
+      return result;
+    }
+    const key = `${source}:${operation.params.pluginName || ""}`;
+    if (codexPlusPluginNativeInstallJobs.has(key)) return await codexPlusPluginNativeInstallJobs.get(key);
+    const promise = (async () => {
+      let id = codexPlusPluginNativeIds.get(key);
+      if (!id) {
+        // 未浏览列表也可能直接进入详情，先获取真实索引 id；这一步不会下载插件文件。
+        const detail = await codexPlusPluginNativeBackend("read-plugin", operation.params, source);
+        id = detail?.plugin?.summary?.codexPlusIndexId;
+        if (typeof id !== "string" || !id) throw new Error("插件索引缺少安装标识，请刷新目录后重试。");
+        codexPlusPluginNativeIds.set(key, id);
+      }
+      try {
+        const result = await codexPlusPluginNativeBackend("install-plugin", operation.params, source);
+        if (result?.authPolicy && Array.isArray(result.appsNeedingAuth)) {
+          codexPlusPluginNativeInvalidate();
+          return result;
+        }
+        throw new Error("正在等待插件安装结果");
+      } catch (error) {
+        if (!error?.timeout && !error?.outcomeUnknown && !/正在等待/.test(error?.message || "")) throw error;
+      }
+      // 安装已经提交，后续只能读取同一后台任务，绝不能再次提交或发给原生接口。
+      const deadline = Date.now() + 10 * 60_000;
+      let communicationFailures = 0;
+      const outcomeUnknown = () => new Error("暂时无法确认安装结果，请刷新已安装目录查看；后台任务可能仍在运行。");
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        let status;
+        try { status = await postJson("/plugin-market/install-status", { source, id }); } catch {
+          if (++communicationFailures >= 5) throw outcomeUnknown();
+          continue;
+        }
+        if (status?.busy === true) { communicationFailures = 0; continue; }
+        if (status?.busy === false && status.stage === "complete" && status.nativeResult?.authPolicy && Array.isArray(status.nativeResult.appsNeedingAuth)) {
+          codexPlusPluginNativeInvalidate();
+          return status.nativeResult;
+        }
+        if (status?.busy === false) throw new Error(status.message || "插件安装未完成，请重试。");
+        if (++communicationFailures >= 5) throw outcomeUnknown();
+      }
+      throw outcomeUnknown();
+    })().finally(() => { codexPlusPluginNativeInstallJobs.delete(key); });
+    codexPlusPluginNativeInstallJobs.set(key, promise);
+    return await promise;
+  }
+
+  /** 返回 null 表示原接口继续执行；返回 Promise 表示已由本层接管。 */
+  function codexPlusPluginNativeInterceptClient(method, params, options, original, hostId) {
+    if (!codexPluginMarketplacePatchEnabled() || options?.[codexPlusPluginNativeBypass]) return null;
+    const operation = codexPlusPluginNativeOperation(method, params, hostId);
+    const source = codexPlusPluginNativeSource(operation.params);
+    if (source && ["read-plugin", "install-plugin"].includes(operation.method)) return codexPlusPluginNativeManaged(operation, source);
+    if (!codexPlusPluginNativeListAllowed(operation)) return null;
+    return (async () => {
+      let result;
+      try {
+        result = await original({ ...(options || {}), [codexPlusPluginNativeBypass]: true });
+      } catch (error) {
+        if (!pluginMarketplaceRemoteAuthError(error)) throw error;
+        result = { marketplaces: [], marketplaceLoadErrors: [], featuredPluginIds: [] };
+      }
+      return await codexPlusPluginNativeExtend(operation, result);
+    })();
+  }
+
+  function codexPlusPluginNativeEnvelope(message) {
+    if (!message || typeof message !== "object") return null;
+    if (message.type === "mcp-request" && message.request?.id != null) {
+      return {
+        transport: "mcp", id: message.request.id,
+        key: `mcp:${message.hostId || "local"}:${message.request.id}`,
+        operation: codexPlusPluginNativeOperation(message.request.method, message.request.params, message.hostId),
+        request: message,
+      };
+    }
+    if (message.type === "fetch" && message.requestId != null && typeof message.url === "string") {
+      let params = message.body || {};
+      if (typeof params === "string") {
+        try { params = JSON.parse(params); } catch { return null; }
+      }
+      return {
+        transport: "fetch", id: message.requestId, key: `fetch:${message.requestId}`,
+        operation: codexPlusPluginNativeOperation(message.url, params, message.hostId), request: message,
+      };
+    }
+    return null;
+  }
+
+  function codexPlusPluginNativeDeliver(data) {
+    codexPlusPluginNativeSyntheticMessages.add(data);
+    window.dispatchEvent(new MessageEvent("message", { data, source: window, origin: window.location.origin }));
+  }
+
+  function codexPlusPluginNativeReply(envelope, result, error) {
+    if (envelope.transport === "fetch") {
+      codexPlusPluginNativeDeliver({ type: "fetch-response", requestId: envelope.id, responseType: error ? "error" : "success", status: error ? 500 : 200,
+        headers: { "content-type": "application/json" }, ...(error ? { error: error.message || String(error) } : { bodyJsonString: JSON.stringify(result) }) });
+    } else {
+      codexPlusPluginNativeDeliver({ type: "mcp-response", hostId: envelope.request.hostId || "local", message: { id: envelope.id,
+        ...(error ? { error: { code: -32000, message: error.message || String(error) } } : { result }) } });
+    }
+  }
+
+  function codexPlusPluginNativeInterceptOutgoing(message) {
+    if (!codexPluginMarketplacePatchEnabled()) return false;
+    const envelope = codexPlusPluginNativeEnvelope(message);
+    if (!envelope) return false;
+    const source = codexPlusPluginNativeSource(envelope.operation.params);
+    if (source && ["read-plugin", "install-plugin"].includes(envelope.operation.method)) {
+      void codexPlusPluginNativeManaged(envelope.operation, source).then(
+        (result) => codexPlusPluginNativeReply(envelope, result),
+        (error) => codexPlusPluginNativeReply(envelope, null, error));
+      return true;
+    }
+    if (codexPlusPluginNativeListAllowed(envelope.operation)) {
+      codexPlusPluginNativeRequests.set(envelope.key, envelope);
+      // 只跟踪当前原生请求；超时不自发重发任何请求。
+      setTimeout(() => codexPlusPluginNativeRequests.delete(envelope.key), 90_000);
+    }
+    return false;
+  }
+
+  function codexPlusPluginNativeSuppressForwarded(message) {
+    if (!codexPluginMarketplacePatchEnabled()) return false;
+    const envelope = codexPlusPluginNativeEnvelope(message);
+    return Boolean(envelope && codexPlusPluginNativeSource(envelope.operation.params)
+      && ["read-plugin", "install-plugin"].includes(envelope.operation.method));
+  }
+
+  function codexPlusPluginNativeInterceptIncoming(data) {
+    if (!data || codexPlusPluginNativeSyntheticMessages.has(data)) return false;
+    const fetchResponse = data.type === "fetch-response";
+    const mcpResponse = data.type === "mcp-response";
+    if (!fetchResponse && !mcpResponse) return false;
+    const key = fetchResponse ? `fetch:${data.requestId}` : `mcp:${data.hostId || "local"}:${data.message?.id}`;
+    const envelope = codexPlusPluginNativeRequests.get(key);
+    if (!envelope) return false;
+    codexPlusPluginNativeRequests.delete(key);
+    void (async () => {
+      let payload;
+      let nativeError;
+      let wrapped = false;
+      if (fetchResponse) {
+        if (data.responseType === "error" || Number(data.status) >= 400) nativeError = data.error || data.bodyJsonString || "原生插件接口请求失败";
+        try { payload = "body" in data ? data.body : JSON.parse(data.bodyJsonString || "{}"); } catch {
+          codexPlusPluginNativeDeliver(data);
+          return;
+        }
+        if (payload?.error) nativeError = payload.error;
+        wrapped = payload && typeof payload === "object" && Object.prototype.hasOwnProperty.call(payload, "id");
+      } else {
+        payload = data.message?.result;
+        nativeError = data.message?.error;
+      }
+      if (nativeError && !pluginMarketplaceRemoteAuthError(nativeError)) {
+        codexPlusPluginNativeDeliver(data);
+        return;
+      }
+      const original = nativeError ? {} : wrapped ? payload.result : payload;
+      const merged = await codexPlusPluginNativeExtend(envelope.operation, original);
+      if (fetchResponse) {
+        const response = wrapped ? { ...payload, result: merged } : merged;
+        if (wrapped) delete response.error;
+        const next = { ...data, responseType: "success", status: 200, bodyJsonString: JSON.stringify(response) };
+        delete next.body;
+        delete next.error;
+        codexPlusPluginNativeDeliver(next);
+      } else {
+        const message = { ...data.message, result: merged };
+        delete message.error;
+        codexPlusPluginNativeDeliver({ ...data, message });
+      }
+    })().catch((error) => codexPlusPluginNativeReply(envelope, null, error));
+    return true;
+  }
+
+  function installCodexPlusPluginNativeTransportListener() {
+    if (window.__codexPlusPluginNativeResponseListener) window.removeEventListener("message", window.__codexPlusPluginNativeResponseListener, true);
+    window.__codexPlusPluginNativeResponseListener = (event) => {
+      if (event.source != null && event.source !== window) return;
+      if (codexPlusPluginNativeInterceptIncoming(event.data)) event.stopImmediatePropagation();
+    };
+    window.addEventListener("message", window.__codexPlusPluginNativeResponseListener, true);
+  }
+
+  function ensureCodexPlusPluginNativeTransportReinjection() {
+    if (!codexPluginMarketplacePatchEnabled()) return;
+    const bridge = window.electronBridge;
+    if (bridge?.__codexPluginMarketplaceOriginalSendMessageFromView
+        && bridge.__codexPluginMarketplaceBridgePatch !== codexPluginMarketplaceUnlockVersion
+        && bridge.sendMessageFromView?.__codexPlusPluginNativeTransport !== codexPlusPluginNativeVersion) {
+      const original = bridge.sendMessageFromView.bind(bridge);
+      const patched = (message) => codexPlusPluginNativeInterceptOutgoing(message) ? Promise.resolve() : original(message);
+      patched.__codexPlusPluginNativeTransport = codexPlusPluginNativeVersion;
+      bridge.sendMessageFromView = patched;
+    }
+    if (window.__codexPluginMarketplaceOriginalDispatchEvent
+        && window.__codexPluginMarketplaceWindowEventPatch !== codexPluginMarketplaceUnlockVersion
+        && window.dispatchEvent?.__codexPlusPluginNativeTransport !== codexPlusPluginNativeVersion) {
+      const original = window.dispatchEvent.bind(window);
+      const patched = (event) => {
+        if (event?.type === "codex-message-from-view") {
+          if (event.__codexForwardedViaBridge && codexPlusPluginNativeSuppressForwarded(event.detail)) return true;
+          if (!event.__codexForwardedViaBridge && codexPlusPluginNativeInterceptOutgoing(event.detail)) return true;
+        }
+        if (event?.type === "message" && codexPlusPluginNativeInterceptIncoming(event.data)) return true;
+        return original(event);
+      };
+      patched.__codexPlusPluginNativeTransport = codexPlusPluginNativeVersion;
+      window.dispatchEvent = patched;
+    }
+  }
+
+  function codexPlusNativePluginNavigationEntry() {
+    // 每次重查原生导航；注入入口和第三方 Plugins 按钮不能充当原生目标。
+    const destinations = Array.from(document.querySelectorAll('nav [data-sidebar-destination], aside.app-shell-left-panel nav button, nav[data-app-navigation-rail] button'));
+    return destinations.find((button) => {
+      if (button.closest('[data-codex-plus-ext], [data-codex-plus-rail]')) return false;
+      if (button.closest(`#${codexPlusSidebarPluginMarketId}, #${codexPlusRailPluginMarketId}`)) return false;
+      if (typeof isExtensionUiNode === "function" && isExtensionUiNode(button)) return false;
+      if (typeof visibleElement === "function" && !visibleElement(button)) return false;
+      const destination = (button.getAttribute("data-sidebar-destination") || "").trim();
+      const label = (button.getAttribute("aria-label") || button.textContent || "").replace(/\s+/g, " ").trim();
+      return destination === "plugins" || destination === "builtin:plugins" || /^(插件|Plugins)$/i.test(label);
+    });
+  }
+
+  function openCodexPlusNativePluginMarket() {
+    closeCodexPlusPage();
+    clearPluginMarketplaceQueryCache();
+    const native = codexPlusNativePluginNavigationEntry();
+    if (native && !native.disabled && native.getAttribute("aria-disabled") !== "true") {
+      native.click();
+      return;
+    }
+    // 没有可验证的原生入口时打开管理工具，不猜测内部路由或跳转外部浏览器。
+    void postJson("/manager/open", { page: "pluginMarket" });
+  }
   async function setCodexGlobalState(key, value) {
     return await codexStateCall("set-global-state", { params: { key, value } });
   }
@@ -7896,6 +9227,12 @@
   let codexModelWhitelistRefreshTimer = 0;
   let codexModelWhitelistRefreshUntil = 0;
   const codexPlusModelListRequestIds = new Set();
+  const codexPlusModelListRequestHosts = new Map();
+  // 跨重注入保留原生数据快照；WeakMap 仅持有模型集合，不缓存 DOM。
+  const codexPlusModelCollectionSnapshots = window.__codexPlusModelCollectionSnapshots
+    || (window.__codexPlusModelCollectionSnapshots = new WeakMap());
+  const codexPlusModelDefaultSnapshots = window.__codexPlusModelDefaultSnapshots
+    || (window.__codexPlusModelDefaultSnapshots = new WeakMap());
 
   if (window.__CODEX_PLUS_TEST_SERVICE_TIER__) {
     window.__codexPlusServiceTierTest = {
@@ -7939,6 +9276,13 @@
         codexModelCatalogLoadedAt = Date.now();
         codexModelCatalogPromise = null;
       },
+      loadModelCatalog: (force = false) => loadCodexModelCatalog(force),
+      patchModelContainer: (value, hostId = "local") => patchModelContainer(value, hostId),
+      patchModelArray: (models, allowEmpty = false, hostId = "local") => patchModelArray(models, allowEmpty, hostId),
+      patchStatsigModelDynamicConfig: (config, hostId = "local") => patchStatsigModelDynamicConfig(config, hostId),
+      patchModelJsonResponse,
+      patchMcpModelResponseData,
+      recordModelListRequest,
       setBackendSettings: (settings = {}) => {
         codexPlusBackendSettings = { ...codexPlusBackendSettings, ...settings };
         codexPlusBackendSettingsLoaded = true;
@@ -7986,14 +9330,12 @@
   async function loadCodexModelCatalog(force = false) {
     if (!force && codexModelCatalogPromise) return codexModelCatalogPromise;
     if (!force && codexModelCatalogLoadedAt && Date.now() - codexModelCatalogLoadedAt < 10000) return codexModelCatalog;
-    codexModelCatalogPromise = postJson("/codex-model-catalog", {})
+    codexModelCatalogPromise = readCodexAppServerPreparation("/codex-model-catalog", {})
       .then(async (result) => {
         codexModelCatalog = result && typeof result === "object" ? result : { status: "failed", model: "", default_model: "", model_provider: "", codex_model_provider: "", provider_name: "", models: [], sources: [], responses_api: { status: "unknown", message: "" } };
         if ((!codexModelCatalog.models || codexModelCatalog.models.length === 0) && codexModelCatalog.status === "not_configured") {
           try {
-            const settingsPromise = postJson("/settings/get", {});
-            const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error("fallback timeout")), 3000));
-            const settingsResp = await Promise.race([settingsPromise, timeoutPromise]);
+            const settingsResp = await readCodexAppServerPreparation("/settings/get", {});
             if (settingsResp && settingsResp.relayProfiles && Array.isArray(settingsResp.relayProfiles)) {
               const activeId = settingsResp.activeRelayId || "";
               const profile = settingsResp.relayProfiles.find(p => p.id === activeId);
@@ -8099,25 +9441,138 @@
     return Array.isArray(value) && value.every((item) => typeof item === "string");
   }
 
-  function patchModelNameArray(models) {
+  function patchModelNameArray(models, hostId) {
     if (!stringArrayLooksPatchable(models)) return false;
+    const allowed = codexPureApiAllowedModelSet(hostId);
+    let changed = prepareModelCollection(models, allowed);
     const customModels = codexPlusModelNames();
-    if (!customModels.length) return false;
-    let changed = false;
+    if (!customModels.length) return changed;
+    if (allowed) {
+      const retained = models.filter((name) => allowed.has(name));
+      if (retained.length !== models.length) {
+        models.splice(0, models.length, ...retained);
+        changed = true;
+      }
+    }
     customModels.forEach((modelName) => {
       if (!models.includes(modelName)) {
         models.push(modelName);
         changed = true;
       }
     });
+    finishModelCollection(models);
     return changed;
   }
 
-  function patchModelArray(models, allowEmpty = false) {
-    if (!modelArrayLooksPatchable(models, allowEmpty)) return false;
-    const customModels = codexPlusModelNames();
-    if (!customModels.length) return false;
+  function modelFilterPolicy(allowed) {
+    return allowed ? `${codexRemoteSessionActiveProfile()?.id || ""}:${codexModelCatalog.model || ""}:${JSON.stringify([...allowed].sort())}` : "";
+  }
+
+  function sameModelCollection(left, right) {
+    return !!right && left.length === right.length && left.every((item, index) => item === right[index]);
+  }
+
+  function prepareModelCollection(collection, allowed) {
+    const policy = modelFilterPolicy(allowed);
+    const previous = codexPlusModelCollectionSnapshots.get(collection);
+    let current = [...collection];
     let changed = false;
+    if (previous && previous.policy !== policy && sameModelCollection(current, previous.patched)) {
+      if (!sameModelCollection(current, previous.original)) {
+        if (Array.isArray(collection)) collection.splice(0, collection.length, ...previous.original);
+        else { collection.clear(); previous.original.forEach((item) => collection.add(item)); }
+        current = [...collection];
+        changed = true;
+      }
+    }
+    if (!allowed) codexPlusModelCollectionSnapshots.delete(collection);
+    else if (!previous || previous.policy !== policy || !sameModelCollection(current, previous.patched)) {
+      codexPlusModelCollectionSnapshots.set(collection, { policy, original: current, patched: null });
+    }
+    return changed;
+  }
+
+  function finishModelCollection(collection) {
+    const snapshot = codexPlusModelCollectionSnapshots.get(collection);
+    if (snapshot) snapshot.patched = [...collection];
+  }
+
+  function patchModelDefaults(value, allowed) {
+    const policy = modelFilterPolicy(allowed);
+    const previous = codexPlusModelDefaultSnapshots.get(value);
+    let changed = false;
+    if (previous && previous.policy !== policy) {
+      for (const [key, state] of Object.entries(previous.fields)) {
+        if (value[key] === state.patched && value[key] !== state.original) {
+          value[key] = state.original;
+          changed = true;
+        }
+      }
+      codexPlusModelDefaultSnapshots.delete(value);
+    }
+    if (!allowed) return changed;
+    const snapshot = codexPlusModelDefaultSnapshots.get(value) || { policy, fields: {} };
+    const fallback = [codexModelCatalog.model, codexModelCatalog.default_model, ...allowed]
+      .find((name) => typeof name === "string" && allowed.has(name));
+    for (const key of ["defaultModel", "default_model"]) {
+      const original = value[key];
+      const name = typeof original === "string" ? original : original?.model || original?.id || original?.slug;
+      if (!name || allowed.has(name)) continue;
+      const patched = typeof original === "string" ? fallback : codexPlusModelDescriptor(fallback);
+      if (!snapshot.fields[key] || original !== snapshot.fields[key].patched) {
+        snapshot.fields[key] = { original, patched };
+      }
+      value[key] = patched;
+      changed = true;
+    }
+    codexPlusModelDefaultSnapshots.set(value, snapshot);
+    return changed;
+  }
+
+  // 只收窄当前纯 API 供应商的有效目录；名单里的 GPT 也是可用模型，不能按前缀删。
+  // 目录失败/未配置/仍属于上一个供应商时继续保留原生列表。
+  function modelResponseHostId(...values) {
+    let local = false;
+    for (const value of values) {
+      let candidates;
+      try { candidates = typeof value === "string" ? [value] : [value?.hostId, value?.host_id]; }
+      catch { return ""; }
+      for (const candidate of candidates) {
+        if (typeof candidate !== "string" || !candidate.trim()) continue;
+        const host = candidate.trim();
+        if (host !== "local") return host;
+        local = true;
+      }
+    }
+    return local ? "local" : "";
+  }
+
+  function codexPureApiAllowedModelSet(hostId) {
+    if (hostId !== "local") return null;
+    const profile = codexRemoteSessionActiveProfile();
+    if (!codexPlusModelUnlockEnabled() || !codexPlusBackendSettingsLoaded
+        || profile?.relayMode !== "pureApi" || codexModelCatalog.status !== "ok") return null;
+    const profileId = String(profile.id || "").trim();
+    const belongsToProfile = profileId && (codexModelCatalog.model_provider === profileId
+      || (Array.isArray(codexModelCatalog.sources)
+        && codexModelCatalog.sources.some((source) => source?.id === `relay-profile:${profileId}`)));
+    const names = codexPlusModelNames();
+    return belongsToProfile && names.length ? new Set(names) : null;
+  }
+
+  function patchModelArray(models, allowEmpty = false, hostId) {
+    if (!modelArrayLooksPatchable(models, allowEmpty)) return false;
+    const allowed = codexPureApiAllowedModelSet(hostId);
+    let changed = prepareModelCollection(models, allowed);
+    const customModels = codexPlusModelNames();
+    if (!customModels.length) return changed;
+    if (allowed) {
+      const retained = models.filter((item) => allowed.has(item.model));
+      if (retained.length !== models.length) {
+        models.splice(0, models.length, ...retained);
+        changed = true;
+      }
+    }
     const existing = new Map(models.map((item) => [item.model, item]));
     models.forEach((item) => {
       if (customModels.includes(item.model)) {
@@ -8134,53 +9589,56 @@
         changed = true;
       }
     });
+    finishModelCollection(models);
     return changed;
   }
 
-  function patchModelContainer(value) {
+  function patchModelContainer(value, hostId) {
     if (!value || typeof value !== "object") return false;
+    hostId = modelResponseHostId(hostId, value, value.message, value.result);
     let changed = false;
-    if (patchModelArray(value.models, "defaultModel" in value || "availableModels" in value)) changed = true;
-    if (patchModelNameArray(value.models)) changed = true;
-    if (patchModelArray(value.data)) changed = true;
-    if (patchModelArray(value.result)) changed = true;
-    if (patchModelArray(value.pages?.[0]?.data)) changed = true;
-    if (patchModelArray(value.result?.data)) changed = true;
-    if (patchModelArray(value.result?.models)) changed = true;
-    if (patchModelArray(value.message?.result?.data)) changed = true;
-    if (patchModelArray(value.message?.result?.models)) changed = true;
+    if (patchModelArray(value.models, "defaultModel" in value || "availableModels" in value, hostId)) changed = true;
+    if (patchModelNameArray(value.models, hostId)) changed = true;
+    if (patchModelArray(value.data, false, hostId)) changed = true;
+    if (patchModelArray(value.result, false, hostId)) changed = true;
+    if (patchModelArray(value.pages?.[0]?.data, false, hostId)) changed = true;
+    if (patchModelArray(value.result?.data, false, hostId)) changed = true;
+    if (patchModelArray(value.result?.models, false, hostId)) changed = true;
+    if (patchModelArray(value.message?.result?.data, false, hostId)) changed = true;
+    if (patchModelArray(value.message?.result?.models, false, hostId)) changed = true;
     const names = codexPlusModelNames();
+    const allowed = codexPureApiAllowedModelSet(hostId);
     if (value.availableModels instanceof Set) {
+      if (prepareModelCollection(value.availableModels, allowed)) changed = true;
+      if (allowed) for (const name of value.availableModels) {
+        if (!allowed.has(name)) { value.availableModels.delete(name); changed = true; }
+      }
       names.forEach((name) => {
         if (!value.availableModels.has(name)) {
           value.availableModels.add(name);
           changed = true;
         }
       });
+      finishModelCollection(value.availableModels);
     }
     if (value.available_models instanceof Set) {
+      if (prepareModelCollection(value.available_models, allowed)) changed = true;
+      if (allowed) for (const name of value.available_models) {
+        if (!allowed.has(name)) { value.available_models.delete(name); changed = true; }
+      }
       names.forEach((name) => {
         if (!value.available_models.has(name)) {
           value.available_models.add(name);
           changed = true;
         }
       });
+      finishModelCollection(value.available_models);
     }
     if (Array.isArray(value.availableModels)) {
-      names.forEach((name) => {
-        if (!value.availableModels.includes(name)) {
-          value.availableModels.push(name);
-          changed = true;
-        }
-      });
+      if (patchModelNameArray(value.availableModels, hostId)) changed = true;
     }
     if (Array.isArray(value.available_models)) {
-      names.forEach((name) => {
-        if (!value.available_models.includes(name)) {
-          value.available_models.push(name);
-          changed = true;
-        }
-      });
+      if (patchModelNameArray(value.available_models, hostId)) changed = true;
     }
     if (Array.isArray(value.hiddenModels)) {
       const before = value.hiddenModels.length;
@@ -8192,6 +9650,7 @@
       value.hidden_models = value.hidden_models.filter((name) => !names.includes(name));
       if (value.hidden_models.length !== before) changed = true;
     }
+    if (patchModelDefaults(value, allowed)) changed = true;
     return changed;
   }
 
@@ -8225,7 +9684,7 @@
     if (!codexPlusModelNames().length) await loadCodexModelCatalog();
     if (!modelJsonResponseLooksPatchable(payload)) return payload;
     try {
-      patchModelContainer(payload);
+      patchModelContainer(payload, modelResponseHostId(payload, payload.result, payload.message));
     } catch (error) {
       window.__codexPlusModelPatchFailures = window.__codexPlusModelPatchFailures || [];
       window.__codexPlusModelPatchFailures.push(String(error?.stack || error));
@@ -8234,8 +9693,8 @@
   }
 
   function installModelJsonResponsePatch() {
-    if (window.__codexPlusModelJsonResponsePatchInstalled === "1") return;
-    window.__codexPlusModelJsonResponsePatchInstalled = "1";
+    if (window.__codexPlusModelJsonResponsePatchInstalled === "3") return;
+    window.__codexPlusModelJsonResponsePatchInstalled = "3";
     window.__codexPlusModelJsonResponseOriginals = window.__codexPlusModelJsonResponseOriginals || {};
     const originals = window.__codexPlusModelJsonResponseOriginals;
     originals.responseJson = originals.responseJson || Response.prototype.json;
@@ -8246,20 +9705,19 @@
     };
   }
 
-  function patchStatsigModelDynamicConfig(config) {
-    const names = codexPlusModelNames();
+  function patchStatsigModelDynamicConfig(config, hostId) {
     const value = config?.value;
-    if (!names.length || !value || typeof value !== "object") return config;
+    if (!value || typeof value !== "object") return config;
     const availableModels = Array.isArray(value.available_models) ? [...value.available_models] : [];
-    let changed = false;
-    names.forEach((name) => {
-      if (!availableModels.includes(name)) {
-        availableModels.push(name);
-        changed = true;
-      }
-    });
-    if (!changed) return config;
+    const collectionSnapshot = codexPlusModelCollectionSnapshots.get(value.available_models);
+    if (collectionSnapshot) codexPlusModelCollectionSnapshots.set(availableModels, { ...collectionSnapshot });
     const nextValue = { ...value, available_models: availableModels };
+    const defaultSnapshot = codexPlusModelDefaultSnapshots.get(value);
+    if (defaultSnapshot) codexPlusModelDefaultSnapshots.set(nextValue, { ...defaultSnapshot, fields: { ...defaultSnapshot.fields } });
+    hostId = modelResponseHostId(hostId, value);
+    const listChanged = patchModelNameArray(availableModels, hostId);
+    const defaultsChanged = patchModelDefaults(nextValue, codexPureApiAllowedModelSet(hostId));
+    if (!listChanged && !defaultsChanged) return config;
     try {
       config.value = nextValue;
     } catch {
@@ -8279,13 +9737,13 @@
   function patchStatsigModelWhitelist() {
     statsigClients().forEach((client) => {
       if (typeof client.getDynamicConfig !== "function") return;
-      if (!client.__codexPlusModelWhitelistPatched) {
+      if (client.__codexPlusModelWhitelistPatched !== "3") {
         const originalGetDynamicConfig = client.getDynamicConfig.bind(client);
         client.getDynamicConfig = (name, options) => {
           const result = originalGetDynamicConfig(name, options);
           return String(name) === "107580212" ? patchStatsigModelDynamicConfig(result) : result;
         };
-        client.__codexPlusModelWhitelistPatched = true;
+        client.__codexPlusModelWhitelistPatched = "3";
       }
       try {
         patchStatsigModelDynamicConfig(client.getDynamicConfig("107580212", { disableExposureLog: true }));
@@ -8295,8 +9753,8 @@
   }
 
   function patchAppServerModelMessages() {
-    if (window.__codexPlusModelMessagePatchInstalled) return;
-    window.__codexPlusModelMessagePatchInstalled = true;
+    if (window.__codexPlusModelMessagePatchInstalled === "3") return;
+    window.__codexPlusModelMessagePatchInstalled = "3";
     window.addEventListener("codex-message-from-view", (event) => {
       try {
         const detail = event?.detail;
@@ -8305,11 +9763,7 @@
           request.params = { ...(request.params || {}), includeHidden: true };
           if (request.id != null) {
             const requestId = String(request.id);
-            codexPlusModelListRequestIds.add(requestId);
-            if (codexPlusModelListRequestIds.size > 64) {
-              codexPlusModelListRequestIds.delete(codexPlusModelListRequestIds.values().next().value);
-            }
-            window.setTimeout(() => codexPlusModelListRequestIds.delete(requestId), 30_000);
+            recordModelListRequest(requestId, modelResponseHostId(detail, request, request.params));
           }
         }
       } catch (error) {
@@ -8328,36 +9782,57 @@
     }, true);
   }
 
+  function recordModelListRequest(requestId, hostId) {
+    if (codexPlusModelListRequestIds.has(requestId)
+        && codexPlusModelListRequestHosts.get(requestId) !== hostId) hostId = "";
+    codexPlusModelListRequestIds.add(requestId);
+    codexPlusModelListRequestHosts.set(requestId, hostId);
+    if (codexPlusModelListRequestIds.size > 64) {
+      const oldest = codexPlusModelListRequestIds.values().next().value;
+      codexPlusModelListRequestIds.delete(oldest);
+      codexPlusModelListRequestHosts.delete(oldest);
+    }
+    window.setTimeout(() => {
+      codexPlusModelListRequestIds.delete(requestId);
+      codexPlusModelListRequestHosts.delete(requestId);
+    }, 30_000);
+  }
+
   function patchMcpModelResponseData(data) {
     if (!codexPlusModelUnlockEnabled()) return false;
     if (data?.type !== "mcp-response") return false;
     const message = data.message || data.response;
     const requestId = message?.id != null ? String(message.id) : "";
     if (codexPlusModelListRequestIds.size === 0 || !codexPlusModelListRequestIds.has(requestId)) return false;
+    const hostId = modelResponseHostId(data, message, codexPlusModelListRequestHosts.get(requestId));
     codexPlusModelListRequestIds.delete(requestId);
+    codexPlusModelListRequestHosts.delete(requestId);
     let changed = false;
-    if (patchModelArray(message?.result?.data, true)) changed = true;
-    if (patchModelArray(message?.result?.models, true)) changed = true;
+    if (patchModelArray(message?.result?.data, true, hostId)) changed = true;
+    if (patchModelArray(message?.result?.models, true, hostId)) changed = true;
     return changed;
   }
 
   function appServerModelRequestMethod(method, params) {
-    if (method === "send-cli-request-for-host" && params?.method) return String(params.method);
+    if (method === "send-cli-request-for-host" && params?.method) return appServerModelRequestMethod(String(params.method), params.params);
     if (method === "vscode://codex/list-plugins") return "list-plugins";
     if (method === "vscode://codex/plugin/install") return "install-plugin";
     if (method === "vscode://codex/plugin/uninstall") return "uninstall-plugin";
     if (method === "plugin/list") return "list-plugins";
     if (method === "plugin/install") return "install-plugin";
+    if (method === "plugin/read") return "read-plugin";
+    if (method === "plugin/installed") return "installed-plugins";
     if (method === "plugin/uninstall") return "uninstall-plugin";
     return String(method || "");
   }
 
-  function patchAppServerModelResult(method, result) {
-    if (method !== "list-models-for-host") return result;
+  function patchAppServerModelResult(method, result, hostId) {
+    if (!["list-models-for-host", "model/list"].includes(method)) return result;
+    hostId = modelResponseHostId(hostId, result);
     try {
-      if (Array.isArray(result)) patchModelArray(result, true);
-      if (Array.isArray(result?.data)) patchModelArray(result.data, true);
-      if (Array.isArray(result?.models)) patchModelArray(result.models, true);
+      if (Array.isArray(result)) patchModelArray(result, true, hostId);
+      if (Array.isArray(result?.data)) patchModelArray(result.data, true, hostId);
+      if (Array.isArray(result?.models)) patchModelArray(result.models, true, hostId);
       sendCodexPlusDiagnostic("model_app_server_result_patched", {
         method,
         modelCount: Array.isArray(result?.data) ? result.data.length : Array.isArray(result?.models) ? result.models.length : Array.isArray(result) ? result.length : null,
@@ -8420,6 +9895,7 @@
 
   function patchAppServerModelRequestClient(client) {
     if (!client || typeof client.sendRequest !== "function") return false;
+    registerNativeHostClient(client);
     try {
       if (!Object.isExtensible(client)) return false;
       for (const key of [
@@ -8441,12 +9917,15 @@
     client.__codexPlusModelOriginalSendRequest = originalSendRequest;
     client.__codexPlusThreadModels = client.__codexPlusThreadModels || new Map();
     client.sendRequest = async function codexPlusModelPatchedSendRequest(method, params, options) {
+      const managed = codexPlusPluginNativeInterceptClient(method, params, options,
+        (nextOptions) => originalSendRequest(method, params, nextOptions), client.hostId);
+      if (managed) return await managed;
       const requestMethod = appServerModelRequestMethod(String(method || ""), params);
       let providerRefreshFailed = false;
       if (codexRemoteSessionProviderRequestMethod(requestMethod)
           && codexRemoteSessionProviderPatchEnabled()
           && window.__codexSessionDeleteBridge) {
-        const settingsLoaded = await loadBackendSettingsState();
+        const settingsLoaded = await loadBackendSettingsState(codexAppServerPreparationTimeoutMs);
         providerRefreshFailed = !settingsLoaded;
         if (providerRefreshFailed) {
           sendCodexPlusDiagnostic("remote_session_provider_refresh_failed", {});
@@ -8454,7 +9933,7 @@
       } else if (codexRemoteSessionProviderRequestMethod(requestMethod)
           && codexRemoteSessionProviderOverrideEnabled()
           && !codexRemoteSessionTargetProvider()) {
-        await loadCodexModelCatalog();
+        providerRefreshFailed = (await loadCodexModelCatalog())?.status === "failed";
       }
       const providerParams = providerRefreshFailed
         ? params
@@ -8473,9 +9952,9 @@
           && ["thread/start", "thread/resume", "turn/start"].includes(threadState.requestMethod)) {
         client.__codexPlusThreadModels.set(threadState.threadId, threadState.model);
       }
-      if (!codexPlusModelUnlockEnabled()) return result;
+      if (!codexPlusModelUnlockEnabled() || !["list-models-for-host", "model/list"].includes(requestMethod)) return result;
       if (!codexPlusModelNames().length) await loadCodexModelCatalog();
-      return patchAppServerModelResult(requestMethod, result);
+      return patchAppServerModelResult(requestMethod, result, modelResponseHostId(params, client));
     };
     if (typeof client.prewarmThreadStart === "function"
         && !client.__codexPlusServiceTierOriginalPrewarmThreadStart) {
@@ -8516,29 +9995,85 @@
     return { lineNumber, columnNumber: braceIdx - lastNewline - 1 };
   }
 
+  // issue #2399：抓取目标不能再按 asset 文件名前缀写死。Codex 26.930 把
+  // AppServerRequestClient 从 `app-initial-*.js` 搬到了 `app-shared-*.js`，
+  // 按前缀找资产必然 anchor_missing，模型白名单解锁在整条 app-server 路径上失效。
+  // 加一项前缀只治当前这一版，下次改名又会失灵，所以改成**按内容找类定义**：
+  // 遍历已加载的 app asset，谁包含 marker 文本谁就是目标，两代产物都能覆盖。
+  // 排序只做「可能的更靠前」的启发式，不影响正确性；命中全靠文本匹配。
+  const codexAppServerClientBundleHints = ["app-shared-", "app-initial-", "app-main-", "chatg"];
+  const codexAppServerClientAssetFetchLimit = 24;
+
+  function codexAppServerClientAssetCandidateUrls() {
+    const urls = codexAppAssetCandidateUrls();
+    const rank = (url) => {
+      const name = (url.split("/").pop() || "").toLowerCase();
+      const hint = codexAppServerClientBundleHints.findIndex((part) => name.includes(part));
+      return hint < 0 ? codexAppServerClientBundleHints.length : hint;
+    };
+    // 按「像主 bundle」在前、体积（URL 长度做代理）大的在前排序，再截断。
+    // 全量 fetch 所有 app asset 会重蹈 #1960 的覆辙，所以限制尝试数量。
+    return urls
+      .slice()
+      .sort((left, right) => rank(left) - rank(right) || right.length - left.length)
+      .slice(0, codexAppServerClientAssetFetchLimit);
+  }
+
+  // 返回 { url, location }；找不到返回 null。diagnostics 由调用方按命中/未命中归类。
+  async function locateCodexAppServerClientInAssets() {
+    const urls = codexAppServerClientAssetCandidateUrls();
+    if (urls.length === 0) return { urls, hit: null };
+    // 先走廉价的 asset loader（有 30s 失败冷却与重试上限），脚本里已经内联了
+    // asset 名时能直接命中，省掉整轮 fetch；不可用就退回到全量文本匹配。
+    const hinted = resolveCodexAppServerClientHintedUrl();
+    const ordered = hinted
+      ? [hinted, ...urls.filter((url) => url !== hinted)]
+      : urls;
+    for (const url of ordered) {
+      try {
+        const text = await fetch(url).then((response) => response.ok ? response.text() : "");
+        if (!text) continue;
+        const location = locateCodexAppServerClientBreakpoint(text);
+        if (location) return { urls, hit: { url, location } };
+      } catch {
+        // 单个 asset 拉取失败不影响其余候选，继续下一个。
+      }
+    }
+    return { urls, hit: null };
+  }
+
+  // 兼容旧路径：asset 名确实内联在入口脚本里时，用 loader 的缓存直接拿到 URL，
+  // 不必为了它把所有 asset 拉一遍。找不到就返回空串，交给内容匹配兜底。
+  function resolveCodexAppServerClientHintedUrl() {
+    for (const prefix of codexAppServerClientBundleHints) {
+      const url = codexAppAssetUrl(prefix);
+      if (url) return url;
+    }
+    return "";
+  }
+
     let codexAppServerClientCaptureStarted = false;
   async function installCodexAppServerClientCapture() {
     if (codexAppServerClientCaptureStarted || window.__codexPlusAppServerClientCapture) return;
     codexAppServerClientCaptureStarted = true;
     try {
       if (typeof fetch !== "function") return;
-      const url = codexAppAssetUrl("app-initial-") || await codexAppAssetUrlFromScriptText("app-initial-");
-      if (!url) {
-        sendCodexPlusDiagnostic("app_server_client_capture_locate_failed", { reason: "asset_url_missing" });
+      const { urls, hit } = await locateCodexAppServerClientInAssets();
+      if (!hit) {
+        // 区分「一个候选资产都没有」和「有资产但没有类定义」：
+        // 前者是页面还没加载完，后者才是 Codex 真的改了产物形状。
+        sendCodexPlusDiagnostic("app_server_client_capture_locate_failed", {
+          reason: urls.length === 0 ? "asset_url_missing" : "anchor_missing",
+          candidateCount: urls.length,
+        });
         return;
       }
-      const response = await fetch(url);
-      const text = response.ok ? await response.text() : "";
-      const location = locateCodexAppServerClientBreakpoint(text);
-      if (!location) {
-        sendCodexPlusDiagnostic("app_server_client_capture_locate_failed", { reason: "anchor_missing" });
-        return;
-      }
-      const urlRegex = url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      window.__codexPlusAppServerClientCapture = { urlRegex, ...location };
+      const urlRegex = hit.url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      window.__codexPlusAppServerClientCapture = { urlRegex, ...hit.location };
       sendCodexPlusDiagnostic("app_server_client_capture_located", {
-        lineNumber: location.lineNumber,
-        columnNumber: location.columnNumber,
+        lineNumber: hit.location.lineNumber,
+        columnNumber: hit.location.columnNumber,
+        asset: (hit.url.split("/").pop() || "").split("?")[0],
       });
     } catch (error) {
       codexAppServerClientCaptureStarted = false;
@@ -8552,8 +10087,10 @@
     function installCodexAppServerClientPrototypePatch() {
     if (window.__codexPlusAppServerClientPrototypePatchInstalled === codexAppServerModelRequestPatchVersion) return true;
     const wanted = codexPlusModelUnlockEnabled()
+      || codexPluginMarketplacePatchEnabled()
       || (codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled())
-      || codexPlusSettings().serviceTierControls;
+      || codexPlusSettings().serviceTierControls
+      || codexPlusSettings().sessionDelete;
     if (!wanted) return false;
     const klass = window.__codexPlusAppServerClientClass;
     if (!klass || typeof klass !== "function" || !klass.prototype) return false;
@@ -8578,12 +10115,16 @@
     proto.__codexPlusThreadModels = proto.__codexPlusThreadModels || new Map();
     proto.sendRequest = async function codexPlusModelPatchedSendRequest(method, params, options) {
       const client = this;
+      registerNativeHostClient(client);
+      const managed = codexPlusPluginNativeInterceptClient(method, params, options,
+        (nextOptions) => originalSendRequest.call(client, method, params, nextOptions), client.hostId);
+      if (managed) return await managed;
       const requestMethod = appServerModelRequestMethod(String(method || ""), params);
       let providerRefreshFailed = false;
       if (codexRemoteSessionProviderRequestMethod(requestMethod)
           && codexRemoteSessionProviderPatchEnabled()
           && window.__codexSessionDeleteBridge) {
-        const settingsLoaded = await loadBackendSettingsState();
+        const settingsLoaded = await loadBackendSettingsState(codexAppServerPreparationTimeoutMs);
         providerRefreshFailed = !settingsLoaded;
         if (providerRefreshFailed) {
           sendCodexPlusDiagnostic("remote_session_provider_refresh_failed", {});
@@ -8591,7 +10132,7 @@
       } else if (codexRemoteSessionProviderRequestMethod(requestMethod)
           && codexRemoteSessionProviderOverrideEnabled()
           && !codexRemoteSessionTargetProvider()) {
-        await loadCodexModelCatalog();
+        providerRefreshFailed = (await loadCodexModelCatalog())?.status === "failed";
       }
       const providerParams = providerRefreshFailed
         ? params
@@ -8610,9 +10151,9 @@
           && ["thread/start", "thread/resume", "turn/start"].includes(threadState.requestMethod)) {
         client.__codexPlusThreadModels.set(threadState.threadId, threadState.model);
       }
-      if (!codexPlusModelUnlockEnabled()) return result;
+      if (!codexPlusModelUnlockEnabled() || !["list-models-for-host", "model/list"].includes(requestMethod)) return result;
       if (!codexPlusModelNames().length) await loadCodexModelCatalog();
-      return patchAppServerModelResult(requestMethod, result);
+      return patchAppServerModelResult(requestMethod, result, modelResponseHostId(params, client));
     };
     if (typeof proto.prewarmThreadStart === "function"
         && !proto.__codexPlusServiceTierOriginalPrewarmThreadStart) {
@@ -8734,8 +10275,10 @@
 
   function ensureCodexModelWhitelistInstalls() {
     if (codexPlusModelUnlockEnabled()
+        || codexPluginMarketplacePatchEnabled()
         || (codexPlusBackendSettingsLoaded && codexRemoteSessionProviderPatchEnabled())
-        || codexPlusSettings().serviceTierControls) {
+        || codexPlusSettings().serviceTierControls
+        || codexPlusSettings().sessionDelete) {
       installAppServerModelRequestPatch();
       void installCodexAppServerClientCapture().catch(() => {});
     }
@@ -8800,7 +10343,6 @@
     const timestamp = Number.parseInt(id.slice(0, 12), 16);
     return Number.isFinite(timestamp) ? timestamp : 0;
   }
-
   function normalizeWorkspacePath(path) {
     const normalized = String(path || "").trim().replace(/\\/g, "/").replace(/\/+$/, "");
     return normalized || String(path || "").trim();
@@ -9087,10 +10629,28 @@
     }
   }
 
+  function sessionSharePlacement() {
+    // 会话操作锚点唯一时才挂载，不能把右侧审查/浏览器的 header 当作会话栏。
+    const headerSelector = 'header, [data-app-shell-header-edge-scroll], [class*="_Header_"]';
+    const anchors = Array.from(document.querySelectorAll('[data-testid="app-shell-header-context-menu-surface"]'))
+      .filter((node) => visibleElement(node) && !node.closest('[data-codex-plus-ext]'));
+    if (anchors.length !== 1) return null;
+    const header = anchors[0].closest(headerSelector);
+    if (!(header instanceof HTMLElement) || !visibleElement(header)) return null;
+    const nativeShare = Array.from(header.querySelectorAll('button[aria-label="Share"], button[aria-label="分享"], button[aria-label*="Share"], button[aria-label*="分享"]'))
+      .find((node) => visibleElement(node) && !node.closest('[data-codex-plus-ext]') && !node.classList.contains(sessionShareButtonClass) && node.closest(headerSelector) === header);
+    const nativeGroup = nativeShare?.closest?.(".ms-auto");
+    if (nativeGroup && header.contains(nativeGroup)) return nativeGroup;
+    const groups = Array.from(header.querySelectorAll(".ms-auto"))
+      .filter((node) => visibleElement(node) && !node.closest('[data-codex-plus-ext]') && node.closest(headerSelector) === header);
+    return groups.length === 1 ? groups[0] : null;
+  }
+
   function installSessionShareButton() {
     const existing = document.querySelectorAll(`.${sessionShareButtonClass}`);
     const ref = currentSessionRef();
-    if (!ref.session_id) {
+    const actionGroup = codexPlusSettings().sessionShare && ref.session_id ? sessionSharePlacement() : null;
+    if (!(actionGroup instanceof HTMLElement)) {
       existing.forEach((button) => button.remove());
       return;
     }
@@ -9102,6 +10662,7 @@
       button.className = `${sessionShareButtonClass} ${headerContextButtonClass}`;
       button.textContent = "分享会话";
       button.setAttribute("aria-label", "分享当前会话");
+      button.setAttribute("data-codex-plus-ext", "session-share");
       button.dataset.codexSessionShareVersion = sessionShareButtonVersion;
       button.addEventListener("click", (event) => {
         event.preventDefault();
@@ -9109,35 +10670,13 @@
         void createSessionShare();
       }, true);
     }
-    const nativeShare = Array.from(document.querySelectorAll('header button[aria-label="Share"], header button[aria-label="分享"], header button[aria-label*="Share"], header button[aria-label*="分享"]')).find(visibleElement);
-    const actionGroup = nativeShare?.closest?.(".ms-auto")
-      || document.querySelector("header .ms-auto")
-      || nativeShare?.parentElement?.parentElement?.parentElement;
-    if (actionGroup instanceof HTMLElement) {
-      button.style.position = "static";
-      button.style.pointerEvents = "auto";
-      button.style.webkitAppRegion = "no-drag";
-      // 只在按钮还不在操作栏里时才搬动它。过去还要求它必须排在最后，
-      // 一旦 Codex 在它后面挂了别的节点，这个条件就永远成立，
-      // 于是每轮 scan 都 appendChild 一次，反过来又触发下一轮 scan（issue #1960）。
-      if (button.parentElement !== actionGroup) {
-        actionGroup.appendChild(button);
-      }
-      return;
-    }
-    const header = document.querySelector('[data-testid="app-shell-header-context-menu-surface"]')?.closest?.("header")
-      || document.querySelector("header")
-      || document.querySelector(selectors.appHeader);
-    if (header instanceof HTMLElement) {
-      // 没有明确操作栏时也保持文档流，避免遮挡原生按钮。
-      button.style.position = "static";
-      button.style.pointerEvents = "auto";
-      button.style.webkitAppRegion = "no-drag";
-      button.style.marginLeft = "8px";
-      if (button.parentElement !== header) header.appendChild(button);
-    } else if (!button.isConnected) {
-      document.body.appendChild(button);
-    }
+    button.setAttribute("data-codex-plus-ext", "session-share");
+    button.style.position = "static";
+    button.style.pointerEvents = "auto";
+    button.style.webkitAppRegion = "no-drag";
+    button.style.marginLeft = "";
+    // 宿主重建时才搬动，避免每轮扫描再次触发 DOM mutation（issue #1960）。
+    if (button.parentElement !== actionGroup) actionGroup.appendChild(button);
   }
 
   function sessionImportMarkdown(session) {
@@ -9212,887 +10751,14 @@
     window.addEventListener("message", window.__codexSessionShareImportHandler);
   }
 
-  function upstreamWorktreeField(dialog, name) {
-    return dialog.querySelector(`[data-codex-upstream-worktree-field="${name}"]`);
-  }
-
-  function upstreamWorktreePayload(dialog) {
-    return {
-      repoPath: upstreamWorktreeField(dialog, "repoPath")?.value || "",
-      branchName: upstreamWorktreeField(dialog, "branchName")?.value || "",
-      worktreePath: upstreamWorktreeField(dialog, "worktreePath")?.value || "",
-      remote: upstreamWorktreeField(dialog, "remote")?.value || "upstream",
-      baseBranch: upstreamWorktreeField(dialog, "baseBranch")?.value || "main",
-      fetch: true,
-    };
-  }
-
-  function readUpstreamBranchSelection() {
-    try {
-      return JSON.parse(sessionStorage.getItem(upstreamBranchSelectionKey) || "null");
-    } catch {
-      return null;
-    }
-  }
-
-  function writeUpstreamBranchSelection(selection) {
-    if (!selection) {
-      sessionStorage.removeItem(upstreamBranchSelectionKey);
-      return;
-    }
-    sessionStorage.setItem(upstreamBranchSelectionKey, JSON.stringify(selection));
-  }
-
-  function nativeBranchMenuCandidates() {
-    return [...document.querySelectorAll('[role="menu"], [data-radix-menu-content], [cmdk-list]')];
-  }
-
-  function looksLikeBranchMenu(menu, trigger = branchMenuTriggerFromMenu(menu)) {
-    const text = (menu.innerText || menu.textContent || "").toLowerCase();
-    if (!branchMenuTriggerIsBranchControl(trigger)) return false;
-    if (/^start in\b/.test(text) || /\bwork locally\b.*\bnew worktree\b.*\bcloud\b/s.test(text)) return false;
-    return /\bbranches?\b|\bbranche\b|create and checkout new branch|create branch/.test(text);
-  }
-
   function visibleElement(node) {
     if (!(node instanceof Element)) return false;
     const rect = node.getBoundingClientRect?.();
     return !!rect && rect.width > 0 && rect.height > 0;
   }
 
-  function effectiveElementRect(node) {
-    if (!(node instanceof Element)) return null;
-    const rect = node.getBoundingClientRect?.();
-    if (rect && rect.width > 0 && rect.height > 0) return rect;
-    const controls = [...node.closest?.(".composer-footer")?.querySelectorAll?.("button, [role='button']") || []]
-      .filter((candidate) => candidate !== node && visibleElement(candidate));
-    const matching = controls.find((candidate) => normalizedElementText(candidate) === normalizedElementText(node));
-    return matching?.getBoundingClientRect?.() || rect || null;
-  }
-
-  function sidebarProjectRows() {
-    const section = projectsSection?.();
-    return [...document.querySelectorAll('[data-app-action-sidebar-project-row][data-app-action-sidebar-project-id]')]
-      .filter((row) => !section || section.contains(row));
-  }
-
-  function projectRowPath(row) {
-    return row?.getAttribute?.("data-app-action-sidebar-project-id") || "";
-  }
-
-  function projectContextFromRow(row) {
-    const path = projectRowPath(row);
-    if (!path) return null;
-    const label = row.getAttribute("data-app-action-sidebar-project-label")
-      || row.getAttribute("aria-label")
-      || displayProjectName(path);
-    return {
-      repoPath: path.startsWith("/") ? path : "",
-      projectId: path.startsWith("/") ? "" : path,
-      label: normalizeProjectLabel(label),
-      at: Date.now(),
-    };
-  }
-
-  function remoteProjectContextFromGlobalState(projectId) {
-    const normalizedProjectId = String(projectId || "").trim();
-    if (!normalizedProjectId) return null;
-    return { projectId: normalizedProjectId, repoPath: "", label: "", at: Date.now() };
-  }
-
-  function readUpstreamProjectContext() {
-    try {
-      const context = JSON.parse(sessionStorage.getItem(upstreamProjectContextKey) || "null");
-      if (!context || typeof context !== "object") return null;
-      if (typeof context.at === "number" && Date.now() - context.at > upstreamProjectContextTtlMs) return null;
-      if (!context.repoPath && !context.projectId) return null;
-      return context;
-    } catch {
-      return null;
-    }
-  }
-
-  function writeUpstreamProjectContext(context) {
-    if (!context?.repoPath && !context?.projectId) return;
-    try {
-      sessionStorage.setItem(upstreamProjectContextKey, JSON.stringify({
-        repoPath: context.repoPath || "",
-        projectId: context.projectId || "",
-        label: context.label || "",
-        at: Date.now(),
-      }));
-    } catch {
-    }
-  }
-
-  function projectContextFromStartButton(button) {
-    const row = button?.closest?.('[data-app-action-sidebar-project-row][data-app-action-sidebar-project-id]');
-    return projectContextFromRow(row);
-  }
-
-  function rememberStartNewChatProjectContext(event) {
-    const target = event.target instanceof Element ? event.target : event.target?.parentElement;
-    const button = target?.closest?.('button[aria-label^="Start new chat in "]');
-    const context = projectContextFromStartButton(button);
-    if (context) writeUpstreamProjectContext(context);
-  }
-
-  function visibleProjectRows() {
-    return sidebarProjectRows().filter((row) => visibleElement(row));
-  }
-
-  function currentProjectContextFromStartButton() {
-    const startButtons = [...document.querySelectorAll('button[aria-label^="Start new chat in "]')]
-      .filter((button) => visibleElement(button));
-    const bottomHalf = window.innerHeight * 0.5;
-    startButtons.sort((left, right) => {
-      const leftRect = left.getBoundingClientRect();
-      const rightRect = right.getBoundingClientRect();
-      const leftScore = Math.abs(leftRect.y - bottomHalf) + Math.max(0, bottomHalf - leftRect.y) * 0.5;
-      const rightScore = Math.abs(rightRect.y - bottomHalf) + Math.max(0, bottomHalf - rightRect.y) * 0.5;
-      return leftScore - rightScore;
-    });
-    for (const button of startButtons) {
-      const context = projectContextFromStartButton(button);
-      if (context) return context;
-    }
-    return null;
-  }
-
-  function currentProjectRepoPathFromSelectedProjectButton() {
-    const projectButtons = [...document.querySelectorAll('button[aria-haspopup="menu"]')]
-      .filter((button) => visibleElement(button))
-      .filter((button) => button.getBoundingClientRect().x > 300)
-      .map((button) => (button.innerText || button.textContent || "").trim())
-      .filter(Boolean);
-    for (const label of projectButtons) {
-      const match = visibleProjectRows().find((row) => {
-        const rowLabel = row.getAttribute("data-app-action-sidebar-project-label") || row.getAttribute("aria-label") || "";
-        return rowLabel.trim() === label;
-      });
-      const path = projectRowPath(match);
-      if (path?.startsWith?.("/")) return path;
-    }
-    return "";
-  }
-
-  function projectContextFromProjectLabel(label) {
-    const normalizedLabel = normalizeProjectLabel(label);
-    if (!normalizedLabel) return null;
-    const row = visibleProjectRows().find((candidate) => {
-      const rowPath = projectRowPath(candidate);
-      const rowLabels = [
-        candidate.getAttribute("data-app-action-sidebar-project-label"),
-        candidate.getAttribute("aria-label"),
-        displayProjectName(rowPath),
-      ].map(normalizeProjectLabel).filter(Boolean);
-      return rowLabels.includes(normalizedLabel);
-    });
-    const context = projectContextFromRow(row);
-    if (!context) return null;
-    return context.projectId ? { ...remoteProjectContextFromGlobalState(context.projectId), label: context.label } : context;
-  }
-
-  function contextMatchesProjectLabel(context, label) {
-    const expected = normalizeProjectLabel(label);
-    if (!expected) return true;
-    const actual = normalizeProjectLabel(context?.label);
-    return !actual || actual === expected;
-  }
-
-  function currentProjectContextFromStoredSelection(label = "") {
-    const context = readUpstreamProjectContext();
-    return contextMatchesProjectLabel(context, label) ? context : null;
-  }
-
-  function currentProjectContextForBranchMenu(menu, trigger = branchMenuTriggerFromMenu(menu)) {
-    const footer = trigger?.closest?.(".composer-footer");
-    const projectButton = footer ? [...footer.querySelectorAll('button, [role="button"]')]
-      .filter((node) => node !== trigger && visibleElement(node))
-      .filter((node) => {
-        const rect = effectiveElementRect(node);
-        const triggerRect = effectiveElementRect(trigger);
-        return rect && triggerRect && rect.x < triggerRect.x;
-      })
-      .sort((left, right) => effectiveElementRect(left).x - effectiveElementRect(right).x)
-      .find((node) => projectContextFromProjectLabel(normalizedElementText(node))) : null;
-    const projectLabel = normalizedElementText(projectButton);
-    return currentProjectContextFromStoredSelection(projectLabel)
-      || projectContextFromProjectLabel(projectLabel)
-      || currentProjectContextFromStoredSelection()
-      || currentProjectContext();
-  }
-
-  function currentProjectRepoPathFromExpandedRows() {
-    const expandedRows = visibleProjectRows().filter((row) => row.getAttribute("data-app-action-sidebar-project-collapsed") === "false");
-    const pathRows = expandedRows.filter((row) => projectRowPath(row).startsWith("/"));
-    if (pathRows.length === 1) return projectRowPath(pathRows[0]);
-    return "";
-  }
-
-  function currentProjectContext() {
-    const stored = currentProjectContextFromStoredSelection();
-    if (stored) return stored;
-    const selectedPath = currentProjectRepoPathFromSelectedProjectButton();
-    if (selectedPath) return { repoPath: selectedPath, projectId: "", label: displayProjectName(selectedPath), at: Date.now() };
-    const startContext = currentProjectContextFromStartButton();
-    if (startContext) return startContext;
-    const expandedPath = currentProjectRepoPathFromExpandedRows();
-    if (expandedPath) return { repoPath: expandedPath, projectId: "", label: displayProjectName(expandedPath), at: Date.now() };
-    return null;
-  }
-
-  function newWorktreeModeActive() {
-    return [...document.querySelectorAll('button, [role="button"]')]
-      .filter((node) => visibleElement(node))
-      .some((node) => {
-        return normalizedElementText(node) === "New worktree";
-      });
-  }
-
   function normalizedElementText(node) {
     return (node?.innerText || node?.textContent || "").replace(/\s+/g, " ").trim();
-  }
-
-  function codexMenuLocalizationScopeSelector() {
-    return [
-      "[role='menu']",
-      "[role='dialog']",
-      "[role='listbox']",
-      "[cmdk-list]",
-      "[data-radix-menu-content]",
-      "[data-radix-popper-content-wrapper]",
-      "[data-testid='app-shell-header-context-menu-surface']",
-      "[data-codex-keyboard-shortcuts]",
-      "[class*='command']",
-      "[class*='Command']",
-      "[class*='shortcut']",
-      "[class*='Shortcut']",
-    ].join(", ");
-  }
-
-  function codexMenuLocalizationRoot() {
-    return document.body || document.documentElement;
-  }
-
-  function shouldLocalizeCodexMenuNode(node) {
-    if (!node || node.nodeType !== Node.TEXT_NODE || !node.nodeValue) return false;
-    const parent = node.parentElement;
-    if (!parent || isExtensionUiNode(parent)) return false;
-    if (parent.closest?.("textarea, input, [contenteditable='true'], [data-message-author-role], [data-testid='conversation-turn'], main .prose")) return false;
-    return !!parent.closest?.(codexMenuLocalizationScopeSelector());
-  }
-
-  function localizeCodexMenuTextNode(node) {
-    if (!shouldLocalizeCodexMenuNode(node)) return false;
-    const original = node.nodeValue;
-    const leading = original.match(/^\s*/)?.[0] || "";
-    const trailing = original.match(/\s*$/)?.[0] || "";
-    const normalized = original.replace(/\s+/g, " ").trim();
-    const localized = codexMenuLocalizationMap.get(normalized);
-    if (!localized) return false;
-    const next = `${leading}${localized}${trailing}`;
-    if (next === original) return false;
-    node.nodeValue = next;
-    return true;
-  }
-
-  function localizeCodexMenuAttributes(root) {
-    if (!root?.querySelectorAll) return false;
-    let changed = false;
-    const selector = "button[aria-label], [role='menuitem'][aria-label], [title], [placeholder]";
-    root.querySelectorAll(selector).forEach((element) => {
-      if (isExtensionUiNode(element)) return;
-      if (element.closest?.("textarea, input, [contenteditable='true'], [data-message-author-role], [data-testid='conversation-turn'], main .prose")) return;
-      if (!element.closest?.(codexMenuLocalizationScopeSelector())) return;
-      for (const attribute of ["aria-label", "title", "placeholder"]) {
-        const value = element.getAttribute(attribute);
-        const localized = codexMenuLocalizationMap.get((value || "").replace(/\s+/g, " ").trim());
-        if (localized && localized !== value) {
-          element.setAttribute(attribute, localized);
-          changed = true;
-        }
-      }
-    });
-    return changed;
-  }
-
-  function localizeCodexMenus(root = codexMenuLocalizationRoot()) {
-    if (!root) return false;
-    let changed = false;
-    const scopes = [];
-    if (root.nodeType === 1 && root.matches?.(codexMenuLocalizationScopeSelector())) scopes.push(root);
-    root.querySelectorAll?.(codexMenuLocalizationScopeSelector()).forEach((scope) => scopes.push(scope));
-    for (const scope of scopes.slice(0, 80)) {
-      if (!(scope instanceof HTMLElement) || isExtensionUiNode(scope)) continue;
-      const walker = document.createTreeWalker(scope, NodeFilter.SHOW_TEXT);
-      let node;
-      while ((node = walker.nextNode())) {
-        if (localizeCodexMenuTextNode(node)) changed = true;
-      }
-      if (localizeCodexMenuAttributes(scope)) changed = true;
-      scope.dataset.codexMenuLocalizationVersion = codexMenuLocalizationVersion;
-    }
-    return changed;
-  }
-
-  async function loadUpstreamBranchDefaults(context) {
-    const repoPath = typeof context === "string" ? context : context?.repoPath || "";
-    const projectId = typeof context === "string" ? "" : context?.projectId || "";
-    if (!repoPath && !projectId) return null;
-    const cacheKey = projectId ? `project:${projectId}` : `repo:${repoPath}`;
-    const cacheTtlMs = projectId ? upstreamRemoteBranchDefaultsCacheTtlMs : upstreamBranchDefaultsCacheTtlMs;
-    const cached = upstreamBranchDefaultsCache.get(cacheKey);
-    if (cached && Date.now() - cached.loadedAt < cacheTtlMs) return cached;
-    const inflight = upstreamBranchDefaultsInflight.get(cacheKey);
-    if (inflight) return inflight;
-    const request = postJson("/upstream-worktree/defaults", { repoPath, projectId })
-      .then((result) => {
-        const entry = { repoPath, projectId, result, loadedAt: Date.now() };
-        if (result?.status === "ok") upstreamBranchDefaultsCache.set(cacheKey, entry);
-        return entry;
-      })
-      .finally(() => upstreamBranchDefaultsInflight.delete(cacheKey));
-    upstreamBranchDefaultsInflight.set(cacheKey, request);
-    return request;
-  }
-
-  function renderUpstreamBranchOption(menu, context, ref) {
-    const repoPath = context?.repoPath || "";
-    const label = ref.label || `${ref.remote || "upstream"}/${ref.branch || "main"}`;
-    const item = document.createElement("div");
-    item.setAttribute("role", "menuitem");
-    item.setAttribute("aria-checked", "false");
-    item.setAttribute(upstreamBranchOptionAttribute, "true");
-    item.setAttribute("data-repo-path", repoPath);
-    item.setAttribute("data-project-id", context?.projectId || "");
-    item.setAttribute("data-remote", ref.remote || "upstream");
-    item.setAttribute("data-base-branch", ref.branch || "main");
-    item.setAttribute("data-label", label);
-    item.className = "codex-upstream-branch-option cursor-interaction flex items-center gap-2 rounded-sm px-2 py-1.5 text-sm text-token-foreground hover:bg-token-list-hover-background";
-    item.innerHTML = `${branchIconSvg()}<span class="min-w-0 flex-1 truncate">${escapeHtml(label)}</span>${checkmarkSvg()}`;
-    menu.appendChild(item);
-  }
-
-  function branchIconSvg() {
-    return '<svg aria-hidden="true" data-codex-upstream-branch-icon="true" viewBox="0 0 24 24" class="h-4 w-4 shrink-0 text-token-text-tertiary" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="6" x2="6" y1="3" y2="15"></line><circle cx="18" cy="6" r="3"></circle><circle cx="6" cy="18" r="3"></circle><path d="M18 9a9 9 0 0 1-9 9"></path></svg>';
-  }
-
-  function checkmarkSvg() {
-    return '<svg hidden aria-hidden="true" data-codex-upstream-branch-check="true" viewBox="0 0 24 24" class="h-4 w-4 shrink-0 text-token-text-secondary" fill="none" stroke="currentColor" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"></path></svg>';
-  }
-
-  function branchMenuItems(menu) {
-    return [...menu.querySelectorAll('[role="menuitem"], [data-radix-collection-item]')]
-      .filter((item) => !item.closest?.(`[${upstreamBranchOptionAttribute}]`));
-  }
-
-  function branchMenuItemLabel(menuItem) {
-    return normalizedElementText(menuItem);
-  }
-
-  function upstreamBranchOptionLabel(option) {
-    return option?.getAttribute?.("data-label") || normalizedElementText(option);
-  }
-
-  function worktreeBranchMap(defaultsResult) {
-    const repoRoot = defaultsResult?.repoRoot || "";
-    const entries = Array.isArray(defaultsResult?.worktreeBranches) ? defaultsResult.worktreeBranches : [];
-    return new Map(entries
-      .filter((entry) => entry?.branch && entry?.path && entry.path !== repoRoot)
-      .map((entry) => [entry.branch, entry.path]));
-  }
-
-  function annotateBranchMenuWorktreeUsage(menu, defaultsResult) {
-    const usedBranches = worktreeBranchMap(defaultsResult);
-    for (const item of branchMenuItems(menu)) {
-      item.removeAttribute(branchWorktreePathAttribute);
-      item.removeAttribute("title");
-      const worktreePath = usedBranches.get(branchMenuItemLabel(item));
-      if (!worktreePath) continue;
-      item.setAttribute(branchWorktreePathAttribute, worktreePath);
-      item.setAttribute("title", `该分支已在另一个 worktree 使用：${worktreePath}`);
-    }
-  }
-
-  function branchWorktreePathFromMenuItem(menuItem) {
-    const annotatedPath = menuItem?.getAttribute?.(branchWorktreePathAttribute) || "";
-    if (annotatedPath) return annotatedPath;
-    const menu = menuItem?.closest?.('[role="menu"], [data-radix-menu-content]');
-    const context = currentProjectContextForBranchMenu(menu);
-    const cacheKey = context?.projectId ? `project:${context.projectId}` : `repo:${context?.repoPath || ""}`;
-    const usedBranches = worktreeBranchMap(upstreamBranchDefaultsCache.get(cacheKey)?.result);
-    return usedBranches.get(branchMenuItemLabel(menuItem)) || "";
-  }
-
-  function upstreamBranchOptionsMatchRefs(menu, context, refs) {
-    const repoPath = context?.repoPath || "";
-    const projectId = context?.projectId || "";
-    const options = [...menu.querySelectorAll(`[${upstreamBranchOptionAttribute}]`)];
-    if (options.length !== refs.length) return false;
-    return options.every((option, index) => {
-      const ref = refs[index];
-      return option.getAttribute("data-repo-path") === repoPath
-        && option.getAttribute("data-project-id") === projectId
-        && option.getAttribute("data-remote") === (ref.remote || "upstream")
-        && option.getAttribute("data-base-branch") === (ref.branch || "main")
-        && upstreamBranchOptionLabel(option) === (ref.label || `${ref.remote || "upstream"}/${ref.branch || "main"}`);
-    });
-  }
-
-  function syncUpstreamBranchMenuSelection(menu) {
-    if (!menu) return;
-    const selection = readUpstreamBranchSelection();
-    for (const option of menu.querySelectorAll(`[${upstreamBranchOptionAttribute}]`)) {
-      const selected = !!selection
-        && option.getAttribute("data-repo-path") === (selection.repoPath || "")
-        && option.getAttribute("data-project-id") === (selection.projectId || "")
-        && option.getAttribute("data-remote") === (selection.remote || "upstream")
-        && option.getAttribute("data-base-branch") === (selection.baseBranch || "main");
-      option.setAttribute("aria-checked", selected ? "true" : "false");
-      option.toggleAttribute("data-selected", selected);
-      const check = option.querySelector('[data-codex-upstream-branch-check="true"]');
-      if (check && selected) check.removeAttribute("hidden");
-      if (check && !selected) check.setAttribute("hidden", "");
-    }
-  }
-
-  function removeUpstreamBranchOptions(scope = document) {
-    scope.querySelectorAll(`[${upstreamBranchOptionAttribute}], .codex-upstream-branch-group`)
-      .forEach((node) => node.remove());
-  }
-
-  function cleanupInvalidUpstreamBranchOptions() {
-    for (const menu of nativeBranchMenuCandidates()) {
-      if (!menu.querySelector(`[${upstreamBranchOptionAttribute}], .codex-upstream-branch-group`)) continue;
-      const trigger = branchMenuTriggerFromMenu(menu);
-      if (!looksLikeBranchMenu(menu, trigger) || !branchMenuInNewWorktreeMode(trigger)) {
-        removeUpstreamBranchOptions(menu);
-      }
-    }
-  }
-
-  function branchMenuTriggerFromMenu(menu) {
-    const labelledBy = menu?.getAttribute?.("aria-labelledby") || "";
-    if (labelledBy) {
-      const trigger = document.getElementById(labelledBy);
-      if (trigger instanceof Element) return trigger;
-    }
-    return [...document.querySelectorAll('.composer-footer button, .composer-footer [role="button"]')]
-      .filter((button) => (button.innerText || button.textContent || "").trim() === "main")
-      .sort((left, right) => right.getBoundingClientRect().x - left.getBoundingClientRect().x)[0] || null;
-  }
-
-  function branchMenuTriggerIsBranchControl(trigger) {
-    const text = normalizedElementText(trigger);
-    if (!text || /^(work locally|new worktree|cloud|no environment)$/i.test(text)) return false;
-    const rect = effectiveElementRect(trigger);
-    const footer = trigger?.closest?.(".composer-footer");
-    if (!rect || !footer) return /branch|main|create branch/i.test(text);
-    const modeTrigger = [...footer.querySelectorAll('button, [role="button"]')]
-      .filter((node) => node !== trigger && visibleElement(node))
-      .filter((node) => node.getBoundingClientRect().x < rect.x)
-      .sort((left, right) => right.getBoundingClientRect().x - left.getBoundingClientRect().x)
-      .find((node) => /^(work locally|new worktree|cloud)$/i.test(normalizedElementText(node)));
-    return !!modeTrigger;
-  }
-
-  function branchMenuInNewWorktreeMode(trigger) {
-    if (!trigger) return newWorktreeModeActive();
-    const footer = trigger.closest?.(".composer-footer");
-    const scope = footer || trigger.parentElement || document;
-    const triggerRect = effectiveElementRect(trigger);
-    if (!triggerRect) return false;
-    const modeTrigger = [...scope.querySelectorAll('button, [role="button"]')]
-      .filter((node) => node !== trigger && visibleElement(node))
-      .filter((node) => node.getBoundingClientRect().x < triggerRect.x)
-      .sort((left, right) => right.getBoundingClientRect().x - left.getBoundingClientRect().x)
-      .find((node) => /worktree|work locally/i.test(normalizedElementText(node)));
-    return normalizedElementText(modeTrigger) === "New worktree";
-  }
-
-  function branchTriggerLabelNode(trigger) {
-    if (!trigger) return null;
-    const nodes = [...trigger.querySelectorAll("span, div")]
-      .filter((node) => (node.innerText || node.textContent || "").trim());
-    return nodes.find((node) => node.classList?.contains("composer-footer__label--sm")) || nodes[0] || trigger;
-  }
-
-  function ensureNativeBranchTriggerLabel(trigger) {
-    if (!trigger || trigger.querySelector?.('[data-codex-upstream-branch-selection-label="true"]')) return;
-    const labelNode = branchTriggerLabelNode(trigger);
-    if (!labelNode) return;
-    trigger.setAttribute("data-codex-upstream-branch-trigger", "true");
-    labelNode.setAttribute("data-codex-native-branch-label", "true");
-    const selectionLabel = document.createElement("span");
-    selectionLabel.setAttribute("data-codex-upstream-branch-selection-label", "true");
-    selectionLabel.className = labelNode.className || "composer-footer__label--sm composer-footer__secondary-label max-w-40 truncate";
-    selectionLabel.hidden = true;
-    labelNode.insertAdjacentElement("afterend", selectionLabel);
-  }
-
-  function clearUpstreamBranchTriggerLabel() {
-    document.querySelectorAll('[data-codex-upstream-branch-trigger="true"]').forEach((trigger) => {
-      const nativeLabel = trigger.querySelector('[data-codex-native-branch-label="true"]');
-      const selectionLabel = trigger.querySelector('[data-codex-upstream-branch-selection-label="true"]');
-      if (nativeLabel) nativeLabel.hidden = false;
-      if (selectionLabel) selectionLabel.hidden = true;
-      trigger.removeAttribute("aria-label");
-      trigger.removeAttribute("title");
-    });
-  }
-
-  function syncUpstreamBranchTriggerLabel() {
-    const selection = readUpstreamBranchSelection();
-    if (!selection?.label) {
-      clearUpstreamBranchTriggerLabel();
-      return;
-    }
-    document.querySelectorAll('[data-codex-upstream-branch-trigger="true"]').forEach((trigger) => {
-      const nativeLabel = trigger.querySelector('[data-codex-native-branch-label="true"]');
-      const selectionLabel = trigger.querySelector('[data-codex-upstream-branch-selection-label="true"]');
-      if (!selectionLabel) return;
-      if (nativeLabel) nativeLabel.hidden = true;
-      selectionLabel.hidden = false;
-      selectionLabel.textContent = selection.label;
-      trigger.setAttribute("aria-label", selection.label);
-      trigger.setAttribute("title", selection.label);
-    });
-  }
-
-  function handleNativeBranchSelection(event) {
-    const target = event.target instanceof Element ? event.target : event.target?.parentElement;
-    const menuItem = target?.closest?.('[role="menuitem"], [data-radix-collection-item]');
-    if (!menuItem || menuItem.closest?.(`[${upstreamBranchOptionAttribute}]`)) return;
-    const menu = menuItem.closest?.('[role="menu"], [data-radix-menu-content]');
-    if (!menu || !looksLikeBranchMenu(menu)) return;
-    const text = (menuItem.innerText || menuItem.textContent || "").replace(/\s+/g, " ").trim();
-    if (!text || /^branches$/i.test(text) || /^upstream$/i.test(text) || text === readUpstreamBranchSelection()?.label) return;
-    const usedWorktreePath = branchWorktreePathFromMenuItem(menuItem);
-    writeUpstreamBranchSelection(null);
-    clearUpstreamBranchTriggerLabel();
-    syncUpstreamBranchMenuSelection(menu);
-    if (usedWorktreePath) {
-      event.preventDefault();
-      event.stopPropagation();
-      event.stopImmediatePropagation?.();
-      showToast(`该分支已在另一个 worktree 使用：${usedWorktreePath}`, null);
-    }
-  }
-
-  async function injectUpstreamBranchOptions() {
-    if (!codexPlusSettings().upstreamWorktreeCreate) {
-      removeUpstreamBranchOptions();
-      return;
-    }
-    cleanupInvalidUpstreamBranchOptions();
-    for (const menu of nativeBranchMenuCandidates()) {
-      const trigger = branchMenuTriggerFromMenu(menu);
-      if (!looksLikeBranchMenu(menu, trigger)) continue;
-      const context = currentProjectContextForBranchMenu(menu, trigger);
-      if (!context?.repoPath && !context?.projectId) {
-        removeUpstreamBranchOptions(menu);
-        continue;
-      }
-      const defaults = await loadUpstreamBranchDefaults(context);
-      const defaultsResult = defaults?.result;
-      const refs = defaults?.result?.upstreamRefs || [];
-      annotateBranchMenuWorktreeUsage(menu, defaultsResult);
-      if (!branchMenuInNewWorktreeMode(trigger)) {
-        removeUpstreamBranchOptions(menu);
-        writeUpstreamBranchSelection(null);
-        clearUpstreamBranchTriggerLabel();
-        continue;
-      }
-      if (!refs.length) {
-        removeUpstreamBranchOptions(menu);
-        continue;
-      }
-      const resolvedContext = {
-        repoPath: defaults?.repoPath || context.repoPath || defaultsResult?.repoRoot || "",
-        projectId: defaults?.projectId || context.projectId || "",
-      };
-      if (upstreamBranchOptionsMatchRefs(menu, resolvedContext, refs)) {
-        syncUpstreamBranchTriggerLabel();
-        syncUpstreamBranchMenuSelection(menu);
-        continue;
-      }
-      removeUpstreamBranchOptions(menu);
-      ensureNativeBranchTriggerLabel(trigger);
-      const group = document.createElement("div");
-      group.className = "codex-upstream-branch-group px-2 py-1 text-xs text-token-text-tertiary";
-      group.textContent = "Upstream";
-      menu.appendChild(group);
-      refs.forEach((ref) => renderUpstreamBranchOption(menu, resolvedContext, ref));
-      syncUpstreamBranchTriggerLabel();
-      syncUpstreamBranchMenuSelection(menu);
-    }
-  }
-
-  function installUpstreamBranchDropdownAdapter() {
-    const adapterVersion = "actual-upstream-refs-v17";
-    window.__codexUpstreamBranchDropdownAdapterVersion = adapterVersion;
-    if (window.__codexUpstreamBranchDropdownAdapterInstalled === adapterVersion) return;
-    window.__codexUpstreamBranchDropdownObserver?.disconnect?.();
-    window.__codexUpstreamBranchDropdownAdapterInstalled = adapterVersion;
-    let upstreamBranchInjectTimer = null;
-    const schedule = () => {
-      clearTimeout(upstreamBranchInjectTimer);
-      upstreamBranchInjectTimer = setTimeout(() => {
-        injectUpstreamBranchOptions().catch((error) => reportDiagnostic("upstream_branch_inject_failed", { error: error?.message || String(error) }));
-      }, 80);
-    };
-    document.addEventListener("click", (event) => {
-      rememberStartNewChatProjectContext(event);
-      const target = event.target instanceof Element ? event.target : event.target?.parentElement;
-      const control = target?.closest?.('button, [role="button"]');
-      if (control && branchMenuTriggerIsBranchControl(control)) schedule();
-      const option = target?.closest?.(`[${upstreamBranchOptionAttribute}]`);
-      if (!option) {
-        handleNativeBranchSelection(event);
-        return;
-      }
-      event.preventDefault();
-      event.stopPropagation();
-      const selection = {
-        repoPath: option.getAttribute("data-repo-path") || "",
-        projectId: option.getAttribute("data-project-id") || "",
-        remote: option.getAttribute("data-remote") || "upstream",
-        baseBranch: option.getAttribute("data-base-branch") || "main",
-        label: upstreamBranchOptionLabel(option) || "upstream/main",
-      };
-      writeUpstreamBranchSelection(selection);
-      prepareUpstreamBranchSelection(selection);
-      syncUpstreamBranchTriggerLabel();
-      syncUpstreamBranchMenuSelection(option.closest?.('[role="menu"], [data-radix-menu-content], [cmdk-list]'));
-      showToast(`将从 ${upstreamBranchOptionLabel(option) || "upstream/main"} 创建新 worktree`, null);
-    }, true);
-    const branchMenuSelector = '[role="menu"], [data-radix-menu-content], [cmdk-list]';
-    const addedNodeContainsBranchMenu = (node) => {
-      if (!(node instanceof Element)) return false;
-      return node.matches(branchMenuSelector) || !!node.querySelector(branchMenuSelector);
-    };
-    const observer = new MutationObserver((records) => {
-      if (records.some((record) => [...record.addedNodes].some(addedNodeContainsBranchMenu))) schedule();
-    });
-    observer.observe(document.body || document.documentElement, { childList: true, subtree: true });
-    window.__codexUpstreamBranchDropdownObserver = observer;
-    schedule();
-  }
-
-  function upstreamQualifiedSourceRef(selection) {
-    if (selection?.qualifiedSourceRef) return selection.qualifiedSourceRef;
-    const remote = (selection?.remote || "upstream").trim();
-    const baseBranch = (selection?.baseBranch || "main").trim();
-    return remote && baseBranch ? `refs/remotes/${remote}/${baseBranch}` : "";
-  }
-
-  function prepareUpstreamBranchSelection(selection) {
-    if ((!selection?.repoPath && !selection?.projectId) || !selection.remote || !selection.baseBranch) return;
-    void postJson("/upstream-worktree/prepare", {
-      repoPath: selection.repoPath || "",
-      projectId: selection.projectId || "",
-      remote: selection.remote,
-      baseBranch: selection.baseBranch,
-      fetch: true,
-    }).then((result) => {
-      if (result?.status !== "ok") throw new Error(result?.message || "prepare failed");
-      writePreparedUpstreamBranchSelection(selection, result);
-    }).catch((error) => {
-      sendCodexPlusDiagnostic("upstream_branch_prepare_failed", {
-        label: selection.label || "",
-        errorName: error?.name || "",
-        errorMessage: error?.message || String(error),
-      });
-    });
-  }
-
-  function writePreparedUpstreamBranchSelection(selection, result) {
-    const current = readUpstreamBranchSelection();
-    if (!upstreamSelectionMatches(current, selection)) return;
-    writeUpstreamBranchSelection({
-      ...current,
-      qualifiedSourceRef: result.qualifiedSourceRef || upstreamQualifiedSourceRef(selection),
-      sourceHead: result.sourceHead || "",
-      preparedAt: Date.now(),
-    });
-  }
-
-  function upstreamSelectionMatches(left, right) {
-    return !!left && !!right
-      && (left.repoPath || "") === (right.repoPath || "")
-      && (left.projectId || "") === (right.projectId || "")
-      && (left.remote || "upstream") === (right.remote || "upstream")
-      && (left.baseBranch || "main") === (right.baseBranch || "main");
-  }
-
-  function upstreamWorktreeNativePayloadFromElement(element) {
-    const trigger = element?.closest?.("[data-codex-worktree-create], [data-worktree-create]") || element;
-    const scopes = [
-      trigger,
-      trigger?.closest?.("form"),
-      trigger?.closest?.("dialog, [role='dialog']"),
-    ].filter((scope, index, all) => scope?.querySelector && all.indexOf(scope) === index);
-    if (!scopes.length) return null;
-    const valueFrom = (selectors) => {
-      for (const scope of scopes) {
-        for (const selector of selectors) {
-          const node = scope.matches?.(selector) ? scope : scope.querySelector(selector);
-          const dataAttribute = selector.match(/^\[([a-z0-9-]+)\]$/i)?.[1] || "";
-          const value = node?.value || node?.getAttribute?.(dataAttribute) || node?.getAttribute?.("data-value") || node?.textContent || "";
-          if (String(value).trim()) return String(value).trim();
-        }
-      }
-      return "";
-    };
-    const repoPath = valueFrom(["[data-repo-path]", "[name='repoPath']", "[name='repo']"]);
-    const branchName = valueFrom(["[data-branch-name]", "[name='branchName']", "[name='branch']"]);
-    const worktreePath = valueFrom(["[data-worktree-path]", "[name='worktreePath']", "[name='path']"]);
-    const remote = valueFrom(["[data-remote]", "[name='remote']"]) || "upstream";
-    const baseBranch = valueFrom(["[data-base-branch]", "[name='baseBranch']", "[name='base']"]) || "main";
-    if (!repoPath || !branchName || !worktreePath || !remote || !baseBranch) return null;
-    return { repoPath, branchName, worktreePath, remote, baseBranch, fetch: true };
-  }
-
-  function upstreamWorktreePayloadFromSelection(trigger) {
-    const selection = readUpstreamBranchSelection();
-    if ((!selection?.repoPath && !selection?.projectId) || !selection?.remote || !selection?.baseBranch) return null;
-    const nativePayload = upstreamWorktreeNativePayloadFromElement(trigger);
-    if (!nativePayload?.branchName || !nativePayload?.worktreePath) return null;
-    return {
-      ...nativePayload,
-      repoPath: selection.repoPath,
-      projectId: selection.projectId || "",
-      remote: selection.remote,
-      baseBranch: selection.baseBranch,
-      fetch: true,
-    };
-  }
-
-  async function handleUpstreamWorktreeNativeCreate(event) {
-    if (!codexPlusSettings().upstreamWorktreeCreate) return false;
-    const target = event.target instanceof Element ? event.target : event.target?.parentElement;
-    const trigger = target?.closest?.("[data-codex-worktree-create], [data-worktree-create]");
-    if (!trigger) return false;
-    const payload = upstreamWorktreePayloadFromSelection(trigger) || upstreamWorktreeNativePayloadFromElement(trigger);
-    if (!payload) {
-      showToast("无法安全识别 Codex 原生 worktree 表单，请使用 Codex++ 菜单创建。", null);
-      return false;
-    }
-    event.preventDefault();
-    event.stopPropagation();
-    try {
-      const result = await postJson("/upstream-worktree/create", payload);
-      if (result?.status === "ok") {
-        writeUpstreamBranchSelection(null);
-        syncUpstreamBranchTriggerLabel();
-        showToast(`已从 ${result.sourceRef} 创建 worktree`, null);
-      } else {
-        showToast(result?.message || "创建 upstream worktree 失败", null);
-      }
-    } catch (error) {
-      showToast(error?.message || "创建 upstream worktree 失败", null);
-    }
-    return true;
-  }
-
-  function installUpstreamWorktreeNativeAdapter() {
-    const adapterVersion = "2";
-    if (window.__codexUpstreamWorktreeNativeAdapterInstalled === adapterVersion) return;
-    window.__codexUpstreamWorktreeNativeAdapterInstalled = adapterVersion;
-    document.addEventListener("click", (event) => {
-      handleUpstreamWorktreeNativeCreate(event);
-    }, true);
-  }
-
-  function setUpstreamWorktreeMessage(dialog, message, status = "idle") {
-    const messageNode = dialog.querySelector("[data-codex-upstream-worktree-message]");
-    if (!messageNode) return;
-    messageNode.dataset.status = status;
-    messageNode.textContent = message || "";
-  }
-
-  async function loadUpstreamWorktreeDefaults(dialog) {
-    const repoPath = upstreamWorktreeField(dialog, "repoPath")?.value?.trim() || "";
-    if (!repoPath) {
-      setUpstreamWorktreeMessage(dialog, "填写仓库路径后会自动读取 remote 和当前分支。", "idle");
-      return;
-    }
-    setUpstreamWorktreeMessage(dialog, "正在读取仓库默认值…", "loading");
-    try {
-      const result = await postJson("/upstream-worktree/defaults", { repoPath });
-      if (result?.status !== "ok") {
-        setUpstreamWorktreeMessage(dialog, result?.message || "读取仓库默认值失败", "failed");
-        return;
-      }
-      const remote = upstreamWorktreeField(dialog, "remote");
-      const baseBranch = upstreamWorktreeField(dialog, "baseBranch");
-      if (remote && !remote.value) remote.value = result.defaultRemote || "upstream";
-      if (baseBranch && (!baseBranch.value || baseBranch.value === "main")) baseBranch.value = result.defaultBaseBranch || "main";
-      setUpstreamWorktreeMessage(dialog, `将从 ${remote?.value || "upstream"}/${baseBranch?.value || "main"} 创建 worktree。`, "ok");
-    } catch (error) {
-      setUpstreamWorktreeMessage(dialog, error?.message || "读取仓库默认值失败", "failed");
-    }
-  }
-
-  async function submitUpstreamWorktree(dialog) {
-    const payload = upstreamWorktreePayload(dialog);
-    if (!payload.repoPath || !payload.branchName || !payload.worktreePath || !payload.remote || !payload.baseBranch) {
-      setUpstreamWorktreeMessage(dialog, "仓库路径、分支名、worktree 路径、remote 和 base branch 都必须填写。", "failed");
-      return;
-    }
-    setUpstreamWorktreeMessage(dialog, "正在 fetch 并创建 worktree…", "loading");
-    try {
-      const result = await postJson("/upstream-worktree/create", payload);
-      if (result?.status === "ok") {
-        setUpstreamWorktreeMessage(dialog, `已从 ${result.sourceRef} 创建：${result.worktreePath}`, "ok");
-        showToast(`已创建 upstream worktree：${result.branchName}`, null);
-      } else {
-        setUpstreamWorktreeMessage(dialog, result?.message || "创建 upstream worktree 失败", "failed");
-      }
-    } catch (error) {
-      setUpstreamWorktreeMessage(dialog, error?.message || "创建 upstream worktree 失败", "failed");
-    }
-  }
-
-  function openUpstreamWorktreeDialog() {
-    document.querySelectorAll(`.${upstreamWorktreeDialogClass}`).forEach((node) => node.remove());
-    const overlay = document.createElement("div");
-    overlay.className = `codex-delete-confirm-overlay ${upstreamWorktreeDialogClass}`;
-    overlay.innerHTML = `
-      <div class="codex-delete-confirm-content" role="dialog" aria-modal="true" aria-label="Create upstream worktree">
-        <div class="codex-delete-confirm-title">Create from upstream</div>
-        <div class="codex-delete-confirm-message">等价于 git worktree add -b branch path upstream/base。创建前会先 fetch 远端分支。</div>
-        <label class="codex-plus-form-field">仓库路径<input data-codex-upstream-worktree-field="repoPath" type="text" placeholder="/path/to/repo"></label>
-        <label class="codex-plus-form-field">新分支名<input data-codex-upstream-worktree-field="branchName" type="text" placeholder="feature/my-task"></label>
-        <label class="codex-plus-form-field">Worktree 路径<input data-codex-upstream-worktree-field="worktreePath" type="text" placeholder="/path/to/worktrees/my-task"></label>
-        <label class="codex-plus-form-field">Remote<input data-codex-upstream-worktree-field="remote" type="text" value="upstream"></label>
-        <label class="codex-plus-form-field">Base branch<input data-codex-upstream-worktree-field="baseBranch" type="text" value="main"></label>
-        <div class="codex-plus-form-message" data-codex-upstream-worktree-message>填写仓库路径后会自动读取 remote 和当前分支。</div>
-        <div class="codex-delete-confirm-actions">
-          <button type="button" data-codex-upstream-worktree-cancel="true">取消</button>
-          <button type="button" data-codex-upstream-worktree-defaults="true">读取默认值</button>
-          <button type="button" data-codex-upstream-worktree-submit="true">Create from upstream</button>
-        </div>
-      </div>
-    `;
-    overlay.addEventListener("click", (event) => {
-      const target = event.target instanceof Element ? event.target : event.target?.parentElement;
-      if (event.target === overlay || target?.closest("[data-codex-upstream-worktree-cancel]")) {
-        overlay.remove();
-        return;
-      }
-      if (target?.closest("[data-codex-upstream-worktree-defaults]")) {
-        loadUpstreamWorktreeDefaults(overlay);
-        return;
-      }
-      if (target?.closest("[data-codex-upstream-worktree-submit]")) {
-        submitUpstreamWorktree(overlay);
-      }
-    }, true);
-    upstreamWorktreeField(overlay, "repoPath")?.addEventListener("change", () => loadUpstreamWorktreeDefaults(overlay));
-    document.body.appendChild(overlay);
-    upstreamWorktreeField(overlay, "repoPath")?.focus();
   }
 
   function escapeHtml(value) {
@@ -10104,7 +10770,7 @@
       .replaceAll("'", "&#39;");
   }
 
-  function confirmDelete(title) {
+  function confirmDelete(title, hostId = "local") {
     document.querySelectorAll(".codex-delete-confirm-overlay").forEach((node) => node.remove());
     return new Promise((resolve) => {
       const overlay = document.createElement("div");
@@ -10112,7 +10778,7 @@
       overlay.innerHTML = `
         <div class="codex-delete-confirm-content" role="dialog" aria-modal="true" aria-label="删除会话">
           <div class="codex-delete-confirm-title">删除会话</div>
-          <div class="codex-delete-confirm-message">删除“${escapeHtml(title)}”？</div>
+          <div class="codex-delete-confirm-message">删除“${escapeHtml(title)}”？${hostId !== "local" ? "这将永久删除远端任务及其子任务，无法撤销。" : ""}</div>
           <div class="codex-delete-confirm-actions">
             <button type="button" data-codex-delete-cancel="true">取消</button>
             <button type="button" data-codex-delete-confirm="true">删除</button>
@@ -10148,17 +10814,22 @@
   }
 
   function isCurrentSessionRow(row, ref) {
+    const currentId = locationThreadId();
+    const currentIdentity = normalizedCodexThreadUuid(currentId) || currentId;
+    const rowIdentity = normalizedCodexThreadUuid(ref.session_id) || ref.session_id;
+    if (currentIdentity && currentIdentity !== rowIdentity) return false;
+    // 新版原生 sidebarThreadRow 明确提供 active；false 不能被相同 pathname 覆盖。
+    const nativeActive = row.getAttribute("data-app-action-sidebar-thread-active");
+    if (nativeActive === "true" || nativeActive === "false") return nativeActive === "true";
     if (row.getAttribute("aria-current") === "page" || row.getAttribute("aria-current") === "true") return true;
     const href = rowHref(row);
     if (href) {
       try {
         const url = new URL(href, window.location.href);
-        if (url.href === window.location.href || url.pathname === window.location.pathname) return true;
-      } catch {
-        if (window.location.href.includes(href)) return true;
-      }
+        if (currentIdentity && url.href === window.location.href) return true;
+      } catch {}
     }
-    return !!ref.session_id && window.location.href.includes(ref.session_id);
+    return !!currentIdentity && currentIdentity === rowIdentity;
   }
 
   function releaseDeleteFocus(row, button) {
@@ -10168,13 +10839,34 @@
     }
   }
 
-  function removeDeletedRow(row, button, ref) {
+  function sameDeletedSessionRef(left, right) {
+    return !!left?.session_id && !!left?.host_id && left.session_id === right?.session_id && left.host_id === right?.host_id;
+  }
+
+  function removeDeletedRow(row, button, ref, requestContext) {
+    // 删除响应期间，React 可能复用或替换 sidebar 行；不能删除其新身份的 DOM。
+    if (!row.isConnected || !sameDeletedSessionRef(sessionRefFromRow(row), ref)) return null;
     releaseDeleteFocus(row, button);
-    const shouldReload = isCurrentSessionRow(row, ref);
-    row.remove();
-    if (shouldReload) {
-      setTimeout(() => window.location.reload(), 10000);
+    const activeRefs = sessionRows().map((candidate) => ({ row: candidate, ref: sessionRefFromRow(candidate) }))
+      .filter((candidate) => isCurrentSessionRow(candidate.row, candidate.ref)).map((candidate) => candidate.ref);
+    const shouldLeave = requestContext?.wasCurrent && requestContext.locationHref === window.location.href
+      && activeRefs.length > 0 && activeRefs.every((active) => sameDeletedSessionRef(active, ref));
+    let navigated = false;
+    if (shouldLeave) {
+      // 已审 native 的 New chat 按钮以 aria-label/newChatMessage 调用 onStartChat。
+      // 只走唯一可见的原生 sidebar 控件；不猜内部路由，也不强制 reload。
+      const navigation = Array.from(document.querySelectorAll("aside.app-shell-left-panel button, nav[data-app-navigation-rail] button"))
+        .filter((candidate) => visibleElement(candidate) && !candidate.disabled && !isExtensionUiNode(candidate)
+          && candidate.closest("aside.app-shell-left-panel, nav[data-app-navigation-rail]")
+          && /^(新聊天|新对话|New chat|New thread)$/i.test((candidate.getAttribute("aria-label") || candidate.textContent || "").trim()));
+      if (navigation.length === 1) {
+        navigation[0].click();
+        navigated = true;
+      }
     }
+    // 原生导航也可能同步重建行，移除前再确认一次，保护被复用的节点。
+    if (row.isConnected && sameDeletedSessionRef(sessionRefFromRow(row), ref)) row.remove();
+    return shouldLeave && !navigated ? "会话已删除，请点击新聊天继续" : null;
   }
 
   function updateDeleteButtonOffsets() {
@@ -10195,13 +10887,37 @@
     event.stopPropagation();
     event.stopImmediatePropagation?.();
     releaseDeleteFocus(row, button);
-    confirmDelete(ref.title).then(async (confirmed) => {
+    if (!ref.host_id) {
+      const evidence = sessionHostEvidenceFromRow(row, ref.session_id);
+      sendCodexPlusDiagnostic("delete_session_host_unresolved", {
+        reason: evidence.reason, hostCount: evidence.hostCount, matchingMetadata: evidence.matchingMetadata,
+        nativeHostAttributePresent: !!row.getAttribute("data-app-action-sidebar-thread-host-id"),
+      });
+      showToast("无法确定会话主机归属，请使用 Codex 原生会话管理", null);
+      return;
+    }
+    ref = { session_id: ref.session_id, title: ref.title, host_id: ref.host_id };
+    return confirmDelete(ref.title, ref.host_id).then(async (confirmed) => {
       if (!confirmed) return;
+      if (!row.isConnected || !sameDeletedSessionRef(sessionRefFromRow(row), ref)) {
+        showToast("会话已变化，请重新选择后删除", null);
+        return;
+      }
       releaseDeleteFocus(row, button);
+      const requestContext = { wasCurrent: isCurrentSessionRow(row, ref), locationHref: window.location.href };
       const result = await postJson("/delete", ref);
       if (result.status === "server_deleted" || result.status === "local_deleted") {
-        removeDeletedRow(row, button, ref);
-        showToast(result.message || "删除成功", result.undo_token);
+        if (result.session_id && result.session_id !== ref.session_id) {
+          showToast("删除结果与请求会话不一致，未更新界面", null);
+          return;
+        }
+        // 远端由原生同主机 thread/deleted 通知更新，不能移除可能已重用的本地 DOM。
+        let navigationNotice = null;
+        if (ref.host_id === "local") {
+          navigationNotice = removeDeletedRow(row, button, ref, requestContext);
+          await refreshRecentConversationsForHost();
+        }
+        showToast(navigationNotice || result.message || "删除成功", result.undo_token);
       } else {
         showToast(result.message || "删除失败", null);
       }
@@ -10310,7 +11026,6 @@
     row.style.setProperty("--codex-session-title-max-width", `${titleMaxWidth}px`);
     group.dataset.codexActionLayoutStable = "true";
   }
-
   function syncActionGroupsLayout() {
     sessionRows().forEach((row) => {
       const group = actionGroupFromRow(row);
@@ -10696,6 +11411,9 @@
     return document.querySelector(".thread-scroll-container") || document.scrollingElement || document.documentElement;
   }
 
+  // 旧版（26.9xx 之前）内容容器类名清单。保留它当候选之一，但**不再当唯一判据**：
+  // 新版 Codex 把 `max-w-(--thread-content-max-width)` 换成了 `max-w-(--thread-body-max-width)`，
+  // `pb-8` 也并入 `has-[[…]]:pb-0` 的条件组合，全等匹配必然归零（issue #2258）。
   const conversationViewContentClasses = [
     "mx-auto",
     "w-full",
@@ -10717,6 +11435,22 @@
     "max-w-(--thread-content-max-width)",
     "px-toolbar",
   ];
+  // Codex 把中间栏宽度的工具类写成 `max-w-(--thread-<用途>-max-width)`，用途词换过好几轮
+  // （content → body、content-responsive…）。所以只钉住「结构」——`max-w-(--thread-*-max-width)`
+  // 这个形状本身——而不是某个具体用途词。哈希类名（`_shell_151xi_3` 那类）一律不写死。
+  const conversationViewThreadWidthTokenPattern = /^(?:[a-z-]+:)*max-w-\(--thread-[a-z-]+-max-width\)$/;
+  // 内容容器的新版稳定锚点。它是虚拟列表宿主（data-mcp-app-portal-target 同节点），
+  // 由 Codex 自己维护在滚动容器内部，比类名抗改。选择器统一登记在 00-prelude.js 的
+  // selectors 表里，不在这里另起一份。
+  const conversationViewContentAnchorSelector = selectors.conversationViewContentAnchor;
+  const conversationViewScrollContainerSelector = selectors.conversationViewScrollContainer;
+  // 页脚包裹层同样带 `max-w-(--thread-…-max-width)`，会被结构候选误当成内容容器。
+  // 用 Codex 自己的页脚标记把它排掉。
+  const conversationViewFooterSelector = selectors.conversationViewFooter;
+  const conversationViewPaneBoundarySelector = "#app-shell-sidebar, .app-shell-left-panel, .sidebar-navigation, nav[data-app-navigation-rail], [data-summary-panel-variant]";
+  // 两侧留白：Codex 的 `--padding-toolbar` 是 `calc(var(--spacing) * 2)`（= 8px * 2）。
+  // 仅在拿不到父节点 computed style 时作为回落的单侧留白。
+  const conversationViewSideInset = 8;
   const conversationViewState = {
     contentEl: null,
     composerEl: null,
@@ -10727,6 +11461,7 @@
     pollId: 0,
     runtimeStarted: false,
     moObserved: false,
+    targetsReported: false,
     observed: new WeakSet(),
     elements: new Set(),
   };
@@ -10740,16 +11475,202 @@
     return classes.every((cls) => set.has(cls));
   }
 
-  function conversationViewFindByClasses(classes) {
-    return Array.from(document.querySelectorAll("div")).find((el) => conversationViewHasAllClasses(el, classes)) || null;
+  function conversationViewFindByClasses(classes, root, accept) {
+    return Array.from(root?.querySelectorAll("div") || [])
+      .find((el) => conversationViewHasAllClasses(el, classes) && accept(el)) || null;
   }
 
+  function conversationViewHasThreadWidthToken(el) {
+    for (const token of conversationViewTokenSet(el)) {
+      if (conversationViewThreadWidthTokenPattern.test(token)) return true;
+    }
+    return false;
+  }
+
+  // 结构性判定：居中 + 满宽 + 线程宽度工具类。不依赖任何具体用途词或哈希类名。
+  function conversationViewLooksLikeThreadWidthBox(el) {
+    if (el?.tagName !== "DIV") return false;
+    const set = conversationViewTokenSet(el);
+    if (!set.has("mx-auto") || !set.has("w-full")) return false;
+    return conversationViewHasThreadWidthToken(el);
+  }
+
+  // 页脚包裹层**自身**也带宽度工具类，所以这里不仅要排掉它的后代，还要排掉它本身。
+  function conversationViewIsInsideFooter(el) {
+    if (!el) return false;
+    try {
+      return el.matches?.(conversationViewFooterSelector) === true
+        || el.closest?.(conversationViewFooterSelector) != null;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function conversationViewScrollContainer() {
+    const scrollers = Array.from(document.querySelectorAll(conversationViewScrollContainerSelector))
+      .filter((el) => typeof visibleElement !== "function" || visibleElement(el));
+    // 多个可见会话没有可靠的当前目标，不把任一 pane 当成整页正文。
+    return scrollers.length === 1 ? scrollers[0] : null;
+  }
+
+  function conversationViewSafeWidthTarget(el, scope) {
+    if (!el || !scope || el === scope || !scope.contains?.(el)) return false;
+    if (scope.matches?.(conversationViewScrollContainerSelector)
+        && el.closest?.(conversationViewScrollContainerSelector) !== scope) return false;
+    return conversationViewSafeWidthNode(el);
+  }
+
+  function conversationViewSafeWidthNode(el) {
+    if (!el) return false;
+    if (["MAIN", "ASIDE", "NAV", "HEADER", "BODY", "HTML"].includes(el.tagName)) return false;
+    if (el.closest?.(`${conversationViewPaneBoundarySelector}, [data-codex-plus-ext]`)) return false;
+    // CSS 变量可继承给整棵布局树；包含其他 pane 的祖先不能改 width/margin/left。
+    // composer 内的状态提示也会用 aside，不能仅按语义标签把它误判为侧栏。
+    return !el.querySelector?.(`${conversationViewPaneBoundarySelector}, .thread-scroll-container`);
+  }
+
+  function conversationViewSamePane(scroller, el) {
+    if (scroller.contains?.(el)) return el.closest?.(conversationViewScrollContainerSelector) === scroller;
+    if (el.closest?.(conversationViewScrollContainerSelector)) return false;
+    if (el.parentElement === scroller.parentElement && el.parentElement !== document.body) return true;
+    for (let pane = scroller.parentElement; pane && pane !== document.body; pane = pane.parentElement) {
+      if (!pane.contains?.(el)) continue;
+      return !pane.querySelector?.(conversationViewPaneBoundarySelector);
+    }
+    return false;
+  }
+
+  function conversationViewFootersFor(scroller) {
+    return Array.from(document.querySelectorAll(conversationViewFooterSelector)).filter((footer) => {
+      if (typeof visibleElement === "function" && !visibleElement(footer)) return false;
+      return !footer.closest?.(`${conversationViewPaneBoundarySelector}, [data-codex-plus-ext]`) && conversationViewSamePane(scroller, footer);
+    });
+  }
+
+  function conversationViewFindNativeComposer(scroller) {
+    const roots = Array.from(document.querySelectorAll("[data-codex-composer-root]"))
+      .filter((el) => (typeof visibleElement !== "function" || visibleElement(el))
+        && !el.closest?.(`${conversationViewPaneBoundarySelector}, [data-codex-plus-ext]`) && (!scroller || conversationViewSamePane(scroller, el)));
+    if (roots.length !== 1) return null;
+    const root = roots[0];
+    const accept = (el) => conversationViewLooksLikeThreadWidthBox(el) && conversationViewSafeWidthNode(el)
+      && !el.matches?.(conversationViewFooterSelector) && !el.querySelector?.(conversationViewContentAnchorSelector);
+    const inside = [root, ...root.querySelectorAll("div")].find(accept);
+    if (inside) return inside;
+    // 原生 composer 锚点可能在宽度宿主内部；只爬到局部宿主，不收窄含正文的布局。
+    for (let host = root.parentElement; host && host !== document.body; host = host.parentElement) {
+      if (accept(host)) return host;
+      if (host.matches?.(conversationViewScrollContainerSelector) || host.querySelector?.(conversationViewScrollContainerSelector)) break;
+    }
+    return null;
+  }
+
+  function conversationViewCollectThreadWidthBoxes(root) {
+    if (!root?.querySelectorAll) return [];
+    return Array.from(root.querySelectorAll("div")).filter(conversationViewLooksLikeThreadWidthBox);
+  }
+
+  /**
+   * 按候选顺序找内容容器，任一候选命中即返回。
+   *
+   * 候选链刻意从「最精确」排到「最宽松」：
+   * 所有候选都必须在唯一的会话滚动区内，并排除布局祖先：
+   *   1. 旧版类名全等（老版本 Codex 上仍然最准）；
+   *   2. Codex 自己的 data-* 锚点（当前版本）；
+   *   3. 结构判定（滚动容器内、居中满宽、带 thread 宽度工具类）；
+   *   4. #2085 报告里提到的兜底：两处类名都没命中时，按 CSS 变量反查宿主节点。
+   *
+   * 顺序不能反：结构判定会把页脚包裹层也算进来，而它和内容容器在同一棵子树里。
+   */
   function conversationViewFindContentEl() {
-    return conversationViewFindByClasses(conversationViewContentClasses);
+    const scroller = conversationViewScrollContainer();
+    if (!scroller) return null;
+    const accept = (el) => conversationViewSafeWidthTarget(el, scroller) && !conversationViewIsInsideFooter(el)
+      && !el.querySelector?.(conversationViewFooterSelector);
+    const legacy = conversationViewFindByClasses(conversationViewContentClasses, scroller, accept);
+    if (legacy) return legacy;
+    const anchored = Array.from(scroller.querySelectorAll(conversationViewContentAnchorSelector)).find(accept);
+    if (anchored) return anchored;
+    const structural = conversationViewCollectThreadWidthBoxes(scroller)
+      // 页脚包裹层（data-thread-scroll-footer）也带同样的宽度工具类，必须排掉。
+      .find(accept);
+    if (structural) return structural;
+    return conversationViewFindByThreadWidthVariable(scroller, accept);
   }
 
   function conversationViewFindComposerEl() {
-    return conversationViewFindByClasses(conversationViewComposerClasses);
+    const scroller = conversationViewScrollContainer();
+    if (!scroller) {
+      // 首页没有消息 scroller；只用明确的原生 composer 锚点，不能全页猜宽度变量。
+      if (Array.from(document.querySelectorAll(conversationViewScrollContainerSelector))
+          .some((el) => typeof visibleElement !== "function" || visibleElement(el))) return null;
+      const native = conversationViewFindNativeComposer(null);
+      if (native) return native;
+      const legacy = Array.from(document.querySelectorAll("div")).filter((el) =>
+        conversationViewHasAllClasses(el, conversationViewComposerClasses) && conversationViewSafeWidthNode(el)
+        && !conversationViewIsInsideFooter(el) && el.querySelector?.('textarea, [contenteditable="true"]'));
+      return legacy.length === 1 ? legacy[0] : null;
+    }
+    // 页脚包裹层带的是和作曲器同一套工具类，会被旧清单全等命中，所以要排除它。
+    const footers = conversationViewFootersFor(scroller);
+    if (footers.length > 1) return null;
+    const footer = footers[0];
+    const accept = (el) => conversationViewSafeWidthTarget(el, footer || scroller)
+      && !el.matches?.(conversationViewFooterSelector) && !conversationViewIsContentCandidate(el);
+    // 新版作曲器在页脚包裹层内部——页脚自身也是 max-w 盒子，得往里再找一层。
+    const insideFooter = conversationViewCollectThreadWidthBoxes(footer).find(accept);
+    if (insideFooter) return insideFooter;
+    if (footer) return conversationViewFindByThreadWidthVariable(footer, (el) => el !== footer && accept(el));
+    const native = conversationViewFindNativeComposer(scroller);
+    if (native) return native;
+    // 保留同一会话内的旧类名；无 footer 的新版结构还必须包含明确编辑器。
+    const legacy = conversationViewFindByClasses(conversationViewComposerClasses, scroller, (el) => accept(el) && !conversationViewIsInsideFooter(el));
+    if (legacy) return legacy;
+    return conversationViewCollectThreadWidthBoxes(scroller).find((el) => accept(el)
+      && !conversationViewIsInsideFooter(el) && !el.querySelector?.(conversationViewContentAnchorSelector)
+      && el.querySelector?.('textarea, [contenteditable="true"]')) || null;
+  }
+
+  // 内容容器的判定（锚点或全等类名），供作曲器查找排除同形节点用。
+  function conversationViewIsContentCandidate(el) {
+    if (!el) return false;
+    if (el.matches?.(conversationViewContentAnchorSelector)) return true;
+    return conversationViewHasAllClasses(el, conversationViewContentClasses);
+  }
+
+  // 兜底：类名全不对时，看计算样式里 Codex 是否在该节点上定义了线程宽度变量。
+  // 变量名只按 `--thread-*-max-width` 这个形状匹配，同样不绑具体用途词。
+  // accept 为 null 时默认排除页脚内部节点（内容容器的用法）；作曲器查找会传自己的判定。
+  function conversationViewFindByThreadWidthVariable(root, accept = null) {
+    if (!root?.querySelectorAll) return null;
+    const candidates = Array.from(root.querySelectorAll("div"));
+    return candidates.find((el) => {
+      if (accept ? !accept(el) : conversationViewIsInsideFooter(el)) return false;
+      try {
+        const style = getComputedStyle(el);
+        // --thread-* 在后代继承，不代表该节点自身受 max-width 约束（#2414）。
+        if (!style.maxWidth || style.maxWidth === "none") return false;
+        for (const name of conversationViewThreadWidthCustomProperties(style)) {
+          if (String(style.getPropertyValue(name) || "").trim()) return true;
+        }
+      } catch (_) {
+        return false;
+      }
+      return false;
+    }) || null;
+  }
+
+  function conversationViewThreadWidthCustomProperties(style) {
+    // CSSStyleDeclaration 的索引属性在 Chromium 里可用；拿不到时退回固定候选名，
+    // 保证兜底在受限环境（测试夹具）里也不会抛。
+    const names = [];
+    const length = Number(style?.length) || 0;
+    for (let index = 0; index < length; index += 1) {
+      const name = style[index];
+      if (typeof name === "string" && name.startsWith("--thread-") && name.endsWith("-max-width")) names.push(name);
+    }
+    if (!names.length) names.push("--thread-body-max-width", "--thread-content-max-width");
+    return names;
   }
 
   function codexServiceTierBadgeVisibleElement(element) {
@@ -11013,9 +11934,19 @@
     }
   }
 
-  function conversationViewApplyNativeWidth(el) {
+  // #2085：设置值是**上限**，不是必须写死的宽度。容器比上限窄时按容器可用宽度
+  // 收敛，否则 900px 会让内容溢出滚动容器、两侧被裁。
+  // 容器宽度已由调用方在读取阶段量好，这里只做纯计算，不读几何——见 conversationViewAlignNow。
+  function conversationViewEffectiveWidth(containerWidth) {
+    const configured = conversationViewWidth();
+    if (!Number.isFinite(containerWidth) || containerWidth <= 0) return configured;
+    return Math.max(conversationViewMinWidth, Math.min(configured, Math.round(containerWidth)));
+  }
+
+  function conversationViewApplyNativeWidth(el, effectiveWidth) {
     conversationViewRememberOriginals(el);
-    const maxWidth = `${conversationViewWidth()}px`;
+    const width = Number.isFinite(effectiveWidth) ? effectiveWidth : conversationViewWidth();
+    const maxWidth = `${width}px`;
     if (el.style.boxSizing !== "border-box") el.style.boxSizing = "border-box";
     if (el.style.width !== "100%") el.style.width = "100%";
     if (el.style.maxWidth !== maxWidth) el.style.maxWidth = maxWidth;
@@ -11025,6 +11956,22 @@
 
   function conversationViewSessionRectFor(el) {
     return el?.parentElement?.getBoundingClientRect() || null;
+  }
+
+  // 容器可用宽度：取宿主节点的内容盒宽（rect.width 含内边距，减掉左右 padding 才是可用空间）。
+  // 拿不到几何（离屏、display:none、父节点缺失）时返回 0，由 effectiveWidth 回落设置上限。
+  function conversationViewAvailableWidth(el) {
+    const host = el?.parentElement;
+    const rect = conversationViewSessionRectFor(el);
+    if (!host || !rect || !(rect.width > 0)) return 0;
+    let inlinePadding = conversationViewSideInset * 2;
+    try {
+      const style = getComputedStyle(host);
+      inlinePadding = (Number.parseFloat(style.paddingLeft) || 0) + (Number.parseFloat(style.paddingRight) || 0);
+    } catch (_) {
+      inlinePadding = conversationViewSideInset * 2;
+    }
+    return Math.max(0, rect.width - inlinePadding);
   }
 
   function conversationViewHtmlCenter() {
@@ -11039,8 +11986,22 @@
   }
 
   function conversationViewResolveTargets() {
-    if (!conversationViewState.contentEl?.isConnected) conversationViewState.contentEl = conversationViewFindContentEl();
-    if (!conversationViewState.composerEl?.isConnected) conversationViewState.composerEl = conversationViewFindComposerEl();
+    for (const [key, next] of [
+      ["contentEl", conversationViewFindContentEl()],
+      ["composerEl", conversationViewFindComposerEl()],
+    ]) {
+      const previous = conversationViewState[key];
+      if (previous && previous !== next) {
+        conversationViewRestoreElement(previous);
+        conversationViewState.elements.delete(previous);
+        [previous, previous.parentElement, previous.parentElement?.parentElement].forEach((el) => {
+          if (!el) return;
+          conversationViewState.ro?.unobserve?.(el);
+          conversationViewState.observed.delete(el);
+        });
+      }
+      conversationViewState[key] = next;
+    }
     [
       document.documentElement,
       document.body,
@@ -11056,15 +12017,24 @@
   function conversationViewAlignNow() {
     if (!codexPlusSettings().conversationView) return;
     conversationViewResolveTargets();
-    // 两阶段批量对齐：先对全部目标应用宽度/复位（写 style），
-    // 再统一读取几何并决定是否写入 left，避免写-读-写交替触发强制重排。
     const targets = [
       conversationViewState.contentEl,
       conversationViewState.composerEl,
     ].filter((el) => el?.isConnected);
-    if (!targets.length) return;
-    targets.forEach((el) => {
-      conversationViewApplyNativeWidth(el);
+    if (!targets.length) {
+      conversationViewReportMissingTargets();
+      return;
+    }
+    conversationViewState.targetsReported = false;
+    // 三阶段批量对齐，全程不出现读-写交替（否则退回 commit 82fb0924 修掉的强制重排）：
+    //   ① 读：一次性量完全部目标的宿主可用宽度，算出各自的有效上限；
+    //   ② 写：按算好的宽度统一写 style（宽度 + 复位自身偏移）；
+    //   ③ 读 + 写 left：统一读几何，决定是否需要再写 left。
+    // #2085 的自适应计算落在 ①，写动作仍集中在 ②，与原有两阶段结构一致。
+    const availableWidths = targets.map((el) => conversationViewAvailableWidth(el));
+    const effectiveWidths = availableWidths.map((width) => conversationViewEffectiveWidth(width));
+    targets.forEach((el, index) => {
+      conversationViewApplyNativeWidth(el, effectiveWidths[index]);
       conversationViewResetOwnOffset(el);
     });
     const htmlCenter = conversationViewHtmlCenter();
@@ -11078,6 +12048,24 @@
         const nextLeft = `${delta.toFixed(2)}px`;
         if (el.style.left !== nextLeft) el.style.left = nextLeft;
       }
+    });
+  }
+
+  /**
+   * #2258 最贵的地方是「静默」：类名变化导致目标归零时，对齐整段直接 return，
+   * 用户只看到居中失效，日志里什么都没有。这里每个会话只上报一次，
+   * 并在下一次成功命中时重置，避免长时间运行时刷屏。
+   */
+  function conversationViewReportMissingTargets() {
+    if (conversationViewState.targetsReported) return;
+    conversationViewState.targetsReported = true;
+    const scroller = conversationViewScrollContainer();
+    sendCodexPlusDiagnostic("conversation_view_target_not_found", {
+      hasScrollContainer: !!scroller,
+      hasContentAnchor: !!document.querySelector(conversationViewContentAnchorSelector),
+      hasFooter: !!document.querySelector(conversationViewFooterSelector),
+      threadWidthBoxes: conversationViewCollectThreadWidthBoxes(scroller || document).length,
+      configuredWidth: conversationViewWidth(),
     });
   }
 
@@ -11121,7 +12109,6 @@
   }
 
   window.__codexPlusConversationViewCleanup = cleanupConversationView;
-
   /**
    * 对外接口层：window.codexPlus
    *
@@ -11159,7 +12146,7 @@
    * 路由白名单。未在此声明的路由即使后端支持也不允许拓展调用。
    *
    * 刻意做成白名单而不是黑名单：新增路由时默认不可用，需要显式决定是否开放，
-   * 避免内部路由（例如 `/settings/set`、`/zed-remote/*`）被顺手暴露出去。
+   * 避免内部路由（例如 `/settings/set`、`/manager/open-transient`）被顺手暴露出去。
    */
   const codexPlusExtensionRoutes = new Set([
     "/diagnostics/log",
@@ -11708,6 +12695,879 @@
       moreMenu.appendChild(item);
     });
   }
+  // API Key 听写使用独立的 ASR 服务。新版原生 capability / app-host RPC 是只读的，
+  // 因此入口与录音由 CPP 管理，识别结果通过原生编辑器事务回填，保持草稿和附件。
+  window.__codexPlusDictationRuntime?.dispose?.();
+  const codexPlusDictation = {
+    phase: "idle", revision: 0, target: null, stream: null, recorder: null,
+    chunks: [], blob: null, text: "", error: "", action: "insert", startedAt: 0,
+    controller: null, timer: null, status: null, statusAt: 0, statusPromise: null,
+    nativeApi: null, nativeApiPromise: null, pendingSend: false,
+  };
+  const codexPlusDictationMaxBytes = 25 * 1024 * 1024;
+  registerCodexPlusExtensionSelector('[data-codex-plus-ext="builtin-dictation"]');
+
+  function codexPlusDictationEnabled() {
+    return codexPlusBackendSettingsLoaded && codexPlusBackendSettings.enhancementsEnabled !== false
+      && codexPlusBackendSettings.dictation?.enabled === true;
+  }
+
+  function codexPlusDictationEditor(scope) {
+    return [...scope.querySelectorAll('.ProseMirror[contenteditable="true"], textarea:not(:disabled):not([readonly]), [role="textbox"][contenteditable="true"]')]
+      .find((node) => visibleElement(node) && !isExtensionUiNode(node) && !node.closest('[inert], [aria-hidden="true"]')) || null;
+  }
+
+  function codexPlusDictationScope(footer) {
+    let scope = footer?.parentElement;
+    while (scope && scope !== document.body) {
+      if (codexPlusDictationEditor(scope)) return scope;
+      if (scope.matches?.('[data-codex-composer-root], [data-composer-surface-variant], form')) break;
+      scope = scope.parentElement;
+    }
+    return null;
+  }
+
+  function codexPlusDictationTargetEditor() {
+    const target = codexPlusDictation.target;
+    if (!target || window.location.href !== target.href) return null;
+    const editor = [...document.querySelectorAll('[data-codex-plus-dictation-target]')]
+      .find((node) => node.dataset.codexPlusDictationTarget === target.id && visibleElement(node));
+    if (editor) return editor;
+    const root = [...document.querySelectorAll('[data-codex-plus-dictation-root]')]
+      .find((node) => node.dataset.codexPlusDictationRoot === target.id && visibleElement(node));
+    return root ? codexPlusDictationEditor(root) : null;
+  }
+
+  async function loadCodexPlusDictationNativeApi() {
+    if (codexPlusDictation.nativeApiPromise) return codexPlusDictation.nativeApiPromise;
+    codexPlusDictation.nativeApiPromise = loadOptionalCodexAppModule("app-initial-").then((module) => {
+      // 构建间压缩导出名会变化，只按能力识别函数；从不写 ESM namespace。
+      const functions = Object.values(module || {}).filter((value) => typeof value === "function");
+      const append = functions.find((fn) => {
+        const source = String(fn);
+        return source.length < 3000 && source.includes(".composerId===") && source.includes(".appendPromptText")
+          && source.includes(".isDictationInProgress") && source.includes("[readonly]") && source.includes(".focus()");
+      });
+      const context = functions.find((fn) => {
+        const source = String(fn);
+        return source.length < 3000 && source.includes("document.activeElement?.closest")
+          && source.includes("[data-codex-composer-root]") && source.includes("composerId:") && source.includes("root:");
+      });
+      codexPlusDictation.nativeApi = append && context ? { append, context } : null;
+      return codexPlusDictation.nativeApi;
+    }).catch(() => null);
+    return codexPlusDictation.nativeApiPromise;
+  }
+
+  function codexPlusDictationView(editor) {
+    const view = editor?.pmViewDesc?.view;
+    return view && !view.isDestroyed && view.dom === editor && view.state?.tr && typeof view.dispatch === "function" ? view : null;
+  }
+
+  function codexPlusInsertDictation(editor, transcript, nativeApi = codexPlusDictation.nativeApi, composerId = codexPlusDictation.target?.composerId) {
+    const text = String(transcript || "").trim();
+    if (!text || !editor?.isConnected || editor.matches?.(':disabled, [readonly], [contenteditable="false"]')
+        || editor.closest?.('[inert], [aria-hidden="true"]')) return false;
+    editor.focus();
+    if (nativeApi && composerId) {
+      const context = nativeApi.context();
+      if (context?.composerId !== composerId || !context.root?.contains(editor)) return false;
+      return nativeApi.append(composerId, text) === true;
+    }
+    const view = codexPlusDictationView(editor);
+    if (view) {
+      // 用原生事务更新 React/ProseMirror 状态；不能直接改 innerHTML/textContent。
+      const { from, to } = view.state.selection;
+      const before = view.state.doc.textBetween(Math.max(0, from - 1), from, "\n");
+      const prefix = before && !/\s$/.test(before) ? " " : "";
+      view.dispatch(view.state.tr.insertText(prefix + text, from, to).scrollIntoView());
+      return true;
+    }
+    if (editor instanceof HTMLTextAreaElement) {
+      const from = editor.selectionStart ?? editor.value.length;
+      const to = editor.selectionEnd ?? from;
+      const prefix = from > 0 && !/\s/.test(editor.value[from - 1]) ? " " : "";
+      const inserted = prefix + text;
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+      if (!setter) return false;
+      setter.call(editor, editor.value.slice(0, from) + inserted + editor.value.slice(to));
+      editor.setSelectionRange(from + inserted.length, from + inserted.length);
+      editor.dispatchEvent(new Event("input", { bubbles: true }));
+      return true;
+    }
+    // 老版本的 contenteditable 交给浏览器编辑命令，失败时保留可复制的识别结果。
+    const selection = window.getSelection?.();
+    if (document.activeElement !== editor || !selection?.anchorNode || !editor.contains(selection.anchorNode)) return false;
+    return document.execCommand("insertText", false, text) === true;
+  }
+
+  function codexPlusDictationSendButton(editor) {
+    let scope = editor.parentElement;
+    while (scope && scope !== document.body) {
+      const button = [...scope.querySelectorAll('button')].find((node) => {
+        if (isExtensionUiNode(node) || !visibleElement(node) || node.disabled || node.getAttribute("aria-disabled") === "true") return false;
+        const label = `${node.getAttribute("aria-label") || ""} ${node.getAttribute("title") || ""}`.trim();
+        return /^(?:Send|Send message|Send prompt|Submit|发送|发送消息|发送提示|提交)(?:\s|\(|（|$)/i.test(label)
+          || node.getAttribute("data-testid") === "send-button" || node.getAttribute("data-action") === "send";
+      });
+      if (button) return button;
+      if (scope.hasAttribute("data-codex-composer-root") || scope.hasAttribute("data-composer-surface-variant") || scope.tagName === "FORM") break;
+      scope = scope.parentElement;
+    }
+    return null;
+  }
+
+  function codexPlusDictationStopTracks() {
+    codexPlusDictation.stream?.getTracks().forEach((track) => track.stop());
+    codexPlusDictation.stream = null;
+    clearInterval(codexPlusDictation.timer);
+    codexPlusDictation.timer = null;
+  }
+
+  function cancelCodexPlusDictation() {
+    ++codexPlusDictation.revision;
+    codexPlusDictation.controller?.abort();
+    codexPlusDictation.controller = null;
+    const recorder = codexPlusDictation.recorder;
+    codexPlusDictation.recorder = null;
+    if (recorder?.state !== "inactive") { try { recorder?.stop(); } catch {} }
+    codexPlusDictationStopTracks();
+    document.querySelectorAll('[data-codex-plus-dictation-target], [data-codex-plus-dictation-root]').forEach((node) => {
+      delete node.dataset.codexPlusDictationTarget; delete node.dataset.codexPlusDictationRoot;
+    });
+    Object.assign(codexPlusDictation, { phase: "idle", target: null, chunks: [], blob: null, text: "", error: "", pendingSend: false });
+    renderCodexPlusDictation();
+  }
+
+  async function loadCodexPlusDictationStatus(force = false) {
+    if (codexPlusDictation.statusPromise) return codexPlusDictation.statusPromise;
+    if (!force && Date.now() - codexPlusDictation.statusAt < 5000) return codexPlusDictation.status;
+    codexPlusDictation.statusPromise = postJson("/dictation/status", {}).then((status) => {
+      codexPlusDictation.status = status;
+      codexPlusDictation.statusAt = Date.now();
+      return status;
+    }).finally(() => { codexPlusDictation.statusPromise = null; });
+    return codexPlusDictation.statusPromise;
+  }
+
+  async function startCodexPlusDictation(footer) {
+    if (!codexPlusDictationEnabled() || codexPlusDictation.phase !== "idle") return;
+    const editor = codexPlusDictationScope(footer) && codexPlusDictationEditor(codexPlusDictationScope(footer));
+    if (!editor) { showToast("无法找到可编辑的 Codex 输入框", null); return; }
+    if (footer.getAttribute("data-dictation-view")) { showToast("请先结束原生语音输入", null); return; }
+    if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder !== "function") {
+      showToast("当前环境不支持麦克风录音", null); return;
+    }
+    const revision = ++codexPlusDictation.revision;
+    const id = crypto.randomUUID();
+    editor.dataset.codexPlusDictationTarget = id;
+    Object.assign(codexPlusDictation, {
+      phase: "requesting", target: { id, href: window.location.href },
+      error: "", text: "", chunks: [], blob: null, action: "insert",
+    });
+    installCodexPlusDictation();
+    try {
+      const nativeApi = await loadCodexPlusDictationNativeApi();
+      if (revision !== codexPlusDictation.revision) return;
+      if (!codexPlusDictationTargetEditor()) throw new Error("输入框或会话已变化，请返回目标会话后重录");
+      editor.focus();
+      const context = nativeApi?.context();
+      if (context?.root?.contains(editor) && context.composerId) {
+        codexPlusDictation.target.composerId = context.composerId;
+        context.root.dataset.codexPlusDictationRoot = id;
+      }
+      const status = await loadCodexPlusDictationStatus(true);
+      if (revision !== codexPlusDictation.revision) return;
+      if (!codexPlusDictationEnabled()) { cancelCodexPlusDictation(); return; }
+      if (!status?.enabled || !status?.configured || !status?.helperToken) throw new Error(status?.message || "请先在管理工具中配置并启用语音服务");
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1 } });
+      if (revision !== codexPlusDictation.revision) {
+        stream.getTracks().forEach((track) => track.stop()); return;
+      }
+      if (!codexPlusDictationEnabled()) {
+        stream.getTracks().forEach((track) => track.stop()); cancelCodexPlusDictation(); return;
+      }
+      codexPlusDictation.stream = stream;
+      const mimeType = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"]
+        .find((type) => typeof MediaRecorder.isTypeSupported === "function" && MediaRecorder.isTypeSupported(type));
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      codexPlusDictation.recorder = recorder;
+      recorder.ondataavailable = (event) => {
+        if (revision !== codexPlusDictation.revision || !event.data?.size) return;
+        codexPlusDictation.chunks.push(event.data);
+        if (codexPlusDictation.chunks.reduce((sum, chunk) => sum + chunk.size, 0) > codexPlusDictationMaxBytes) {
+          codexPlusDictation.error = "录音超过 25 MiB，请缩短后重录";
+          stopCodexPlusDictation("discard");
+        }
+      };
+      recorder.onerror = () => {
+        if (revision !== codexPlusDictation.revision) return;
+        codexPlusDictation.error = "录音失败，请检查麦克风后重录";
+        stopCodexPlusDictation("discard");
+      };
+      recorder.onstop = () => {
+        if (revision !== codexPlusDictation.revision) return;
+        codexPlusDictationStopTracks();
+        codexPlusDictation.recorder = null;
+        const blob = new Blob(codexPlusDictation.chunks, { type: recorder.mimeType || "audio/webm" });
+        codexPlusDictation.chunks = [];
+        if (codexPlusDictation.action === "discard" || blob.size > codexPlusDictationMaxBytes) {
+          codexPlusDictation.phase = "error"; renderCodexPlusDictation(); return;
+        }
+        if (!blob.size || Date.now() - codexPlusDictation.startedAt < 250) { cancelCodexPlusDictation(); return; }
+        codexPlusDictation.blob = blob;
+        void transcribeCodexPlusDictation();
+      };
+      recorder.start(1000);
+      codexPlusDictation.phase = "recording";
+      codexPlusDictation.startedAt = Date.now();
+      codexPlusDictation.timer = setInterval(() => {
+        if (Date.now() - codexPlusDictation.startedAt >= 595000) stopCodexPlusDictation("insert");
+        renderCodexPlusDictation();
+      }, 1000);
+      renderCodexPlusDictation();
+    } catch (error) {
+      if (revision !== codexPlusDictation.revision) return;
+      codexPlusDictationStopTracks();
+      codexPlusDictation.phase = "error";
+      codexPlusDictation.error = ["NotAllowedError", "SecurityError"].includes(error?.name)
+        ? "麦克风权限被拒绝，请在系统设置中允许 Codex 使用麦克风后重录"
+        : error?.name === "NotFoundError" ? "未找到麦克风" : error?.message || "无法开始录音";
+      renderCodexPlusDictation();
+    }
+  }
+
+  function stopCodexPlusDictation(action) {
+    codexPlusDictation.action = action;
+    if (codexPlusDictation.phase === "transcribing") { renderCodexPlusDictation(); return; }
+    if (codexPlusDictation.phase !== "recording") return;
+    codexPlusDictation.phase = "transcribing";
+    clearInterval(codexPlusDictation.timer);
+    try { codexPlusDictation.recorder.stop(); }
+    catch { codexPlusDictationStopTracks(); codexPlusDictation.phase = "error"; codexPlusDictation.error = "无法结束录音，请重录"; }
+    renderCodexPlusDictation();
+  }
+
+  async function finishCodexPlusDictation() {
+    if (!codexPlusDictationEnabled()) { cancelCodexPlusDictation(); return; }
+    const editor = codexPlusDictationTargetEditor();
+    if (!editor || !codexPlusInsertDictation(editor, codexPlusDictation.text)) {
+      codexPlusDictation.phase = "result";
+      codexPlusDictation.error = "输入框或会话已变化，请复制识别结果到目标输入框";
+      renderCodexPlusDictation(); return;
+    }
+    const send = codexPlusDictation.action === "send";
+    const target = { ...codexPlusDictation.target };
+    cancelCodexPlusDictation();
+    if (send) {
+      const revision = codexPlusDictation.revision;
+      codexPlusDictation.pendingSend = true;
+      // 给原生状态一个渲染周期，再点击它自己的发送按钮；找不到时保留已插入的草稿。
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      if (revision !== codexPlusDictation.revision) return;
+      codexPlusDictation.pendingSend = false;
+      if (!codexPlusDictationEnabled() || window.location.href !== target.href) return;
+      const context = codexPlusDictation.nativeApi?.context();
+      const currentEditor = target.composerId && context?.composerId === target.composerId
+        ? codexPlusDictationEditor(context.root) : editor.isConnected && !target.composerId ? editor : null;
+      if (!currentEditor) return;
+      const button = codexPlusDictationSendButton(currentEditor);
+      if (button) button.click();
+      else showToast("识别结果已插入，请点击发送", null);
+    }
+  }
+
+  async function codexPlusDictationAudioBase64(blob, signal) {
+    if (blob.size > codexPlusDictationMaxBytes) throw new Error("录音超过 25 MiB，请缩短后重录");
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    let encoded = "";
+    // 按 3 字节对齐分段编码，避免一次展开大录音耗尽调用栈；让取消事件有机会执行。
+    for (let offset = 0; offset < bytes.length; offset += 49152) {
+      if (signal.aborted) throw new DOMException("转写已取消", "AbortError");
+      encoded += btoa(String.fromCharCode(...bytes.subarray(offset, offset + 49152)));
+      if (offset && offset % (49152 * 8) === 0) await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    return encoded;
+  }
+
+  async function transcribeCodexPlusDictation() {
+    if (!codexPlusDictationEnabled()) { cancelCodexPlusDictation(); return; }
+    if (!codexPlusDictation.blob) return;
+    const revision = ++codexPlusDictation.revision;
+    const controller = new AbortController();
+    codexPlusDictation.controller = controller;
+    codexPlusDictation.phase = "transcribing";
+    codexPlusDictation.error = "";
+    renderCodexPlusDictation();
+    let cancelRequest = null;
+    try {
+      const status = await loadCodexPlusDictationStatus(true);
+      if (revision !== codexPlusDictation.revision) return;
+      if (!status?.enabled || !status?.configured || !status?.helperToken) throw new Error(status?.message || "语音服务尚未配置");
+      const requestId = crypto.randomUUID();
+      let requestStarted = false;
+      cancelRequest = () => {
+        if (requestStarted) void postJson("/dictation/cancel", { requestId, helperToken: status.helperToken }).catch(() => {});
+      };
+      controller.signal.addEventListener("abort", cancelRequest, { once: true });
+      const audioBase64 = await codexPlusDictationAudioBase64(codexPlusDictation.blob, controller.signal);
+      if (revision !== codexPlusDictation.revision || controller.signal.aborted) return;
+      if (!codexPlusDictationEnabled()) { cancelCodexPlusDictation(); return; }
+      const extension = codexPlusDictation.blob.type.includes("mp4") ? "m4a" : "webm";
+      requestStarted = true;
+      // app:// 的 CSP 不允许 renderer 直接 fetch localhost；音频经既有特权桥接交给 Rust。
+      const result = await postJson("/dictation/transcribe", {
+        requestId, audioBase64, mimeType: codexPlusDictation.blob.type || "audio/webm",
+        filename: `dictation.${extension}`, helperToken: status.helperToken,
+      });
+      controller.signal.removeEventListener("abort", cancelRequest);
+      cancelRequest = null;
+      if (revision !== codexPlusDictation.revision) return;
+      if (result?.status === "failed" || result?.status === "cancelled") throw new Error(result?.message || "语音转写失败");
+      if (typeof result?.text !== "string") throw new Error("语音服务没有返回 text 字段");
+      codexPlusDictation.text = result.text.trim();
+      if (!codexPlusDictation.text) { cancelCodexPlusDictation(); showToast("未识别到文字，请重录", null); return; }
+      await finishCodexPlusDictation();
+    } catch (error) {
+      if (revision !== codexPlusDictation.revision) return;
+      codexPlusDictation.phase = "error";
+      codexPlusDictation.error = error?.name === "AbortError" ? "转写已取消" : error?.message || "语音转写失败";
+      renderCodexPlusDictation();
+    } finally {
+      if (cancelRequest) controller.signal.removeEventListener("abort", cancelRequest);
+      if (revision === codexPlusDictation.revision) codexPlusDictation.controller = null;
+    }
+  }
+
+  function codexPlusDictationControl(action, label, disabled = false) {
+    const button = document.createElement("button");
+    button.type = "button"; button.textContent = label; button.dataset.dictationAction = action;
+    button.disabled = disabled;
+    return button;
+  }
+
+  function renderCodexPlusDictation() {
+    const state = codexPlusDictation;
+    document.querySelectorAll('[data-codex-plus-ext="builtin-dictation"][data-dictation-controls]').forEach((root) => {
+      const active = state.phase !== "idle" && (root.dataset.dictationTarget === state.target?.id || root.dataset.floating === "true");
+      const seconds = Math.floor((Date.now() - state.startedAt) / 1000);
+      const recordingLabel = `● 录音 ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+      const key = active ? `${state.phase}:${state.action}:${state.error}:${state.text}` : "idle";
+      if (root.dataset.renderKey === key) {
+        // 计时只改文本，不能每秒销毁按钮，否则键盘焦点和进行中的点击会丢失。
+        if (active && state.phase === "recording") root.querySelector('[role="status"]').textContent = recordingLabel;
+        return;
+      }
+      root.dataset.renderKey = key; root.replaceChildren();
+      if (!active) { root.append(codexPlusDictationControl("start", "语音输入", state.phase !== "idle")); return; }
+      const status = document.createElement("span"); status.setAttribute("role", "status");
+      if (state.phase === "recording") status.setAttribute("aria-live", "off");
+      status.textContent = state.phase === "requesting" ? "正在请求麦克风…"
+        : state.phase === "recording" ? recordingLabel
+        : state.phase === "transcribing" ? "正在转写…" : state.error;
+      root.append(status);
+      if (state.phase === "recording") {
+        root.append(codexPlusDictationControl("insert", "停止并插入"), codexPlusDictationControl("send", "停止并发送"));
+      } else if (state.phase === "transcribing") {
+        root.append(codexPlusDictationControl("send", "完成后发送", state.action === "send"));
+      } else if (state.phase === "error") {
+        if (state.blob) root.append(codexPlusDictationControl("retry", "重试转写"));
+        root.append(codexPlusDictationControl("rerecord", "重录"));
+      } else if (state.phase === "result") {
+        const text = document.createElement("textarea"); text.readOnly = true; text.value = state.text; text.setAttribute("aria-label", "语音识别结果");
+        root.append(text, codexPlusDictationControl("copy", "复制文字"));
+      }
+      root.append(codexPlusDictationControl("cancel", state.phase === "result" ? "关闭" : "取消"));
+    });
+    const floating = document.getElementById("codex-plus-dictation-recovery");
+    if (state.phase === "idle") floating?.remove();
+    else if (!codexPlusDictationTargetEditor() && !floating) {
+      const root = createCodexPlusDictationControls();
+      root.id = "codex-plus-dictation-recovery"; root.dataset.floating = "true";
+      document.body.append(root); renderCodexPlusDictation();
+    }
+  }
+
+  function createCodexPlusDictationControls() {
+    const root = document.createElement("div");
+    root.dataset.codexPlusExt = "builtin-dictation"; root.dataset.dictationControls = "true";
+    root.className = "codex-plus-dictation-controls";
+    root.addEventListener("pointerdown", (event) => { if (event.target.closest("button")) event.preventDefault(); });
+    root.addEventListener("click", (event) => {
+      const action = event.target.closest('[data-dictation-action]')?.dataset.dictationAction;
+      if (!action) return;
+      event.preventDefault(); event.stopPropagation();
+      if (action === "start") void startCodexPlusDictation(root.closest(".composer-footer, [data-composer-footer-responsive]"));
+      else if (action === "cancel") cancelCodexPlusDictation();
+      else if (action === "retry") void transcribeCodexPlusDictation();
+      else if (action === "rerecord") {
+        const footer = codexPlusDictationTargetEditor()?.closest('[data-composer-surface-variant], form')?.querySelector('.composer-footer, [data-composer-footer-responsive]')
+          || root.closest(".composer-footer, [data-composer-footer-responsive]");
+        cancelCodexPlusDictation();
+        if (footer) void startCodexPlusDictation(footer);
+        else showToast("请返回目标会话后重新录音", null);
+      } else if (action === "copy") {
+        if (!navigator.clipboard?.writeText) { showToast("请选中识别结果手动复制", null); return; }
+        void navigator.clipboard.writeText(codexPlusDictation.text)
+          .then(() => showToast("已复制识别结果", null)).catch(() => showToast("复制失败，请选中识别结果手动复制", null));
+      } else stopCodexPlusDictation(action);
+    });
+    return root;
+  }
+
+  function installCodexPlusDictation() {
+    if (!codexPlusDictationEnabled()) {
+      if (codexPlusDictation.phase !== "idle" || codexPlusDictation.pendingSend) cancelCodexPlusDictation();
+      document.querySelectorAll('[data-codex-plus-ext="builtin-dictation"]').forEach((node) => node.remove());
+      return;
+    }
+    if (!document.getElementById("codex-plus-dictation-style")) {
+      const style = document.createElement("style"); style.id = "codex-plus-dictation-style";
+      style.dataset.codexPlusExt = "builtin-dictation";
+      style.textContent = `.codex-plus-dictation-controls{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-inline:6px;font-size:12px;max-width:100%}
+        .codex-plus-dictation-controls button{border:1px solid color-mix(in srgb,currentColor 20%,transparent);border-radius:8px;padding:5px 8px;background:transparent;color:inherit;cursor:pointer;white-space:nowrap}
+        .codex-plus-dictation-controls button:disabled{opacity:.5;cursor:default}.codex-plus-dictation-controls button:focus-visible{outline:2px solid currentColor;outline-offset:2px}
+        #codex-plus-dictation-recovery{position:fixed;bottom:24px;right:24px;z-index:2147483000;padding:12px;border-radius:12px;background:var(--background,#252525);color:var(--foreground,#eee);box-shadow:0 4px 24px #0006;max-width:480px}
+        #codex-plus-dictation-recovery textarea{width:100%;min-height:80px;color:inherit;background:transparent}`;
+      document.head.append(style);
+    }
+    document.querySelectorAll(".composer-footer, [data-composer-footer-responsive]").forEach((footer) => {
+      if (!visibleElement(footer) || isExtensionUiNode(footer)) return;
+      const scope = codexPlusDictationScope(footer);
+      const editor = scope && codexPlusDictationEditor(scope);
+      if (!editor) return;
+      let controls = footer.querySelector('[data-dictation-controls]');
+      if (!controls) { controls = createCodexPlusDictationControls(); footer.append(controls); }
+      const target = editor.dataset.codexPlusDictationTarget || editor.closest('[data-codex-plus-dictation-root]')?.dataset.codexPlusDictationRoot || "";
+      if (controls.dataset.dictationTarget !== target) { controls.dataset.dictationTarget = target; delete controls.dataset.renderKey; }
+    });
+    renderCodexPlusDictation();
+  }
+
+  const codexPlusDictationKeyHandler = (event) => {
+    if (event.key === "Escape" && (codexPlusDictation.phase !== "idle" || codexPlusDictation.pendingSend)) {
+      event.preventDefault(); event.stopImmediatePropagation(); cancelCodexPlusDictation();
+      return;
+    }
+    const editor = codexPlusDictationTargetEditor();
+    if (event.key === "Enter" && !event.isComposing && !event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey
+        && editor && (document.activeElement === editor || editor.contains?.(document.activeElement))
+        && ["requesting", "recording", "transcribing"].includes(codexPlusDictation.phase)) {
+      // 在录音期间，Enter 先结束转写再发送，不能让原生输入框先提交旧草稿。
+      event.preventDefault(); event.stopImmediatePropagation();
+      if (codexPlusDictation.phase !== "requesting") stopCodexPlusDictation("send");
+    }
+  };
+  document.addEventListener("keydown", codexPlusDictationKeyHandler, true);
+  const codexPlusDictationDispose = () => {
+    cancelCodexPlusDictation();
+    document.removeEventListener("keydown", codexPlusDictationKeyHandler, true);
+    document.querySelectorAll('[data-codex-plus-ext="builtin-dictation"]').forEach((node) => node.remove());
+  };
+  window.addEventListener("pagehide", codexPlusDictationDispose, { once: true });
+  window.__codexPlusDictationRuntime = { dispose: () => {
+    window.removeEventListener("pagehide", codexPlusDictationDispose);
+    codexPlusDictationDispose();
+  } };
+  // 特效只观察原生编辑事件；不写输入框、不改选区，也不触发 React 输入事务。
+  window.__codexPlusTypingEffectsRuntime?.dispose?.();
+  const codexPlusTypingEffects = {
+    installed: false, disposed: false, mode: "off", canvas: null, context: null,
+    bounds: null, particles: [], frame: null, frameAt: 0, lastBurstAt: -Infinity,
+    editor: null, composition: null, compositionFrame: null, media: null,
+  };
+  const codexPlusTypingEffectMaxParticles = 180;
+  const codexPlusTypingEffectInterval = 40;
+  const codexPlusTypingEffectOwner = "builtin-typing-effects";
+  registerCodexPlusExtensionSelector('[data-codex-plus-ext="builtin-typing-effects"]');
+
+  function codexPlusTypingEffectMode() {
+    const value = codexPlusSettings().typingEffect;
+    return ["rainbow", "fireworks", "stars"].includes(value) ? value : "off";
+  }
+
+  function clearCodexPlusTypingEffects(resetComposition = true) {
+    const state = codexPlusTypingEffects;
+    if (state.frame !== null) cancelAnimationFrame(state.frame);
+    state.frame = null;
+    state.canvas?.remove();
+    state.canvas = state.context = state.bounds = state.editor = null;
+    if (resetComposition !== false) {
+      state.composition = null;
+      if (state.compositionFrame !== null) cancelAnimationFrame(state.compositionFrame);
+      state.compositionFrame = null;
+    }
+    state.particles.length = 0;
+    state.frameAt = 0;
+    state.lastBurstAt = -Infinity;
+  }
+
+  function syncCodexPlusTypingEffects() {
+    const state = codexPlusTypingEffects;
+    const mode = codexPlusTypingEffectMode();
+    if (state.mode !== mode || mode === "off" || state.media?.matches || document.hidden) clearCodexPlusTypingEffects();
+    state.mode = mode;
+  }
+
+  function codexPlusTypingEffectEditor(target) {
+    const editor = target?.closest?.('.ProseMirror[contenteditable="true"], textarea, [role="textbox"][contenteditable="true"]');
+    if (!editor?.isConnected || editor.matches(':disabled, [readonly], [contenteditable="false"]')
+        || isExtensionUiNode(editor) || editor.closest('[inert], [aria-hidden="true"]') || !visibleElement(editor)) return null;
+    // 新版有明确 composer 标记；旧版必须与 composer-footer 同属一个局部容器。
+    let composer = editor.closest('[data-codex-composer-root], [data-composer-surface-variant]');
+    if (!composer) {
+      let parent = editor.parentElement;
+      for (let depth = 0; parent && parent !== document.body && depth < 4; depth++, parent = parent.parentElement) {
+        if (parent.querySelector?.('.composer-footer')) { composer = parent; break; }
+        if (parent.tagName === "FORM") break;
+      }
+    }
+    return composer && (document.activeElement === editor || editor.contains(document.activeElement)) ? editor : null;
+  }
+
+  function codexPlusTypingEffectText(editor) {
+    return editor instanceof HTMLTextAreaElement ? editor.value : editor.textContent || "";
+  }
+
+  function codexPlusTypingEffectTextareaCaret(editor) {
+    const style = getComputedStyle(editor);
+    const rect = editor.getBoundingClientRect();
+    const width = editor.offsetWidth || rect.width;
+    const height = editor.offsetHeight || rect.height;
+    // 镜像不显示滚动条，须扣除原生 textarea 的滚动条占用，保持实际换行列宽。
+    const mirrorWidth = editor.clientWidth > 0
+      ? editor.clientWidth + (parseFloat(style.borderLeftWidth) || 0) + (parseFloat(style.borderRightWidth) || 0) : width;
+    const mirror = document.createElement("div");
+    mirror.setAttribute("data-codex-plus-ext", codexPlusTypingEffectOwner);
+    mirror.setAttribute("aria-hidden", "true");
+    // offsetWidth 使用布局尺寸，最终按真实 rect 缩放，兼容编辑器祖先上的 CSS zoom。
+    const properties = ["direction", "fontFamily", "fontSize", "fontWeight", "fontStyle", "fontVariant", "fontStretch",
+      "fontKerning", "fontFeatureSettings", "fontVariationSettings", "lineHeight", "letterSpacing", "wordSpacing", "textTransform", "textIndent", "textAlign", "tabSize", "wordBreak",
+      "paddingTop", "paddingRight", "paddingBottom", "paddingLeft", "borderTopWidth", "borderRightWidth", "borderBottomWidth", "borderLeftWidth"];
+    for (const property of properties) mirror.style[property] = style[property];
+    Object.assign(mirror.style, {
+      position: "fixed", left: "-100000px", top: "0", visibility: "hidden", pointerEvents: "none",
+      boxSizing: "border-box", width: `${mirrorWidth}px`, height: "auto", minHeight: "0", maxHeight: "none",
+      borderStyle: "solid", overflow: "hidden", whiteSpace: editor.wrap === "off" ? "pre" : "pre-wrap",
+      overflowWrap: editor.wrap === "off" ? "normal" : "break-word", zoom: "1",
+    });
+    const position = editor.selectionEnd ?? editor.value.length;
+    mirror.textContent = editor.value.slice(0, position);
+    const marker = document.createElement("span");
+    marker.textContent = editor.value.slice(position) || "\u200b";
+    mirror.appendChild(marker);
+    document.body.appendChild(mirror);
+    try {
+      const mirrorRect = mirror.getBoundingClientRect();
+      const markerRect = marker.getClientRects()[0] || marker.getBoundingClientRect();
+      const mirrorScale = mirrorRect.width / mirrorWidth || 1;
+      const scaleX = rect.width / width || 1;
+      const scaleY = rect.height / height || 1;
+      const lineHeight = parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.25 || 20;
+      return {
+        x: rect.left + ((markerRect.left - mirrorRect.left) / mirrorScale - editor.scrollLeft) * scaleX,
+        y: rect.top + ((markerRect.top - mirrorRect.top) / mirrorScale - editor.scrollTop + lineHeight * .55) * scaleY,
+      };
+    } finally { mirror.remove(); }
+  }
+
+  function codexPlusTypingEffectCaret(editor) {
+    const box = editor.getBoundingClientRect();
+    let point;
+    if (editor instanceof HTMLTextAreaElement) point = codexPlusTypingEffectTextareaCaret(editor);
+    else {
+      const selection = window.getSelection?.();
+      if (!selection?.rangeCount || !editor.contains(selection.anchorNode) || !editor.contains(selection.focusNode)) return null;
+      const range = selection.getRangeAt(0).cloneRange();
+      range.collapse(false);
+      let rect = range.getClientRects()[0] || range.getBoundingClientRect();
+      let precedingCharacter = false;
+      if (!rect?.height && range.endContainer?.nodeType === 3 && range.endOffset > 0) {
+        range.setStart(range.endContainer, range.endOffset - 1);
+        rect = range.getBoundingClientRect();
+        precedingCharacter = true;
+      }
+      const style = getComputedStyle(editor);
+      const lineHeight = parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.25 || 20;
+      if (rect?.height) point = {
+        x: precedingCharacter && style.direction !== "rtl" ? rect.right : rect.left,
+        y: rect.top + rect.height * .55,
+      };
+      else {
+        // 空段落/BR 的 collapsed Range 可能没有几何，使用所在行而非整个 editor 的首行。
+        let node = range.endContainer?.nodeType === 1 ? range.endContainer : range.endContainer?.parentElement;
+        const child = node?.childNodes?.[range.endOffset] || node?.childNodes?.[Math.max(0, range.endOffset - 1)];
+        if (child?.nodeType === 1) node = child;
+        let fallback = box;
+        let fallbackStyle = style;
+        for (let depth = 0; node && editor.contains(node) && depth < 4; depth++, node = node.parentElement) {
+          const nodeRect = node.getBoundingClientRect?.();
+          if (nodeRect?.height > 0) { fallback = nodeRect; fallbackStyle = getComputedStyle(node); break; }
+        }
+        const scaleX = box.width / (editor.offsetWidth || box.width) || 1;
+        const scaleY = box.height / (editor.offsetHeight || box.height) || 1;
+        const fallbackLineHeight = parseFloat(fallbackStyle.lineHeight) || parseFloat(fallbackStyle.fontSize) * 1.25 || lineHeight;
+        point = {
+          x: fallback.left + (parseFloat(fallbackStyle.paddingLeft) || 0) * scaleX,
+          y: fallback.top + ((parseFloat(fallbackStyle.paddingTop) || 0) + fallbackLineHeight * .55) * scaleY,
+        };
+      }
+    }
+    if (!Number.isFinite(point.x) || !Number.isFinite(point.y)) return null;
+    return { x: Math.max(box.left, Math.min(box.right, point.x)), y: Math.max(box.top, Math.min(box.bottom, point.y)) };
+  }
+
+  function createCodexPlusTypingEffectCanvas() {
+    const state = codexPlusTypingEffects;
+    if (state.canvas?.isConnected) return true;
+    const canvas = document.createElement("canvas");
+    canvas.setAttribute("data-codex-plus-ext", codexPlusTypingEffectOwner);
+    canvas.setAttribute("aria-hidden", "true");
+    Object.assign(canvas.style, {
+      position: "fixed", top: "0", left: "0", width: "100%", height: "100%", pointerEvents: "none",
+      zIndex: "2147483000", background: "transparent",
+    });
+    const context = canvas.getContext("2d");
+    if (!context) return false;
+    document.documentElement.appendChild(canvas);
+    const bounds = canvas.getBoundingClientRect();
+    const ratio = Math.min(2, Math.max(1, window.devicePixelRatio || 1));
+    canvas.width = Math.max(1, Math.round(bounds.width * ratio));
+    canvas.height = Math.max(1, Math.round(bounds.height * ratio));
+    context.setTransform(ratio, 0, 0, ratio, 0, 0);
+    Object.assign(state, { canvas, context, bounds });
+    return true;
+  }
+
+  function drawCodexPlusTypingEffects(timestamp) {
+    const state = codexPlusTypingEffects;
+    state.frame = null;
+    if (state.disposed || state.mode !== codexPlusTypingEffectMode() || state.media?.matches || document.hidden
+        || !state.editor?.isConnected || codexPlusTypingEffectEditor(document.activeElement) !== state.editor || !state.canvas?.isConnected) {
+      clearCodexPlusTypingEffects(); return;
+    }
+    const elapsed = state.frameAt ? Math.max(0, Math.min(32, timestamp - state.frameAt)) : 16;
+    state.frameAt = timestamp;
+    const context = state.context;
+    context.clearRect(0, 0, state.bounds.width, state.bounds.height);
+    state.particles = state.particles.filter((particle) => {
+      particle.age += elapsed;
+      if (particle.age >= particle.life) return false;
+      particle.x += particle.vx * elapsed / 1000;
+      particle.y += particle.vy * elapsed / 1000;
+      particle.vy += particle.gravity * elapsed / 1000;
+      const alpha = (1 - particle.age / particle.life) ** 1.5;
+      context.save();
+      context.globalAlpha = alpha;
+      context.fillStyle = particle.color;
+      context.translate(particle.x - state.bounds.left, particle.y - state.bounds.top);
+      context.rotate(particle.rotation + particle.age / 700);
+      if (particle.star) {
+        context.beginPath();
+        for (let index = 0; index < 10; index++) {
+          const radius = particle.size * (index % 2 ? .42 : 1);
+          const angle = index * Math.PI / 5 - Math.PI / 2;
+          if (index === 0) context.moveTo(Math.cos(angle) * radius, Math.sin(angle) * radius);
+          else context.lineTo(Math.cos(angle) * radius, Math.sin(angle) * radius);
+        }
+        context.closePath(); context.fill();
+      } else context.fillRect(-particle.size / 2, -particle.size / 2, particle.size, particle.size * 1.7);
+      context.restore();
+      return true;
+    });
+    if (state.particles.length) state.frame = requestAnimationFrame(drawCodexPlusTypingEffects);
+    else clearCodexPlusTypingEffects(false);
+  }
+
+  function emitCodexPlusTypingEffects(editor) {
+    const state = codexPlusTypingEffects;
+    syncCodexPlusTypingEffects();
+    if (state.disposed || state.mode === "off" || state.media?.matches || document.hidden) return false;
+    const now = performance.now();
+    if (now - state.lastBurstAt < codexPlusTypingEffectInterval) return false;
+    const point = codexPlusTypingEffectCaret(editor);
+    if (!point || !createCodexPlusTypingEffectCanvas()) return false;
+    state.lastBurstAt = now;
+    state.editor = editor;
+    const count = state.mode === "fireworks" ? 26 : state.mode === "stars" ? 10 : 16;
+    const available = Math.max(0, codexPlusTypingEffectMaxParticles - state.particles.length);
+    if (!available) return false;
+    const hue = now / 9 % 360;
+    for (let index = 0; index < Math.min(count, available); index++) {
+      const angle = state.mode === "fireworks" ? index / count * Math.PI * 2 : -Math.PI + Math.random() * Math.PI;
+      const speed = state.mode === "fireworks" ? 65 + Math.random() * 100 : 35 + Math.random() * 95;
+      state.particles.push({
+        x: point.x, y: point.y, vx: Math.cos(angle) * speed, vy: Math.sin(angle) * speed,
+        gravity: state.mode === "stars" ? 95 : 180, age: 0, life: 420 + Math.random() * 360,
+        size: state.mode === "stars" ? 3 + Math.random() * 3 : 1.5 + Math.random() * 2.2,
+        star: state.mode === "stars", rotation: Math.random() * Math.PI,
+        color: `hsl(${state.mode === "stars" ? 38 + Math.random() * 22 : hue + index * 360 / count} 95% 68%)`,
+      });
+    }
+    if (state.particles.length && state.frame === null) state.frame = requestAnimationFrame(drawCodexPlusTypingEffects);
+    return true;
+  }
+
+  function createCodexPlusTypingEffectComposition(editor, before = codexPlusTypingEffectText(editor)) {
+    return { editor, before, ended: false, emitted: false, lastEmittedText: null, lastInputText: before, sawTrustedInput: false, attempts: 0 };
+  }
+
+  function commitCodexPlusTypingEffectComposition(composition) {
+    const state = codexPlusTypingEffects;
+    if (state.composition !== composition || !composition.data || !composition.trusted
+        || !codexPlusTypingEffectEditor(composition.editor)) return false;
+    const text = codexPlusTypingEffectText(composition.editor);
+    if (composition.emitted && text === composition.committed) return true;
+    // 最终 input 通常紧接组词 input；同一份已绘制文本不重复发射。
+    if (text !== composition.lastEmittedText) {
+      if (text === composition.before || !emitCodexPlusTypingEffects(composition.editor)) return false;
+    }
+    composition.emitted = true;
+    composition.committed = text;
+    composition.lastEmittedText = text;
+    return true;
+  }
+
+  function updateCodexPlusTypingEffectComposition(composition) {
+    const state = codexPlusTypingEffects;
+    if (state.composition !== composition || state.disposed || !codexPlusTypingEffectEditor(composition.editor)) return;
+    let emitted;
+    if (composition.ended) emitted = commitCodexPlusTypingEffectComposition(composition);
+    else {
+      const text = codexPlusTypingEffectText(composition.editor);
+      emitted = text === composition.lastEmittedText || (composition.lastInputData === "" && !composition.backwardDeletion);
+      if (!emitted && (text !== composition.before || composition.backwardDeletion) && emitCodexPlusTypingEffects(composition.editor)) {
+        composition.lastEmittedText = text;
+        emitted = true;
+      }
+    }
+    if (emitted) {
+      if (state.compositionFrame !== null) cancelAnimationFrame(state.compositionFrame);
+      state.compositionFrame = null;
+      composition.attempts = 0;
+    } else if (state.composition === composition && state.compositionFrame === null && composition.attempts < 3) {
+      // 输入法/编辑器可能在事件之后才恢复选区；只做有界补发，不开启常驻扫描。
+      state.compositionFrame = requestAnimationFrame(() => {
+        state.compositionFrame = null;
+        composition.attempts += 1;
+        updateCodexPlusTypingEffectComposition(composition);
+      });
+    }
+  }
+
+  function codexPlusTypingEffectInput(event) {
+    if (event.isTrusted !== true) return;
+    const backwardDeletion = ["deleteContentBackward", "deleteWordBackward", "deleteSoftLineBackward", "deleteHardLineBackward"].includes(event.inputType);
+    if (!backwardDeletion && !["insertText", "insertLineBreak", "insertParagraph", "insertCompositionText", "insertFromComposition"].includes(event.inputType)) return;
+    const editor = codexPlusTypingEffectEditor(event.target);
+    if (!editor) return;
+    const state = codexPlusTypingEffects;
+    let composition = state.composition;
+    const compositionInput = event.isComposing || ["insertCompositionText", "insertFromComposition"].includes(event.inputType);
+    if (compositionInput && (!composition || composition.editor !== editor
+        || (composition.ended && composition.emitted && (event.isComposing || codexPlusTypingEffectText(editor) !== composition.committed)))) {
+      // 部分输入法不会派发 compositionstart，但仍有可信的原生组词 input。
+      if (state.compositionFrame !== null) cancelAnimationFrame(state.compositionFrame);
+      state.compositionFrame = null;
+      composition = state.composition = createCodexPlusTypingEffectComposition(editor, null);
+      if (event.inputType === "insertFromComposition") Object.assign(composition, { ended: true, data: event.data, trusted: true });
+    }
+    if (composition?.editor === editor) {
+      if (backwardDeletion && composition.ended && !event.isComposing) {
+        if (state.compositionFrame !== null) cancelAnimationFrame(state.compositionFrame);
+        state.compositionFrame = null;
+        state.composition = null;
+        emitCodexPlusTypingEffects(editor);
+        return;
+      }
+      if (!composition.ended || !composition.emitted) {
+        const text = codexPlusTypingEffectText(editor);
+        // 输入法退格也可能沿用 insertCompositionText，且清空组词时 data 为空。
+        const shorterPreedit = compositionInput && typeof composition.lastInputText === "string" && text.length < composition.lastInputText.length;
+        Object.assign(composition, {
+          sawTrustedInput: true, lastInputData: event.data, lastInputText: text,
+          backwardDeletion: backwardDeletion || shorterPreedit, attempts: 0,
+        });
+        updateCodexPlusTypingEffectComposition(composition);
+        return;
+      }
+      if (codexPlusTypingEffectText(editor) === composition.committed) return;
+      state.composition = null;
+    }
+    if (event.isComposing || (!backwardDeletion && !["insertText", "insertLineBreak", "insertParagraph"].includes(event.inputType))) return;
+    if (event.inputType === "insertText" && !event.data) return;
+    emitCodexPlusTypingEffects(editor);
+  }
+
+  function codexPlusTypingEffectCompositionStart(event) {
+    if (event.isTrusted !== true) return;
+    syncCodexPlusTypingEffects();
+    if (codexPlusTypingEffects.mode === "off" || codexPlusTypingEffects.media?.matches || document.hidden) return;
+    const editor = codexPlusTypingEffectEditor(event.target);
+    if (editor) {
+      if (codexPlusTypingEffects.compositionFrame !== null) cancelAnimationFrame(codexPlusTypingEffects.compositionFrame);
+      codexPlusTypingEffects.compositionFrame = null;
+      codexPlusTypingEffects.composition = createCodexPlusTypingEffectComposition(editor);
+    }
+  }
+
+  function codexPlusTypingEffectCompositionEnd(event) {
+    const composition = codexPlusTypingEffects.composition;
+    if (!composition || composition.editor !== codexPlusTypingEffectEditor(event.target)) return;
+    // 有些输入法/宿主转发结束事件，isTrusted 为 false；仅接纳之前已观察到的可信组词内容。
+    if (event.isTrusted !== true && (!composition.sawTrustedInput || (event.data && event.data !== composition.lastInputData))) return;
+    if (!event.data) {
+      codexPlusTypingEffects.composition = null;
+      if (codexPlusTypingEffects.compositionFrame !== null) cancelAnimationFrame(codexPlusTypingEffects.compositionFrame);
+      codexPlusTypingEffects.compositionFrame = null;
+      return;
+    }
+    Object.assign(composition, { ended: true, data: event.data, trusted: event.isTrusted === true || composition.sawTrustedInput });
+    queueMicrotask(() => {
+      updateCodexPlusTypingEffectComposition(composition);
+    });
+  }
+
+  function codexPlusTypingEffectFocusOut(event) {
+    const state = codexPlusTypingEffects;
+    if (event.target === state.editor || event.target === state.composition?.editor) clearCodexPlusTypingEffects();
+  }
+
+  function installCodexPlusTypingEffects() {
+    const state = codexPlusTypingEffects;
+    if (state.disposed) return;
+    if (!state.installed) {
+      state.installed = true;
+      state.media = window.matchMedia?.("(prefers-reduced-motion: reduce)") || null;
+      document.addEventListener("input", codexPlusTypingEffectInput, true);
+      document.addEventListener("compositionstart", codexPlusTypingEffectCompositionStart, true);
+      document.addEventListener("compositionend", codexPlusTypingEffectCompositionEnd, true);
+      document.addEventListener("focusout", codexPlusTypingEffectFocusOut, true);
+      document.addEventListener("visibilitychange", syncCodexPlusTypingEffects);
+      window.addEventListener("blur", clearCodexPlusTypingEffects);
+      window.addEventListener("resize", clearCodexPlusTypingEffects);
+      state.media?.addEventListener?.("change", syncCodexPlusTypingEffects);
+    }
+    syncCodexPlusTypingEffects();
+  }
+
+  window.__codexPlusTypingEffectsRuntime = {
+    dispose() {
+      const state = codexPlusTypingEffects;
+      state.disposed = true;
+      clearCodexPlusTypingEffects();
+      if (!state.installed) return;
+      document.removeEventListener("input", codexPlusTypingEffectInput, true);
+      document.removeEventListener("compositionstart", codexPlusTypingEffectCompositionStart, true);
+      document.removeEventListener("compositionend", codexPlusTypingEffectCompositionEnd, true);
+      document.removeEventListener("focusout", codexPlusTypingEffectFocusOut, true);
+      document.removeEventListener("visibilitychange", syncCodexPlusTypingEffects);
+      window.removeEventListener("blur", clearCodexPlusTypingEffects);
+      window.removeEventListener("resize", clearCodexPlusTypingEffects);
+      state.media?.removeEventListener?.("change", syncCodexPlusTypingEffects);
+      state.installed = false;
+    },
+  };
   function ensureConversationViewRuntime() {
     if (conversationViewState.runtimeStarted) return;
     conversationViewState.ro = conversationViewState.ro || new ResizeObserver(() => scheduleConversationViewAlign());
@@ -11912,7 +13772,6 @@
     refreshCodexPlusRailNavigation();
     installCodexPlusPageNavigationCloseHandler();
     installSessionShareImportListener();
-    localizeCodexMenus();
     scheduleBackendHeartbeat();
     installDeleteButtonEventDelegation();
     updateThreadScrollHandlers();
@@ -12256,514 +14115,6 @@
     };
   }
 
-  let zedRemoteStatusPromise = null;
-  const zedRemoteMissingHostMessage = "Cannot determine remote SSH host for this file";
-
-  function showZedRemoteToast(message) {
-    document.querySelectorAll(`.${zedRemoteToastClass}`).forEach((node) => node.remove());
-    const toast = document.createElement("div");
-    toast.className = zedRemoteToastClass;
-    toast.textContent = message;
-    document.body.appendChild(toast);
-    setTimeout(() => toast.remove(), 3200);
-  }
-
-  async function loadZedRemoteStatus() {
-    zedRemoteStatusPromise = zedRemoteStatusPromise || postJson("/zed-remote/status", {});
-    return zedRemoteStatusPromise;
-  }
-
-  async function resolveZedRemoteHost(hostId) {
-    const result = await postJson("/zed-remote/resolve-host", { hostId });
-    return result?.status === "ok" && result.ssh ? result.ssh : null;
-  }
-
-  function zedRemoteIsRemoteHostId(hostId) {
-    return zedRemoteString(hostId).startsWith("remote-ssh-");
-  }
-
-  function zedRemoteProjectIdFromRow(row) {
-    const projectList = row?.closest?.("[data-app-action-sidebar-project-list-id]");
-    const projectId = zedRemoteString(projectList?.getAttribute?.("data-app-action-sidebar-project-list-id"));
-    if (projectId) return projectId;
-    const projectRow = row?.closest?.("[data-app-action-sidebar-project-id]");
-    return zedRemoteString(projectRow?.getAttribute?.("data-app-action-sidebar-project-id"));
-  }
-
-  function zedRemoteWorkspaceRootFromObject(source) {
-    if (!source || typeof source !== "object") return "";
-    for (const key of ["remoteWorkspaceRoot", "workspaceRoot", "displayCwd", "cwd", "rootPath", "workingDirectory", "workingDir"]) {
-      const workspaceRoot = zedRemoteString(source[key]);
-      if (workspaceRoot.startsWith("/") && !/\/\.codex$/.test(workspaceRoot)) return workspaceRoot;
-    }
-    const hostConfig = source.hostConfig || source.sshHostConfig || source.remoteHostConfig || source.ssh || {};
-    for (const key of ["remoteWorkspaceRoot", "workspaceRoot", "rootPath", "cwd"]) {
-      const workspaceRoot = zedRemoteString(hostConfig[key]);
-      if (workspaceRoot.startsWith("/") && !/\/\.codex$/.test(workspaceRoot)) return workspaceRoot;
-    }
-    return "";
-  }
-
-  function zedRemoteWorkspaceRootFromElement(element) {
-    for (const key of zedRemoteReactKeys(element)) {
-      const workspaceRoot = zedRemoteWalkObject(element[key], zedRemoteWorkspaceRootFromObject, { maxDepth: 10, maxNodes: 320 });
-      if (workspaceRoot) return workspaceRoot;
-    }
-    return "";
-  }
-
-  function zedRemoteWorkspaceRootFromRow(row) {
-    for (let node = row; node && node !== document.body; node = node.parentElement) {
-      const workspaceRoot = zedRemoteWorkspaceRootFromElement(node);
-      if (workspaceRoot) return workspaceRoot;
-    }
-    return "";
-  }
-
-  function zedRemoteActiveThreadRow() {
-    const rows = sessionRows(true).filter((row) => row instanceof HTMLElement);
-    return rows.find((row) => row.getAttribute("data-app-action-sidebar-thread-active") === "true")
-      || rows.find((row) => row.getAttribute("aria-current") === "page" || row.getAttribute("aria-current") === "true")
-      || null;
-  }
-
-  function zedRemoteCurrentFallbackPayload() {
-    const row = zedRemoteActiveThreadRow();
-    const ref = row ? sessionRefFromRow(row) : currentSessionRef();
-    const threadId = ref.session_id || locationThreadId();
-    const hostId = zedRemoteString(row?.getAttribute?.("data-app-action-sidebar-thread-host-id"));
-    const isRemoteHost = zedRemoteIsRemoteHostId(hostId);
-    const payload = {};
-    if (threadId) payload.threadId = threadId;
-    if (hostId && hostId !== "local") payload.hostId = hostId;
-    if (!isRemoteHost) return payload;
-    const remoteWorkspaceRoot = zedRemoteWorkspaceRootFromRow(row);
-    const remoteProjectId = zedRemoteProjectIdFromRow(row);
-    if (remoteWorkspaceRoot) payload.remoteWorkspaceRoot = remoteWorkspaceRoot;
-    if (remoteProjectId) payload.remoteProjectId = remoteProjectId;
-    return payload;
-  }
-
-  async function resolveZedRemoteFallbackRequest() {
-    const payload = zedRemoteCurrentFallbackPayload();
-    if (!zedRemoteIsRemoteHostId(payload.hostId)) return null;
-    const result = await postJson("/zed-remote/fallback-request", payload);
-    return result?.status === "ok" && result.request ? result.request : null;
-  }
-
-  function zedRemoteOpenStrategy() {
-    const strategy = zedRemoteString(codexPlusBackendSettings.zedRemoteOpenStrategy);
-    return ["addToFocusedWorkspace", "reuseWindow", "newWindow", "default"].includes(strategy)
-      ? strategy
-      : "addToFocusedWorkspace";
-  }
-
-  function zedRemoteString(value) {
-    return typeof value === "string" || typeof value === "number" ? String(value).trim() : "";
-  }
-
-  function zedRemoteTruthy(value) {
-    if (value === true) return true;
-    if (typeof value === "string") return /^(true|1|yes|enabled|ssh)$/i.test(value.trim());
-    return false;
-  }
-
-  function zedRemoteHasTrustedSshSignal(source, hostConfig) {
-    return zedRemoteTruthy(source?.supportsSsh) || zedRemoteTruthy(hostConfig?.supportsSsh);
-  }
-
-  function zedRemoteContextFromObject(source) {
-    if (!source || typeof source !== "object") return null;
-    const hostConfig = source.hostConfig || source.sshHostConfig || source.remoteHostConfig || source.ssh || {};
-    const host = zedRemoteString(source.remoteHost || source.sshHost || source.host || source.hostname || source.hostName || hostConfig.host || hostConfig.hostname || hostConfig.hostName || hostConfig.sshHost);
-    const hostId = zedRemoteString(source.hostId);
-    const cwd = zedRemoteString(source.cwd || source.workspaceRoot || source.rootPath || source.remoteWorkspaceRoot || hostConfig.remoteWorkspaceRoot || hostConfig.workspaceRoot || hostConfig.rootPath);
-    if ((!host || !zedRemoteHasTrustedSshSignal(source, hostConfig)) && !(hostId.startsWith("remote-ssh-") && cwd.startsWith("/"))) return null;
-    const user = zedRemoteString(source.remoteUser || source.sshUser || source.user || source.username || hostConfig.user || hostConfig.username || hostConfig.sshUser);
-    const port = zedRemoteString(source.remotePort || source.sshPort || source.port || hostConfig.port || hostConfig.sshPort);
-    const workspaceRoot = cwd;
-    return { hostId, ssh: { user, host, port }, workspaceRoot };
-  }
-
-  function zedRemoteWalkObject(root, visitor, options = {}) {
-    const maxDepth = options.maxDepth || 6;
-    const maxNodes = options.maxNodes || 180;
-    const visited = new WeakSet();
-    const stack = [{ value: root, depth: 0 }];
-    let scanned = 0;
-    while (stack.length && scanned < maxNodes) {
-      const { value, depth } = stack.pop();
-      if (!value || typeof value !== "object" || visited.has(value) || depth > maxDepth) continue;
-      visited.add(value);
-      scanned += 1;
-      const result = visitor(value);
-      if (result) return result;
-      if (value instanceof Element || value === window || value === document || value === document.body || value === document.documentElement) continue;
-      for (const key of Object.keys(value).slice(0, 80)) {
-        if (key === "ownerDocument" || key === "parentElement" || key === "parentNode" || key === "children" || key === "childNodes") continue;
-        let child;
-        try {
-          child = value[key];
-        } catch {
-          continue;
-        }
-        if (child && typeof child === "object") stack.push({ value: child, depth: depth + 1 });
-      }
-    }
-    return null;
-  }
-
-  function zedRemoteReactKeys(element) {
-    return Object.keys(element).filter((key) => key.startsWith("__reactFiber") || key.startsWith("__reactInternalInstance") || key.startsWith("__reactProps"));
-  }
-
-  function zedRemoteContextFromElement(element) {
-    for (const key of zedRemoteReactKeys(element)) {
-      const context = zedRemoteWalkObject(element[key], zedRemoteContextFromObject);
-      if (context) return context;
-    }
-    return null;
-  }
-
-  function zedRemoteContextForElement(element) {
-    for (let node = element; node && node !== document.body; node = node.parentElement) {
-      const context = zedRemoteContextFromElement(node);
-      if (context) return context;
-    }
-    return null;
-  }
-
-  function zedRemoteHostIdFromText(text) {
-    const source = String(text || "");
-    const match = source.match(/\bremote-ssh-[A-Za-z0-9:_-]+\b/);
-    return match ? match[0] : "";
-  }
-
-  function zedRemoteWorkspaceRootForPath(path) {
-    const source = String(path || "").trim();
-    const projects = Array.from(document.querySelectorAll(selectors.sidebarThread))
-      .map((row) => ({
-        label: (row.textContent || "").replace(/\s+/g, " ").trim(),
-        selected: row.getAttribute("aria-current") === "page" || row.getAttribute("data-selected") === "true" || row.getAttribute("data-active") === "true" || row.className.includes("selected"),
-      }))
-      .filter((row) => row.label);
-    const selected = projects.find((row) => row.selected)?.label || "";
-    for (const label of [selected, ...projects.map((row) => row.label)]) {
-      const name = label.match(/^([A-Za-z0-9._-]+)/)?.[1];
-      if (name && source.includes(`/repo/${name}/`)) return source.slice(0, source.indexOf(`/repo/${name}/`) + `/repo/${name}`.length);
-    }
-    const repoIndex = source.indexOf("/bin/repo/");
-    if (repoIndex >= 0) {
-      const afterRepo = source.slice(repoIndex + "/bin/repo/".length);
-      const project = afterRepo.split("/")[0];
-      if (project) return source.slice(0, repoIndex + "/bin/repo/".length + project.length);
-    }
-    return source;
-  }
-
-  function zedRemoteFallbackContextForElement(element) {
-    const pathText = (element.textContent || "").trim();
-    if (!pathText.startsWith("/")) return null;
-    const root = element.closest("main") || document.body;
-    const hostId = zedRemoteHostIdFromText(root?.textContent || "") || "remote-ssh-codex-managed:remote";
-    return { hostId, ssh: { user: "", host: "", port: "" }, workspaceRoot: zedRemoteWorkspaceRootForPath(pathText) };
-  }
-
-  function zedRemoteContextFromSerializedState(text) {
-    const source = String(text || "");
-    if (!source.includes("hostConfig") || !source.includes("supportsSsh") || !source.includes("remoteWorkspaceRoot")) return null;
-    const trimmed = source.trim();
-    if (/^[{[]/.test(trimmed)) {
-      try {
-        const parsed = JSON.parse(trimmed);
-        const context = zedRemoteWalkObject(parsed, zedRemoteContextFromObject, { maxDepth: 10, maxNodes: 300 });
-        if (context) return context;
-      } catch {
-      }
-    }
-    if (!/['"]supportsSsh['"]\s*:\s*true/.test(source)) return null;
-    const fieldValue = (name) => {
-      const match = source.match(new RegExp(`["']${name}["']\\s*:\\s*["']([^"']+)["']`));
-      return match ? match[1] : "";
-    };
-    const host = fieldValue("host") || fieldValue("hostname") || fieldValue("hostName") || fieldValue("sshHost") || fieldValue("remoteHost");
-    if (!host) return null;
-    return {
-      ssh: {
-        user: fieldValue("user") || fieldValue("username") || fieldValue("sshUser") || fieldValue("remoteUser"),
-        host,
-        port: fieldValue("port") || fieldValue("sshPort") || fieldValue("remotePort"),
-      },
-      workspaceRoot: fieldValue("remoteWorkspaceRoot") || fieldValue("workspaceRoot") || fieldValue("rootPath"),
-    };
-  }
-
-  const zedRemoteContextCacheTtlMs = 1200;
-  let zedRemoteContextCache = { scope: null, at: 0, value: null };
-
-  function zedRemoteScopedElements(scope, selector) {
-    const root = scope?.querySelectorAll ? scope : document;
-    const nodes = [];
-    if (scope instanceof HTMLElement && scope.matches?.(selector)) nodes.push(scope);
-    root.querySelectorAll?.(selector).forEach((node) => nodes.push(node));
-    return Array.from(new Set(nodes));
-  }
-
-  function zedRemoteContextFromDataset(node) {
-    if (!(node instanceof HTMLElement)) return null;
-    const data = node.dataset;
-    return zedRemoteContextFromObject({
-      hostConfig: data.hostConfig ? { host: data.hostConfig, supportsSsh: true } : {},
-      supportsSsh: data.supportsSsh || data.supportsSshRemote,
-      sshHost: data.sshHost,
-      remoteHost: data.remoteHost,
-      host: data.host,
-      sshUser: data.sshUser,
-      remoteUser: data.remoteUser,
-      user: data.user,
-      sshPort: data.sshPort,
-      remotePort: data.remotePort,
-      port: data.port,
-      remoteWorkspaceRoot: data.remoteWorkspaceRoot,
-      workspaceRoot: data.workspaceRoot,
-    });
-  }
-
-  function zedRemoteContextUncached(scope = document) {
-    const explicitSelector = "[data-host-config], [data-ssh-host], [data-remote-host], [data-remote-workspace-root], [data-supports-ssh]";
-    for (const node of zedRemoteScopedElements(scope, explicitSelector)) {
-      if (isExtensionUiNode(node)) continue;
-      const context = zedRemoteContextFromDataset(node);
-      if (context) return context;
-    }
-    const reactSelector = "[data-remote-path], [data-file-path], [data-path], [data-open-in-targets], [data-open-file], [data-codex-open-file], [role='menuitem']";
-    const reactNodes = zedRemoteScopedElements(scope, reactSelector);
-    if (scope instanceof HTMLElement && !isExtensionUiNode(scope)) reactNodes.unshift(scope);
-    for (const node of Array.from(new Set(reactNodes)).slice(0, 60)) {
-      if (!(node instanceof HTMLElement) || isExtensionUiNode(node)) continue;
-      const context = zedRemoteContextFromElement(node);
-      if (context) return context;
-    }
-    if (scope !== document) return null;
-    const scripts = Array.from(document.querySelectorAll("script[type='application/json'], script[data-state], script#__NEXT_DATA__, script:not([src])"));
-    for (const script of scripts.slice(0, 20)) {
-      const context = zedRemoteContextFromSerializedState(script.textContent || "");
-      if (context) return context;
-    }
-    return null;
-  }
-
-  function zedRemoteContext(scope = document) {
-    const settings = codexPlusSettings();
-    if (!settings.zedRemoteOpen) return null;
-    const now = Date.now();
-    if (zedRemoteContextCache.scope === scope && now - zedRemoteContextCache.at < zedRemoteContextCacheTtlMs) {
-      return zedRemoteContextCache.value;
-    }
-    const value = zedRemoteContextUncached(scope);
-    zedRemoteContextCache = { scope, at: now, value };
-    return value;
-  }
-
-  function zedRemoteAbsolutePath(value, workspaceRoot) {
-    const text = String(value || "").trim();
-    if (!text) return "";
-    if (text.startsWith("/")) return text;
-    if (workspaceRoot && !text.includes("://") && !text.startsWith("~")) {
-      return `${workspaceRoot.replace(/\/+$/, "")}/${text.replace(/^\.\//, "")}`;
-    }
-    return "";
-  }
-
-  function zedRemoteMetadataRemotePath(source) {
-    if (!source || typeof source !== "object") return "";
-    return zedRemoteString(source.remotePath || source.remote_path || source.path || source.filePath || source.file_path || source.openFile?.remotePath || source.openFile?.path);
-  }
-
-  function zedRemotePathFromElementMetadata(element) {
-    const dataPath = element.dataset.remotePath || element.dataset.filePath || element.dataset.path || "";
-    if (dataPath) return dataPath;
-    for (const key of zedRemoteReactKeys(element)) {
-      const path = zedRemoteWalkObject(element[key], zedRemoteMetadataRemotePath, { maxDepth: 6, maxNodes: 120 });
-      if (path) return path;
-    }
-    return "";
-  }
-
-  function zedRemoteInlinePathFromElement(element, context) {
-    if (!context?.hostId && !context?.ssh?.host) return "";
-    const text = (element.textContent || "").trim();
-    if (!text || text.length > 600 || !text.startsWith("/")) return "";
-    const path = zedRemoteAbsolutePath(text, context.workspaceRoot || "");
-    if (!path) return "";
-    if (context.workspaceRoot && !path.startsWith(`${context.workspaceRoot.replace(/\/+$/, "")}/`) && path !== context.workspaceRoot) return "";
-    return path;
-  }
-
-  function zedRemoteAnchorHasOpenFileMetadata(anchor) {
-    if (!(anchor instanceof HTMLAnchorElement)) return false;
-    if (anchor.dataset.remotePath || anchor.dataset.filePath || anchor.dataset.path || anchor.dataset.openInTargets || anchor.dataset.openFile || anchor.dataset.codexOpenFile) return true;
-    const label = `${anchor.getAttribute("aria-label") || ""} ${anchor.getAttribute("data-testid") || ""} ${anchor.getAttribute("rel") || ""}`;
-    return /open[-_\s]?file|open-in-targets|remote/i.test(label) && !!zedRemotePathFromElementMetadata(anchor);
-  }
-
-  function zedRemoteFileCandidates(context, scope = document) {
-    const candidates = [];
-    const seen = new Set();
-    const addCandidate = (node, candidateContext, rawPath) => {
-      if (!candidateContext?.ssh?.host && !candidateContext?.hostId) return;
-      const path = zedRemoteAbsolutePath(rawPath, candidateContext.workspaceRoot || "");
-      if (!path || seen.has(path)) return;
-      seen.add(path);
-      candidates.push({ node, request: { ssh: candidateContext.ssh, hostId: candidateContext.hostId || "", path } });
-    };
-    const selectors = "[data-remote-path], [data-file-path], [data-path], [data-open-in-targets], [data-open-file], [data-codex-open-file], a[data-remote-path], a[data-file-path], a[data-path]";
-    zedRemoteScopedElements(scope, selectors).forEach((node) => {
-      if (!(node instanceof HTMLElement) || isExtensionUiNode(node)) return;
-      if (node instanceof HTMLAnchorElement && !zedRemoteAnchorHasOpenFileMetadata(node)) return;
-      addCandidate(node, zedRemoteContextForElement(node) || context, zedRemotePathFromElementMetadata(node));
-    });
-    if (scope !== document) {
-      zedRemoteScopedElements(scope, "span.inline-markdown, code, [class*='inlineMarkdown']").forEach((node) => {
-        if (!(node instanceof HTMLElement) || isExtensionUiNode(node)) return;
-        const candidateContext = zedRemoteContextForElement(node) || context || zedRemoteFallbackContextForElement(node);
-        if (!candidateContext?.hostId && !candidateContext?.ssh?.host) return;
-        const path = zedRemoteInlinePathFromElement(node, candidateContext);
-        if (path) addCandidate(node, candidateContext, path);
-      });
-    }
-    return candidates;
-  }
-
-  function zedRemoteBestOpenRequest(scope = document, context = zedRemoteContext(scope) || zedRemoteContext(document) || {}) {
-    const candidates = zedRemoteFileCandidates(context, scope);
-    if (candidates.length) return candidates[0].request;
-    return null;
-  }
-
-  async function openZedRemote(request) {
-    let nextRequest = request;
-    if (!nextRequest?.ssh?.host && nextRequest?.hostId) {
-      const ssh = await resolveZedRemoteHost(nextRequest.hostId);
-      nextRequest = ssh ? { ...nextRequest, ssh } : nextRequest;
-    }
-    if (!nextRequest?.ssh?.host) {
-      showZedRemoteToast(zedRemoteMissingHostMessage);
-      return;
-    }
-    nextRequest = {
-      ...nextRequest,
-      strategy: nextRequest.strategy || zedRemoteOpenStrategy(),
-      remember: codexPlusBackendSettings.zedRemoteProjectRegistryEnabled !== false,
-    };
-    try {
-      const result = await postJson("/zed-remote/open", nextRequest);
-      if (result?.status === "ok") {
-        showZedRemoteToast("Opened in Zed Remote");
-        return;
-      }
-      showZedRemoteToast(result?.message || "Cannot open this file in Zed Remote");
-    } catch (error) {
-      showZedRemoteToast(error?.message || "Cannot open this file in Zed Remote");
-    }
-  }
-
-  function removeZedRemoteButtons() {
-    document.querySelectorAll(`[data-codex-zed-remote-version]`).forEach((node) => {
-      delete node.dataset.codexZedRemoteVersion;
-    });
-    document.querySelectorAll(`.${zedRemoteButtonClass}`).forEach((node) => node.remove());
-  }
-
-  function createZedRemoteOpenInMenuItem(referenceItem) {
-    const item = document.createElement("div");
-    item.className = referenceItem?.className || "no-drag text-token-foreground outline-hidden rounded-lg px-[var(--padding-row-x)] py-[var(--padding-row-y)] text-sm group hover:bg-token-list-hover-background focus:bg-token-list-hover-background cursor-interaction flex flex-col";
-    item.classList.add(zedRemoteOpenInMenuItemClass);
-    item.setAttribute("role", referenceItem?.getAttribute("role") || "menuitem");
-    item.setAttribute("tabindex", referenceItem?.getAttribute("tabindex") || "-1");
-    item.setAttribute("data-orientation", referenceItem?.getAttribute("data-orientation") || "vertical");
-    item.innerHTML = `
-      <div class="flex w-full items-center gap-1.5">
-        <span class="inline-flex size-[18px] items-center justify-center leading-none shrink-0 opacity-75 group-focus:opacity-100 group-hover:opacity-100">
-          <img alt="" class="codex-zed-open-in-menu-icon icon-sm" src="apps/zed.png">
-        </span>
-        <span class="flex-1 min-w-0 truncate">Zed</span>
-      </div>
-    `;
-    bindZedRemoteOpenInMenuItem(item, "injected");
-    return item;
-  }
-
-  function zedRemoteOpenInMenuActivationIsDuplicate(target) {
-    if (!(target instanceof HTMLElement)) return false;
-    const now = Date.now();
-    const activatedAt = Number(target.dataset.codexZedOpenInMenuActivatedAt || 0);
-    if (activatedAt && now - activatedAt < zedRemoteOpenInMenuActivationWindowMs) return true;
-    target.dataset.codexZedOpenInMenuActivatedAt = String(now);
-    return false;
-  }
-
-  async function activateZedRemoteOpenInMenuItem(event) {
-    if (!codexPlusSettings().zedRemoteOpen) return;
-    if (event?.type === "keydown" && !["Enter", " "].includes(event.key)) return;
-    const scope = event?.currentTarget?.closest?.('[role="menu"], [data-radix-popper-content-wrapper]') || event?.currentTarget || document;
-    event.preventDefault();
-    event.stopPropagation();
-    event.stopImmediatePropagation?.();
-    if (zedRemoteOpenInMenuActivationIsDuplicate(event?.currentTarget)) return;
-    const request = zedRemoteBestOpenRequest(scope) || await resolveZedRemoteFallbackRequest();
-    if (!request) {
-      showZedRemoteToast("Cannot find a remote workspace or file for Zed");
-      return;
-    }
-    openZedRemote(request);
-    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true }));
-  }
-
-  function bindZedRemoteOpenInMenuItem(item, source) {
-    item.setAttribute("data-codex-zed-open-in-menu", source);
-    if (item.dataset.codexZedOpenInMenuBound === zedRemoteOpenInMenuVersion) return;
-    item.dataset.codexZedOpenInMenuBound = zedRemoteOpenInMenuVersion;
-    item.dataset.codexZedOpenInMenuVersion = zedRemoteOpenInMenuVersion;
-    item.addEventListener("pointerup", activateZedRemoteOpenInMenuItem, true);
-    item.addEventListener("click", activateZedRemoteOpenInMenuItem, true);
-    item.addEventListener("keydown", activateZedRemoteOpenInMenuItem, true);
-  }
-
-  function removeZedRemoteOpenInMenuItems(scope = document) {
-    const root = scope?.querySelectorAll ? scope : document;
-    root.querySelectorAll(`.${zedRemoteOpenInMenuItemClass}, [data-codex-zed-open-in-menu="injected"]`).forEach((node) => node.remove());
-  }
-
-  function zedRemoteOpenInMenuScopes(scope = document) {
-    const root = scope?.querySelectorAll ? scope : document;
-    const menus = [];
-    if (scope instanceof HTMLElement && scope.matches?.('[role="menu"]')) menus.push(scope);
-    root.querySelectorAll?.('[role="menu"]').forEach((menu) => menus.push(menu));
-    return Array.from(new Set(menus));
-  }
-
-  function refreshZedRemoteOpenInMenus(scope = document) {
-    removeZedRemoteOpenInMenuItems(scope);
-    if (!codexPlusSettings().zedRemoteOpen) return;
-    const fallbackPayload = zedRemoteCurrentFallbackPayload();
-    zedRemoteOpenInMenuScopes(scope).forEach((menu) => {
-      if (!(menu instanceof HTMLElement) || isExtensionUiNode(menu)) return;
-      const items = Array.from(menu.querySelectorAll('[role="menuitem"]')).filter((item) => !isExtensionUiNode(item));
-      const menuText = items.map((item) => (item.textContent || "").trim()).join(" ");
-      if (!/\b(VS Code|Cursor|Antigravity)\b/.test(menuText)) return;
-      if (!zedRemoteBestOpenRequest(menu) && !zedRemoteIsRemoteHostId(fallbackPayload.hostId)) return;
-      const existingZedItem = items.find((item) => (item.textContent || "").trim() === "Zed");
-      if (existingZedItem) {
-        bindZedRemoteOpenInMenuItem(existingZedItem, "native");
-        return;
-      }
-      const referenceItem = items.find((item) => /^(VS Code|Cursor|Antigravity)$/.test((item.textContent || "").trim()));
-      if (!referenceItem) return;
-      referenceItem.parentElement?.appendChild(createZedRemoteOpenInMenuItem(referenceItem));
-    });
-  }
-
   function sessionCopyMenuRow(menu) {
     const triggerId = menu?.getAttribute?.("aria-labelledby") || "";
     const trigger = triggerId ? document.getElementById(triggerId) : null;
@@ -13082,61 +14433,8 @@
     });
   }
 
-  async function refreshZedRemoteOpenControls(scope = document) {
-    if (!codexPlusSettings().zedRemoteOpen) {
-      removeZedRemoteButtons();
-      removeZedRemoteOpenInMenuItems();
-      return;
-    }
-    try {
-      const status = await loadZedRemoteStatus();
-      if (!status?.platformSupported || (!status.zedAppFound && !status.zedCliFound)) {
-        removeZedRemoteButtons();
-        removeZedRemoteOpenInMenuItems();
-        return;
-      }
-    } catch (_) {
-      removeZedRemoteButtons();
-      removeZedRemoteOpenInMenuItems();
-      return;
-    }
-    refreshZedRemoteOpenInMenus(scope);
-  }
-
-  function runScheduledZedRemoteMenuRefresh() {
-    window.__codexZedRemoteMenuRefreshPending = false;
-    clearTimeout(window.__codexZedRemoteMenuRefreshTimer);
-    window.__codexZedRemoteMenuRefreshTimer = null;
-    refreshZedRemoteOpenControls().catch(() => {
-      removeZedRemoteOpenInMenuItems();
-    });
-  }
-
-  function shouldRefreshZedRemoteMenus(mutations) {
-    if (!codexPlusSettings().zedRemoteOpen) return false;
-    if (!mutations) return true;
-    return mutations.some((mutation) => {
-      const target = mutation.target;
-      if (isExtensionUiNode(target)) return false;
-      if (target?.nodeType === 1 && target.matches?.('[role="menu"], [data-radix-popper-content-wrapper]')) return true;
-      return [...Array.from(mutation.addedNodes), ...Array.from(mutation.removedNodes)].some((node) => node.nodeType === 1 && (
-        node.matches?.('[role="menu"], [data-radix-popper-content-wrapper]') ||
-        node.querySelector?.('[role="menu"], [data-radix-popper-content-wrapper]')
-      ));
-    });
-  }
-
-  function scheduleZedRemoteMenuRefresh(mutations) {
-    if (!shouldRefreshZedRemoteMenus(mutations)) return;
-    if (window.__codexZedRemoteMenuRefreshPending) return;
-    window.__codexZedRemoteMenuRefreshPending = true;
-    window.__codexZedRemoteMenuRefreshTimer = setTimeout(runScheduledZedRemoteMenuRefresh, 50);
-  }
-
   function scanDeferred() {
-    if (pluginPatchDisabledInRelayMode()) {
-      clearPluginPatchArtifacts();
-    } else {
+    if (codexPluginMarketplacePatchEnabled()) {
       const pluginUnlockStrategy = codexPluginUnlockStrategy();
       const settings = codexPlusSettings();
       logCodexPluginUnlockStrategy(pluginUnlockStrategy);
@@ -13154,6 +14452,7 @@
         }
       }
     }
+    if (typeof syncCodexPlusWhaleWidget === "function") runScanStep(syncCodexPlusWhaleWidget);
     refreshDreamSkin();
     refreshThreadIdBadges();
     sessionRows().forEach(tryAttachButton);
@@ -13181,7 +14480,603 @@
     runScanStep(scanLightweight);
     requestAnimationFrame(() => runScanStep(scanDeferred));
   }
+  // 完整上游引擎的词法宿主：不替换页面全局 API；挂件关闭时释放所有副作用。
+  const codexPlusWhaleFullStoragePrefix = "codexPlus.whale.full.v1.";
+  function codexPlusWhaleFullNumber(value) {
+    if (value === null || value === undefined || value === "") return null;
+    const n = Number(value); return Number.isFinite(n) && n >= 0 ? n : null;
+  }
+  function codexPlusWhaleFullBuiltin(url) {
+    let parsed;
+    try { parsed = new URL(String(url), "https://codex-whale.invalid"); } catch { return ""; }
+    const path = parsed.pathname, id = parsed.searchParams.get("id"), set = parsed.searchParams.get("set");
+    const aliases = { "/dsh-whale/image.png": "DSniang1.png", "/dsh-whale/rua.gif": "rua.gif" };
+    const fragments = { ya1: "Ya1.mp3", ya2: "Ya2.mp3", d1: "D1.mp3", d2: "D2.mp3", exp_orb: "minecraft-exp-orb.wav", end_a: "task-end-a.wav", taskEnd: "task-end-a.wav" };
+    let file = aliases[path];
+    if (path === "/dsh-whale/audio-fragment.wav") file = fragments[id];
+    if (path === "/dsh-whale/bubble-img.png") file = ({ bimg_petpet: "bubble-petpet.gif", bimg_money1: "bubble-money1.gif" })[id];
+    if (/^\/dsh-whale\/sound\/(press|release)\.mp3$/.test(path) && (!set || set === "duck" || set === "fx1")) file = fragments[(set === "fx1" ? "d" : "ya") + (path.includes("press") ? "1" : "2")];
+    if (path === "/dsh-whale/role-image.png" && id === "default") file = "DSniang1.png";
+    return file ? window.__CODEX_PLUS_WHALE_ASSETS__?.[file] || (file === "DSniang1.png" ? window.__CODEX_PLUS_WHALE_IMAGE__ : "") || "" : "";
+  }
 
+  function codexPlusWhaleFullDataResponse(source) {
+    // 直接读取本地内嵌字节，避免 fetch(data:) 受到宿主 connect-src 限制。
+    const match = /^data:((?:audio|image)\/[A-Za-z0-9.+-]+);base64,([A-Za-z0-9+/]*={0,2})$/.exec(source);
+    if (!match) throw new Error("不支持的本地媒体数据");
+    const bytes = Uint8Array.from(atob(match[2]), (character) => character.charCodeAt(0));
+    return new Response(bytes, { status: 200, headers: { "Content-Type": match[1] } });
+  }
+
+  function createCodexPlusWhaleFullRuntime() {
+    const state = { disposed: false, paused: document.hidden === true, timers: new Map(), rafs: new Map(), observers: new Set(), nodes: new Set(), listeners: [], audio: new Set(), pending: new Set(), media: new Map(), objectUrls: new Set(), subscriptions: [], dispatcher: null, sessionId: "", session: null, sessionAt: 0, sessionPending: null, history: null, historyAt: 0, historyPrices: "", historyPending: null, models: [], relayProfiles: [], turn: null, completed: new Set(), seq: 0, pendingWait: null, completion: null, controls: null, serial: 0 };
+    const isolated = Object.create(null);
+    const wrappedMedia = new WeakSet();
+    const storage = {
+      getItem(key) { return localStorage.getItem(codexPlusWhaleFullStoragePrefix + key); },
+      setItem(key, value) { return localStorage.setItem(codexPlusWhaleFullStoragePrefix + key, String(value)); },
+      removeItem(key) { return localStorage.removeItem(codexPlusWhaleFullStoragePrefix + key); },
+    };
+    try { state.seq = Math.max(0, Number(storage.getItem("dshw-last-seq")) || 0); } catch {}
+    state.initialSeq = state.seq;
+    state.priceRevision = 0;
+    state.statRevision = 0;
+    const active = () => !state.disposed;
+    function listen(target, name, callback, options) {
+      const wrapped = typeof callback === "function" ? function (event) { if (active()) callback.call(target, event); } : { handleEvent(event) { if (active()) callback?.handleEvent?.(event); } };
+      target.addEventListener(name, wrapped, options);
+      state.listeners.push({ target, name, callback, wrapped, options });
+    }
+    function unlisten(target, name, callback, options) {
+      for (let i = state.listeners.length - 1; i >= 0; i--) {
+        const entry = state.listeners[i];
+        if (entry.target === target && entry.name === name && entry.callback === callback) {
+          target.removeEventListener(name, entry.wrapped, options ?? entry.options); state.listeners.splice(i, 1);
+        }
+      }
+    }
+    function arm(id, timer) {
+      if (!active() || state.paused) return;
+      timer.native = setTimeout(() => {
+        if (!state.timers.has(id) || !active() || state.paused) return;
+        timer.native = null;
+        if (!timer.repeat) state.timers.delete(id);
+        try { timer.callback(...timer.args); } finally { if (timer.repeat && state.timers.has(id)) arm(id, timer); }
+      }, timer.delay);
+    }
+    function schedule(callback, delay, repeat, args) {
+      if (!active() || typeof callback !== "function") return 0;
+      const id = ++state.serial, timer = { callback, delay: Math.max(0, Number(delay) || 0), repeat, args, native: null };
+      state.timers.set(id, timer); arm(id, timer); return id;
+    }
+    function clearTimer(id) { const timer = state.timers.get(id); if (timer?.native !== null) clearTimeout(timer?.native); state.timers.delete(id); }
+    function raf(callback) {
+      if (!active()) return 0;
+      const id = ++state.serial, frame = { callback, native: null };
+      state.rafs.set(id, frame);
+      if (!state.paused) frame.native = requestAnimationFrame((time) => { state.rafs.delete(id); if (active() && !state.paused) callback(time); });
+      return id;
+    }
+    function cancelRaf(id) { const frame = state.rafs.get(id); if (frame?.native !== null) cancelAnimationFrame(frame?.native); state.rafs.delete(id); }
+    function trackedObserver(Native) {
+      if (typeof Native !== "function") return undefined;
+      return class {
+        constructor(callback) { this.records = []; this.native = new Native((entries, observer) => { if (active() && !state.paused) callback(entries, this); }); state.observers.add(this); }
+        observe(target, options) { this.records.push([target, options]); if (active() && !state.paused) this.native.observe(target, options); }
+        disconnect() { this.native.disconnect(); this.records = []; }
+        takeRecords() { return this.native.takeRecords?.() || []; }
+      };
+    }
+    function trackedAudioContext(options) {
+      const Native = window.AudioContext || window.webkitAudioContext;
+      if (!Native || !active()) throw new Error("音频不可用");
+      const audio = new Native(options); state.audio.add(audio); return audio;
+    }
+    trackedAudioContext.prototype = (window.AudioContext || window.webkitAudioContext)?.prototype || Object.prototype;
+    function bridge(path, payload) {
+      if (!active() || state.paused) return Promise.reject(new Error("挂件已暂停"));
+      return new Promise((resolve, reject) => {
+        let done = false;
+        const finish = (error, value) => { if (done) return; done = true; clearTimeout(timer); state.pending.delete(cancel); error ? reject(error) : resolve(value); };
+        const cancel = () => finish(new Error("挂件请求已取消"));
+        const timer = setTimeout(() => finish(new Error("挂件请求超时")), 45000);
+        state.pending.add(cancel);
+        Promise.resolve(postJson(path, payload)).then((value) => finish(active() ? null : new Error("挂件已关闭"), value), (error) => finish(error));
+      });
+    }
+    function context() {
+      const ref = currentSessionRef() || {}, id = String(ref.session_id || ""), host = String(ref.host_id || "local");
+      if (id !== state.sessionId || host !== state.sessionHost) {
+        state.sessionId = id; state.session = null; state.sessionAt = 0; state.sessionPending = null; state.turn = null; state.pendingWait = null; state.lastTurnResult = null; state.lastTurnPending = null;
+      }
+      state.sessionHost = host; state.sessionRef = ref; state.remote = host !== "local";
+      return id;
+    }
+    function observe(turn, baseline = false) {
+      if (!turn?.id) return;
+      const previous = state.turn;
+      if (!baseline && previous?.id === turn.id && previous.status === "running" && turn.status === "completed" && !state.completed.has(turn.id)) {
+        state.seq += 1; state.completed.add(turn.id);
+        if (state.completed.size > 128) state.completed.delete(state.completed.values().next().value);
+      }
+      if (baseline && turn.status === "completed") state.completed.add(turn.id);
+      state.turn = { id: turn.id, status: turn.status, usage: turn.usage || null };
+    }
+    function setStatsEnabled(value) {
+      const enabled = value !== false;
+      if (state.codexStatsOn === enabled) return;
+      state.codexStatsOn = enabled; state.statRevision += 1;
+      state.history = null; state.historyAt = 0; state.historyPending = null; state.session = null; state.sessionAt = 0; state.sessionPending = null; state.lastTurnResult = null; state.lastTurnPending = null;
+    }
+    async function session() {
+      const id = context();
+      if (!id) return null;
+      if (state.codexStatsOn === false || state.remote) return { status: "ok", sessionId: id, title: state.sessionRef?.title || "", lastTurn: state.turn, total: state.nativeUsage?.total || null, today: null, rateLimits: [] };
+      if (state.session && Date.now() - state.sessionAt < 5000) return state.session;
+      if (state.sessionPending) return state.sessionPending;
+      const baseline = !state.session && !state.turn;
+      const statRevision = state.statRevision;
+      const pending = bridge("/whale/session", { ...state.sessionRef, session_id: id }).then((data) => {
+        if (!active() || context() !== id || statRevision !== state.statRevision || state.codexStatsOn === false || state.remote) return null;
+        state.session = data; state.sessionAt = Date.now();
+        if (data?.status === "ok" && !(Date.now() - (state.nativeTurnAt || 0) < 10000 && state.turn?.id === data.lastTurn?.id && state.turn.status === "completed" && data.lastTurn.status === "running")) observe(data.lastTurn, baseline);
+        return data;
+      }).finally(() => { if (state.sessionPending === pending) state.sessionPending = null; });
+      state.sessionPending = pending; return pending;
+    }
+    function prices() {
+      const result = [];
+      for (const model of state.models) {
+        const price = model.price;
+        if (!price || ![price.hit, price.miss, price.out].every((value) => value !== "" && codexPlusWhaleFullNumber(value) !== null)) continue;
+        const matchIds = model.matchIds?.length ? model.matchIds : [model.id];
+        const currency = String(price.cur || "USD").toUpperCase(), rate = currency === "CNY" ? 1 : codexPlusWhaleFullNumber(price.rate);
+        if (!(rate > 0) || !["CNY", "USD"].includes(currency)) continue;
+        // 匹配交给数据层：精确匹配优先，其次最长的大小写不敏感子串。
+        for (const id of matchIds) result.push({ model: id, currency: "CNY", input: Number(price.miss) * rate, cachedInput: Number(price.hit) * rate, output: Number(price.out) * rate });
+      }
+      return result;
+    }
+    function pricingFingerprint() { return JSON.stringify(state.models.map((model) => ({ id: model.id, price: model.price, matchIds: model.matchIds }))); }
+    async function history(force = false) {
+      if (state.codexStatsOn === false) return { status: "disabled", complete: false, codex: { ok: false, disabled: true } };
+      const quote = prices(), fingerprint = JSON.stringify(quote);
+      if (!force && state.history && state.historyPrices === fingerprint && Date.now() - state.historyAt < 60000) return state.history;
+      if (state.historyPending) return state.historyPending;
+      const revision = state.priceRevision, statRevision = state.statRevision;
+      const pending = bridge("/whale/history", { period: "all", page: 1, pageSize: 500, prices: quote }).then((data) => {
+        if (statRevision !== state.statRevision || state.codexStatsOn === false) return { status: "disabled", complete: false, codex: { ok: false, disabled: true } };
+        if (active() && revision !== state.priceRevision) return history(true);
+        if (active()) { state.history = data; state.historyAt = Date.now(); state.historyPrices = fingerprint; } return data;
+      }).finally(() => { if (state.historyPending === pending) state.historyPending = null; });
+      state.historyPending = pending; return pending;
+    }
+    const toTokens = (period) => {
+      if (state.codexStatsOn === false) return "—";
+      const value = state.history?.periods?.[period]?.usage?.totalTokens ?? state.history?.machineSummary?.[({ today: "todayTokens", month: "monthTokens", all: "totalTokens" })[period]];
+      const number = codexPlusWhaleFullNumber(value);
+      if (number === null) return "—";
+      return number.toLocaleString("zh-CN", { maximumFractionDigits: 0 });
+    };
+    function codexModel(model, summary) {
+      const data = summary?.codex || summary?.machineSummary || {};
+      const total = (period) => codexPlusWhaleFullNumber(summary?.periods?.[period]?.usage?.totalTokens);
+      const limits = state.session?.rateLimits || summary?.rateLimits || [];
+      const windows = limits.filter((entry) => entry.resetAt == null || Number(entry.resetAt) * 1000 > Date.now()).map((entry, index) => ({ usedPct: entry.usedPercent, windowMinutes: entry.windowMinutes || (index === 0 ? 300 : 10080), resetAt: entry.resetAt == null ? null : Number(entry.resetAt) * 1000 }));
+      return { ...model, codex: { ...data, ok: summary?.status === "ok" || summary?.status === "partial" || data.ok === true, complete: summary?.complete === true, deferred: summary?.complete === false ? Math.max(1, summary?.scan?.deferred || 1) : 0, todayTokens: total("today") ?? data.todayTokens, monthTokens: total("month") ?? data.monthTokens, totalTokens: total("all") ?? data.totalTokens, sessions: summary?.scan?.sessions ?? data.sessions ?? 0, days7: data.days7 || (summary?.days || []).slice(-7).map((day) => ({ date: day.date, tokens: day.usage?.totalTokens })), windows: data.windows || { primary: windows[0] || null, secondary: windows[1] || null } }, planSupport: windows.length > 0, plan: windows.length ? { ok: true, usedPct: windows[0].usedPct, remainPct: windows[0].usedPct == null ? null : 100 - windows[0].usedPct, windows: windows.map((entry, index) => ({ id: index === 0 ? "rolling" : "weekly", key: index === 0 ? "rolling" : "weekly", label: index === 0 ? "5h" : "周", usedPct: entry.usedPct, remainPct: entry.usedPct == null ? null : 100 - entry.usedPct, resetAt: entry.resetAt })) } : model.plan };
+    }
+    function subscribe() {
+      const dispatcher = window.__codexPlusRemoteSessionRecoveryDispatcher;
+      if (state.dispatcher === dispatcher && state.onEvent) return;
+      for (const unsubscribe of state.subscriptions.splice(0)) { try { unsubscribe(); } catch {} }
+      state.dispatcher = dispatcher;
+      const onEvent = (payload, method) => {
+        if (!active() || state.paused) return;
+        const data = payload?.params || payload || {}, turn = data.turn || data;
+        const thread = String(data.threadId || data.thread_id || data.conversationId || "").replace(/^local:/, "");
+        if (!thread || thread !== context().replace(/^local:/, "")) return;
+        if (method === "thread/tokenUsage/updated") {
+          state.nativeUsage = data.tokenUsage || null;
+          if (state.turn && data.tokenUsage?.last) state.turn.usage = data.tokenUsage.last;
+        } else if (["serverRequest/resolved", "item/tool/userInputAnswered", "item/approval/responded", "item/completed"].includes(method)) {
+          const id = String(data.requestId || data.itemId || data.item?.id || data.id || "");
+          if (state.pendingWait && (id === state.pendingWait.id || id === state.pendingWait.itemId)) { state.pendingWait = null; void state.controls?.pollWaitState?.(); }
+        } else if (method === "turn/started" || method === "turn/completed") {
+          const id = turn.id || data.turnId;
+          observe({ id, status: method === "turn/started" ? "running" : ({ failed: "failed", interrupted: "aborted", aborted: "aborted" })[turn.status] || "completed", usage: turn.usage });
+          state.nativeTurnAt = Date.now();
+          state.pendingWait = null;
+          state.sessionAt = 0;
+          void state.controls?.pollLastTurn?.();
+        } else {
+          state.pendingWait = { id: String(payload?.id || data.requestId || data.itemId || data.id || ""), itemId: String(data.itemId || ""), kind: method.includes("requestUserInput") || method === "mcpServer/elicitation/request" ? "question" : "approval" };
+          void state.controls?.pollWaitState?.();
+        }
+      };
+      state.onEvent = onEvent;
+      if (!dispatcher?.subscribe) return;
+      for (const method of ["turn/started", "turn/completed", "thread/tokenUsage/updated", "item/tool/requestUserInput", "item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval", "mcpServer/elicitation/request", "serverRequest/resolved", "item/tool/userInputAnswered", "item/approval/responded", "item/completed"]) {
+        try { const remove = dispatcher.subscribe(method, (payload) => onEvent(payload, method)); if (typeof remove === "function") state.subscriptions.push(remove); } catch {}
+      }
+    }
+    function nativeEnvelope(value, depth = 0) {
+      if (!active() || state.paused || !value || typeof value !== "object" || depth > 4) return;
+      if (typeof value.method === "string" && /^(turn\/(started|completed)|thread\/tokenUsage\/updated|item\/(tool\/requestUserInput|commandExecution\/requestApproval|fileChange\/requestApproval|permissions\/requestApproval|completed)|mcpServer\/elicitation\/request|serverRequest\/resolved)$/.test(value.method)) state.onEvent?.(value, value.method);
+      if (value.id != null && (Object.hasOwn(value, "result") || Object.hasOwn(value, "error") || Object.hasOwn(value, "response")) && String(value.id) === state.pendingWait?.id) {
+        state.pendingWait = null; void state.controls?.pollWaitState?.();
+      }
+      for (const key of ["message", "request", "payload", "data", "notification"]) if (value[key] && typeof value[key] === "object") nativeEnvelope(value[key], depth + 1);
+    }
+    async function lastTurn() {
+      await session().catch(() => null);
+      if (state.lastTurnResult?.body?.seq === state.seq) return state.lastTurnResult;
+      if (state.lastTurnPending) return state.lastTurnPending;
+      const seq = state.seq;
+      const turn = state.turn?.status === "completed" ? state.turn : null;
+      let amount = null, currency = null, usage = turn?.usage || state.session?.lastTurn?.usage || null;
+      if (turn && seq > state.initialSeq && prices().length && state.codexStatsOn !== false && !state.remote) {
+        const pending = (async () => {
+        const details = await bridge("/whale/history", { period: "all", sessionId: context().replace(/^local:/, ""), turnId: turn.id, page: 1, pageSize: 500, prices: prices() }).catch(() => null);
+        const totals = {};
+        for (const record of details?.records || []) {
+          if (record.turnId !== turn.id || !record.estimatedCost) continue;
+          const cost = record.estimatedCost; totals[cost.currency] = (totals[cost.currency] || 0) + cost.amount;
+        }
+        const currencies = Object.keys(totals);
+        if (currencies.length === 1) { currency = currencies[0]; amount = totals[currency]; }
+        const result = { status: 200, body: { ok: true, seq, turn, amount, currency, usage, estimated: amount !== null } };
+        if (active() && state.seq === seq) state.lastTurnResult = result;
+        return result;
+        })().finally(() => { if (state.lastTurnPending === pending) state.lastTurnPending = null; });
+        state.lastTurnPending = pending; return pending;
+      }
+      const result = { status: 200, body: { ok: true, seq, turn, amount, currency, usage, estimated: amount !== null } };
+      state.lastTurnResult = result; return result;
+    }
+    async function compatibilityJson(path, method, query, body) {
+      subscribe();
+      if (path === "/dsh-whale/size.json" && method === "GET" && state.startupConfig) return { status: 200, body: state.startupConfig };
+      if (path === "/dsh-whale/last-turn.json") {
+        return lastTurn();
+      }
+      if (path === "/dsh-whale/wait.json") {
+        const data = await session().catch(() => null);
+        return { status: 200, body: { ok: true, sessionName: data?.sessionName || data?.title || state.sessionRef?.title || "", pending: data?.pending || state.pendingWait || null } };
+      }
+      const response = await bridge("/whale/full", { path, method, query, body });
+      if (path === "/dsh-whale/size.json" && method === "PUT" && response?.status === 200) {
+        setStatsEnabled(body.codexStatsOn);
+      }
+      if (path === "/dsh-whale/api-models.json" && response?.body?.ok) {
+        state.relayProfiles = response.body.relayProfiles || state.relayProfiles;
+        setStatsEnabled(response.body.codexStatsOn);
+        const previous = pricingFingerprint();
+        state.models = response.body.models || state.models;
+        if (pricingFingerprint() !== previous) { state.priceRevision += 1; state.history = null; state.historyAt = 0; state.historyPending = null; state.lastTurnResult = null; state.lastTurnPending = null; }
+        if (method === "GET") {
+          const statsOn = response.body.codexStatsOn !== false;
+          const summary = statsOn ? await history().catch(() => null) : null;
+          response.body.models = (response.body.models || []).map((model) => model.id === "codex" ? statsOn ? codexModel(model, summary) : { ...model, codex: { ok: false, disabled: true } } : model);
+        }
+        state.models = response.body.models || state.models;
+      }
+      if (path === "/dsh-whale/usage-records.json" && method === "GET") {
+        state.recordsAccountBase = JSON.parse(JSON.stringify(response.body));
+        const data = await history().catch(() => null);
+        response.body = mergeRecords(response.body, data);
+      }
+      return response;
+    }
+    function mergeRecords(base, data) {
+      if (!data?.today || !data?.days7 || !data?.all) return base;
+      const merge = (account, local) => ({ ...local, ...account, modelTotal: local?.modelTotal, models: local?.models || [], estimatedCosts: local?.estimatedCosts, unpricedRecords: local?.unpricedRecords });
+      const mergeDays = (account, local) => { const days = new Map((local || []).map((day) => [day.date, day])); for (const day of account || []) days.set(day.date, merge(day, days.get(day.date))); return [...days.values()].sort((a, b) => a.date.localeCompare(b.date)); };
+      return { ...base, today: merge(base?.today, data.today), days7: mergeDays(base?.days7, data.days7), all: { ...base?.all, days: mergeDays(base?.all?.days, data.all.days), events: data.all.events || [] }, complete: data.complete, historyPagination: data.pagination, historyArchive: data.archive, ok: true };
+    }
+    const nativeFetch = window.fetch?.bind(window) || globalThis.fetch;
+    function responseOf(result) {
+      if (result?.data) {
+        const bytes = Uint8Array.from(atob(result.data), (c) => c.charCodeAt(0));
+        return new Response(bytes, { status: result.status || 200, headers: { "Content-Type": result.mimeType || "application/octet-stream" } });
+      }
+      return new Response(JSON.stringify(result?.body ?? null), { status: result?.status || 200, headers: { "Content-Type": "application/json" } });
+    }
+    async function fetchCompat(value, options = {}) {
+      if (!active() || state.paused) throw new Error("挂件已暂停");
+      const raw = String(value), builtin = codexPlusWhaleFullBuiltin(raw);
+      if (builtin) return codexPlusWhaleFullDataResponse(builtin);
+      const parsed = new URL(raw, "https://codex-whale.invalid");
+      if (parsed.origin !== "https://codex-whale.invalid" || !parsed.pathname.startsWith("/dsh-whale/")) {
+        // 上游只有本机资源 fetch；用户显式配置的超链接通过 window.open。
+        if (raw.startsWith("data:")) return codexPlusWhaleFullDataResponse(raw);
+        if (raw.startsWith("blob:")) return nativeFetch(raw, options);
+        throw new Error("挂件资源只允许本机桥接");
+      }
+      const method = String(options.method || "GET").toUpperCase();
+      const query = Object.fromEntries(parsed.searchParams.entries());
+      let body = {};
+      if (options.body) { try { body = JSON.parse(options.body); } catch { throw new Error("无效挂件请求"); } }
+      if (options.signal?.aborted) throw new Error("挂件请求已取消");
+      const result = await compatibilityJson(parsed.pathname, method, query, body);
+      if (!active() || options.signal?.aborted) throw new Error("挂件请求已取消");
+      if (result?.builtinFragmentId) {
+        const uri = codexPlusWhaleFullBuiltin("/dsh-whale/audio-fragment.wav?id=" + encodeURIComponent(result.builtinFragmentId));
+        if (!uri) throw new Error("内置音频缺失");
+        return nativeFetch(uri);
+      }
+      return responseOf(result);
+    }
+    async function resolveMedia(path) {
+      const builtin = codexPlusWhaleFullBuiltin(path); if (builtin) return builtin;
+      if (state.media.has(path)) return state.media.get(path);
+      const pending = (async () => {
+      const result = await fetchCompat(path);
+      if (!result.ok) throw new Error("素材加载失败");
+      const blob = await result.blob();
+      if (!active()) throw new Error("挂件已关闭");
+      const objectUrl = URL.createObjectURL(blob); state.objectUrls.add(objectUrl); state.media.set(path, objectUrl); return objectUrl;
+      })().catch((error) => { if (state.media.get(path) === pending) state.media.delete(path); throw error; });
+      state.media.set(path, pending); return pending;
+    }
+    function mediaNode(node) {
+      if (wrappedMedia.has(node)) return node;
+      wrappedMedia.add(node);
+      let proto = node, descriptor;
+      while (proto && !descriptor) { descriptor = Object.getOwnPropertyDescriptor(proto, "src"); proto = Object.getPrototypeOf(proto); }
+      let revision = 0;
+      const set = (value) => { if (descriptor?.set) descriptor.set.call(node, value); else node.setAttribute("src", value); };
+      try { Object.defineProperty(node, "src", { configurable: true, get() { return descriptor?.get ? descriptor.get.call(node) : node.getAttribute("src") || ""; }, set(value) {
+        const rev = ++revision, raw = String(value || "");
+        if (!raw.startsWith("/dsh-whale/")) { if (!raw || /^(data:image\/(png|jpeg|webp|gif|avif);|data:audio\/|blob:)/i.test(raw)) set(raw); return; }
+        const builtin = codexPlusWhaleFullBuiltin(raw);
+        if (builtin) { set(builtin); return; }
+        void resolveMedia(raw).then((url) => { if (active() && rev === revision) set(url); }).catch(() => { if (active() && rev === revision) node.dispatchEvent?.(new Event("error")); });
+      } }); } catch {}
+      return node;
+    }
+    function mark(node) {
+      if (!active()) throw new Error("挂件已关闭");
+      if (!node) return node;
+      node.setAttribute?.("data-codex-plus-ext", "whale-widget");
+      if (["IMG", "AUDIO", "VIDEO", "SOURCE"].includes(node.tagName)) mediaNode(node);
+      return node;
+    }
+    const head = new Proxy(document.head, { get(target, key) {
+      if (["appendChild", "insertBefore", "append", "prepend", "replaceChildren"].includes(key)) return (...args) => { if (!active()) return args[0]; for (const node of args) if (node?.nodeType || node?.tagName) state.nodes.add(node); return target[key](...args); };
+      const value = Reflect.get(target, key, target); return typeof value === "function" ? value.bind(target) : value;
+    } });
+    const doc = new Proxy(document, { get(target, key) {
+      if (key === "head") return head;
+      if (key === "createElement") return (...args) => mark(target.createElement(...args));
+      if (key === "createElementNS") return (...args) => mark(target.createElementNS(...args));
+      if (key === "addEventListener") return (name, callback, options) => listen(target, name, callback, options);
+      if (key === "removeEventListener") return (name, callback, options) => unlisten(target, name, callback, options);
+      const value = Reflect.get(target, key, target); return typeof value === "function" ? value.bind(target) : value;
+    } });
+    const win = new Proxy(window, { get(target, key) {
+      if (key === "__codexPlusWhaleHost") return host;
+      if (typeof key === "string" && (key.startsWith("__dsh") || key === "dshwRegisterMask")) return isolated[key];
+      if (key === "document") return doc;
+      if (key === "localStorage") return storage;
+      if (key === "Image") return image;
+      if (key === "Audio") return audio;
+      if (key === "AudioContext" || key === "webkitAudioContext") return window.AudioContext || window.webkitAudioContext ? trackedAudioContext : undefined;
+      if (key === "addEventListener") return (name, callback, options) => listen(target, name, callback, options);
+      if (key === "removeEventListener") return (name, callback, options) => unlisten(target, name, callback, options);
+      const value = Reflect.get(target, key, target); return typeof value === "function" ? value.bind(target) : value;
+    }, set(target, key, value) { if (typeof key === "string" && (key.startsWith("__dsh") || key === "dshwRegisterMask")) { isolated[key] = value; return true; } return Reflect.set(target, key, value, target); } });
+    function image(width, height) { return mark(new window.Image(width, height)); }
+    image.prototype = window.Image?.prototype || Object.prototype;
+    function audio(url) { const node = mark(new window.Audio()); if (url) node.src = url; return node; }
+    audio.prototype = window.Audio?.prototype || Object.prototype;
+    const host = {
+      active, state, tokens: toTokens,
+      attach(node) { if (active()) state.nodes.add(node); },
+      detach(node) { state.nodes.delete(node); },
+      initialSound() { return state.startupConfig?.sound !== false; },
+      complete(data, show) { state.completion = data; show(data.amount); },
+      completionCost(amount) {
+        const completion = state.completion;
+        if (amount == null) return completion?.usage?.totalTokens == null ? "用量暂不可用" : Number(completion.usage.totalTokens).toLocaleString("zh-CN") + " tokens";
+        return Number(amount).toLocaleString("zh-CN", { maximumFractionDigits: 6 }) + " " + (completion?.currency || "") + "（估算）";
+      },
+      completionModules(modules) {
+        const unknown = state.completion?.amount == null;
+        return modules.map((module) => module.type === "text" ? { ...module, text: String(module.text).replace("上一轮对话消耗:", unknown ? "Codex 任务完成" : "上一轮费用估算:").replace(/^¥\s*/, "") } : module).concat(unknown ? [{ type: "text", text: "未配置单价，费用未知", size: 2, color: "#9fb0d9" }] : []);
+      },
+      recordsPager(body, data, render) {
+        const pagination = data.historyPagination;
+        if (!pagination) return;
+        const area = mark(document.createElement("div")); area.className = "dshwv-usage-hint"; area.style.cssText = "display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:4px 0 10px";
+        const page = pagination.page || 1, pages = Math.max(1, pagination.pages || 1);
+        const label = mark(document.createElement("span")); label.textContent = `明细第 ${page} / ${pages} 页 · 共 ${pagination.total || 0} 条${data.complete === false ? " · 正在统计" : ""}`; area.appendChild(label);
+        const input = mark(document.createElement("input")); input.type = "search"; input.placeholder = "搜索全部明细：日期或模型"; input.value = state.recordsSearch || ""; input.className = "dshwv-colnat"; input.style.width = "100%"; area.appendChild(input);
+        const request = async (next) => {
+          state.recordsRevision = (state.recordsRevision || 0) + 1;
+          const revision = state.recordsRevision, priceRevision = state.priceRevision;
+          const result = await bridge("/whale/history", { period: "all", page: next, pageSize: pagination.pageSize || 500, search: input.value, prices: prices() }).catch(() => null);
+          if (!active() || !body.isConnected || revision !== state.recordsRevision || priceRevision !== state.priceRevision || !result) return;
+          state.recordsSearch = input.value; render(mergeRecords(state.recordsAccountBase, result));
+        };
+        for (const [text, next, disabled] of [["上一页", page - 1, page <= 1], ["下一页", page + 1, page >= pages]]) {
+          const button = mark(document.createElement("button")); button.type = "button"; button.textContent = text; button.className = "dshwv-snapbtn dshwv-snapbtn-no"; button.disabled = disabled; button.addEventListener("click", () => { void request(next); }); area.appendChild(button);
+        }
+        const search = mark(document.createElement("button")); search.type = "button"; search.textContent = "搜索"; search.className = "dshwv-snapbtn dshwv-snapbtn-ok"; search.addEventListener("click", () => { void request(1); }); area.appendChild(search); input.addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); void request(1); } });
+        if (data.historyArchive?.detailRetentionDays) { const note = mark(document.createElement("span")); note.textContent = `明细保留 ${data.historyArchive.detailRetentionDays} 天；更早用量保留在日汇总中。`; note.style.width = "100%"; area.appendChild(note); }
+        body.appendChild(area);
+      },
+      fail(error) { state.initializationError = error?.name || "Error"; console.warn("[Codex++] 完整鲸鱼初始化失败", state.initializationError); },
+      bind(controls) { state.controls = controls; subscribe(); },
+      defaultBubbleItems(items) {
+        const copy = JSON.parse(JSON.stringify(items));
+        if (copy[0]?.modules) copy[0].modules = [
+          { type: "text", text: "Codex 本机用量", size: 8, bold: true },
+          { type: "today", modelId: "codex", size: 20, rgb: "indigo", tpl: "{tokens_today}" },
+          { type: "today", modelId: "codex", size: 4, color: "#9fb0d9", tpl: "今日 tokens · 近7天 {tokens_week}" },
+          { type: "balance", modelId: "current-provider", size: 3, tpl: "供应商余额 {balance}" },
+          { type: "session", size: 3, tpl: "{session}", len: 20 },
+        ];
+        return copy;
+      },
+      profileSelect(selected) {
+        const select = mark(document.createElement("select")); select.className = "dshwv-colnat";
+        const profiles = state.relayProfiles.length ? state.relayProfiles : [{ id: selected || "", name: selected || "当前供应商" }];
+        for (const profile of profiles) { const option = mark(document.createElement("option")); option.value = profile.id; option.textContent = profile.name || profile.id; select.appendChild(option); }
+        select.value = selected || profiles[0]?.id || ""; return select;
+      },
+    };
+    const mutation = trackedObserver(window.MutationObserver), resize = trackedObserver(window.ResizeObserver);
+    const environment = [win, doc, fetchCompat, storage, (fn, ms, ...args) => schedule(fn, ms, false, args), clearTimer, (fn, ms, ...args) => schedule(fn, ms, true, args), clearTimer, raf, cancelRaf, mutation, resize, trackedAudioContext, trackedAudioContext, image, audio];
+    async function initialize() {
+      const configuration = await bridge("/whale/full", { path: "/dsh-whale/size.json", method: "GET", query: {}, body: {} });
+      if (configuration?.status !== 200 || !configuration.body) throw new Error("完整挂件设置读取失败");
+      state.startupConfig = configuration.body;
+      setStatsEnabled(configuration.body.codexStatsOn);
+      let legacy;
+      try { legacy = JSON.parse(localStorage.getItem("codexPlus.whaleWidget.v1") || "null"); } catch {}
+      if (!legacy || storage.getItem("legacy-migrated") === "1") return;
+      if (configuration.body.hasSavedConfig === true) { storage.setItem("legacy-migrated", "1"); return; }
+      // 只迁移用户实际保存过的旧偏好；保存失败保留旧数据并允许下次重试。
+      const send = async (path, method, body) => {
+        const result = await bridge("/whale/full", { path: "/dsh-whale/" + path, method, query: {}, body });
+        if (result?.status !== 200 || result.body?.ok === false) throw new Error("旧挂件偏好迁移失败");
+        return result.body;
+      };
+      if (typeof legacy.image === "string" && /^data:image\/(png|jpeg|webp|gif);base64,/.test(legacy.image) && legacy.image.length <= 1400000) {
+        const roles = await send("roles.json", "GET", {});
+        let imported = (roles.roles || []).find((role) => role.name === "原挂件角色");
+        if (!imported) {
+          const result = await send("roles.json", "POST", { name: "原挂件角色", image: legacy.image, format: legacy.image.startsWith("data:image/gif;") ? "gif" : "png" });
+          imported = (result.roles || []).find((role) => role.name === "原挂件角色");
+        }
+        if (imported?.id) storage.setItem("dshw-role", imported.id);
+      }
+      if (typeof legacy.phrase === "string" && legacy.phrase.trim()) {
+        const config = await send("bubble.json", "GET", {});
+        if (!config.config?.items?.length) await send("bubble.json", "POST", { v: 1, tapAdvance: false, lib: [], items: [{ kind: "custom", modules: [{ type: "text", text: legacy.phrase.slice(0, 120), size: 8 }, { type: "today", modelId: "codex", size: 12, tpl: "今日 {tokens_today} tokens" }] }] });
+      }
+      const limits = Object.values(legacy.thresholds || {}).find((value) => value && typeof value === "object");
+      if (limits) {
+        const patch = { models: { "current-provider": {} } };
+        if (codexPlusWhaleFullNumber(limits.low) > 0) patch.models["current-provider"].alert = { on: true, below: Number(limits.low) };
+        if (codexPlusWhaleFullNumber(limits.budget) > 0) patch.models["current-provider"].budget = { on: true, amount: Number(limits.budget) };
+        await send("usage-settings.json", "PUT", patch);
+      }
+      const base = Math.max(122, Math.min(250, Math.min(window.innerWidth || 1024, window.innerHeight || 768) * 0.28));
+      const config = { ...configuration.body, sound: legacy.sound === true, turnCostOn: legacy.completion !== false };
+      if (codexPlusWhaleFullNumber(legacy.size) > 0) config.scale = Math.min(2.5, Math.max(0.6, Number(legacy.size) / (base * 0.5945)));
+      if (codexPlusWhaleFullNumber(legacy.x) !== null && codexPlusWhaleFullNumber(legacy.y) !== null) {
+        const fullSize = base * (config.scale || 1.5), right = Math.max(0, (window.innerWidth || 1024) - Number(legacy.x) - Number(legacy.size || 88)), bottom = Math.max(0, (window.innerHeight || 768) - Number(legacy.y) - Number(legacy.size || 88));
+        storage.setItem("dshw-pos", JSON.stringify({ v: 2, hAnchor: legacy.x < (window.innerWidth || 1024) / 2 ? "left" : "right", hDist: legacy.x < (window.innerWidth || 1024) / 2 ? Math.max(0, legacy.x - fullSize * 0.4055) : right, vAnchor: legacy.y < (window.innerHeight || 768) / 2 ? "top" : "bottom", vDist: legacy.y < (window.innerHeight || 768) / 2 ? Math.max(0, legacy.y - fullSize * 0.4055) : bottom }));
+      }
+      if (legacy.snap === false) storage.setItem("dshw-snap", JSON.stringify({ v: 3, mode: "off" }));
+      const result = await send("size.json", "PUT", config); state.startupConfig = { ...config, ...result, hasSavedConfig: true };
+      storage.setItem("legacy-migrated", "1");
+    }
+    function pause(paused) {
+      if (state.paused === paused || !active()) return;
+      state.paused = paused;
+      if (paused) {
+        for (const timer of state.timers.values()) { if (timer.native !== null) clearTimeout(timer.native); timer.native = null; }
+        for (const frame of state.rafs.values()) { if (frame.native !== null) cancelAnimationFrame(frame.native); frame.native = null; }
+        for (const observer of state.observers) observer.native.disconnect();
+        for (const cancel of [...state.pending]) cancel();
+        for (const audio of state.audio) { try { void audio.suspend?.().catch?.(() => {}); } catch {} }
+        state.turn = null; state.sessionAt = 0; state.pendingWait = null;
+      } else {
+        for (const [id, timer] of state.timers) arm(id, timer);
+        for (const [id, frame] of state.rafs) frame.native = requestAnimationFrame((time) => { state.rafs.delete(id); if (active() && !state.paused) frame.callback(time); });
+        for (const observer of state.observers) for (const [target, options] of observer.records) observer.native.observe(target, options);
+        context(); subscribe(); void state.controls?.refresh?.(false);
+      }
+    }
+    function dispose() {
+      if (state.disposed) return; state.disposed = true;
+      for (const id of [...state.timers.keys()]) clearTimer(id);
+      for (const id of [...state.rafs.keys()]) cancelRaf(id);
+      for (const observer of state.observers) observer.disconnect(); state.observers.clear();
+      for (const entry of state.listeners.splice(0)) entry.target.removeEventListener(entry.name, entry.wrapped, entry.options);
+      for (const unsubscribe of state.subscriptions.splice(0)) { try { unsubscribe(); } catch {} }
+      for (const cancel of [...state.pending]) cancel();
+      for (const context of state.audio) { try { void context.close?.().catch?.(() => {}); } catch {} } state.audio.clear();
+      for (const node of state.nodes) { if (node.parentNode) node.parentNode.removeChild(node); } state.nodes.clear();
+      for (const url of state.objectUrls) URL.revokeObjectURL(url); state.objectUrls.clear(); state.media.clear();
+      state.controls = null;
+    }
+    listen(document, "visibilitychange", () => pause(document.hidden === true));
+    listen(window, "message", (event) => {
+      if (event.source !== window || (event.origin && event.origin !== "null" && event.origin !== window.location?.origin)) return;
+      nativeEnvelope(event.data);
+    }, true);
+    listen(window, "codex-message-from-view", (event) => nativeEnvelope(event.detail), true);
+    // 设置迁移和首次读取在异步等待中也要记录短任务，绑定原 UI 后统一由 seq 消费。
+    subscribe();
+    return { state, environment, host, active, pause, dispose, initialize, fetch: fetchCompat, context, session, history, observe, subscribe, nativeEnvelope, prices };
+  }
+  // 完整版鲸鱼由上游原始引擎 + Codex 数据适配层组成；默认关闭。
+  window.__codexPlusWhaleWidgetRuntime?.dispose?.();
+  const codexPlusWhaleState = { disposed: false, runtime: null, profile: "", missingSource: false, failedUntil: 0, notice: null };
+  function codexPlusWhaleEnabled() {
+    return !codexPlusWhaleState.disposed && codexPlusBackendSettingsLoaded && codexPlusSettings().whaleWidget === true;
+  }
+  function codexPlusWhaleStop() {
+    codexPlusWhaleState.runtime?.dispose();
+    codexPlusWhaleState.runtime = null;
+    codexPlusWhaleState.notice?.remove(); codexPlusWhaleState.notice = null;
+  }
+  function codexPlusWhaleInitializationFailed(runtime) {
+    runtime?.dispose(); codexPlusWhaleState.runtime = null; codexPlusWhaleState.failedUntil = Date.now() + 10000;
+    if (codexPlusWhaleState.notice) return;
+    const notice = document.createElement("div"); notice.setAttribute("data-codex-plus-ext", "whale-widget"); notice.setAttribute("role", "status");
+    notice.style.cssText = "position:fixed;right:20px;bottom:20px;z-index:2147483600;max-width:320px;padding:12px;border-radius:10px;background:#fff5ec;color:#7c3218;font:12px/1.6 system-ui;box-shadow:0 3px 16px #0002";
+    notice.textContent = "鲸鱼挂件暂时无法加载，10 秒后自动重试。可在 Codex++ 增强设置关闭后重新开启。";
+    document.body.appendChild(notice); codexPlusWhaleState.notice = notice;
+  }
+  function codexPlusWhaleProfileFingerprint() {
+    const profile = codexRemoteSessionActiveProfile?.();
+    const settings = codexPlusBackendSettings || {};
+    return JSON.stringify([profile?.id || "", profile?.relayMode || "", settings.codexAppWhaleBalanceProtocol,
+      settings.codexAppWhaleBalancePath, settings.codexAppWhaleBalanceField, settings.codexAppWhaleBalanceCurrency,
+      settings.codexAppWhaleBalanceScale]);
+  }
+  function syncCodexPlusWhaleWidget() {
+    if (!codexPlusWhaleEnabled()) { codexPlusWhaleStop(); codexPlusWhaleState.failedUntil = 0; return; }
+    const profile = codexPlusWhaleProfileFingerprint();
+    if (codexPlusWhaleState.profile !== profile) { codexPlusWhaleStop(); codexPlusWhaleState.failedUntil = 0; }
+    codexPlusWhaleState.profile = profile;
+    if (codexPlusWhaleState.runtime) {
+      codexPlusWhaleState.runtime.context();
+      codexPlusWhaleState.runtime.subscribe();
+      codexPlusWhaleState.runtime.pause(document.hidden === true);
+      return;
+    }
+    // 隐藏窗口等恢复可见后再挂载，不在后台构造音频或轮询会话日志。
+    if (document.hidden) return;
+    if (Date.now() < codexPlusWhaleState.failedUntil) return;
+    if (typeof window.__CODEX_PLUS_WHALE_ENGINE__ !== "function") {
+      if (!codexPlusWhaleState.missingSource) console.warn("[Codex++] 完整鲸鱼运行时未随启动器加载，请重新构建启动器。");
+      codexPlusWhaleState.missingSource = true; codexPlusWhaleInitializationFailed(null); return;
+    }
+    const runtime = createCodexPlusWhaleFullRuntime();
+    codexPlusWhaleState.runtime = runtime;
+    registerCodexPlusExtensionSelector("[data-codex-plus-ext=whale-widget]");
+    void runtime.initialize().then(() => {
+      if (runtime.active() && codexPlusWhaleState.runtime === runtime && codexPlusWhaleEnabled()) {
+        window.__CODEX_PLUS_WHALE_ENGINE__(...runtime.environment);
+        if (runtime.state.initializationError || !runtime.state.controls) throw new Error("完整鲸鱼初始化未完成");
+        codexPlusWhaleState.notice?.remove(); codexPlusWhaleState.notice = null;
+      }
+    }).catch((error) => {
+      if (!runtime.active()) return;
+      if (codexPlusWhaleState.runtime === runtime) codexPlusWhaleInitializationFailed(runtime);
+    });
+  }
+  window.__codexPlusWhaleWidgetRuntime = {
+    version: 3,
+    sync: syncCodexPlusWhaleWidget,
+    dispose() { codexPlusWhaleStop(); codexPlusWhaleState.disposed = true; },
+    get state() { return codexPlusWhaleState.runtime?.state || null; },
+  };
   /**
    * 这个节点是不是 Codex++ 自己（或拓展）的 UI。
    *
@@ -13191,7 +15086,7 @@
    */
   function isExtensionUiNode(node) {
     if (!node?.closest) return false;
-    if (node.closest(`.codex-delete-toast, .codex-delete-confirm-overlay, .codex-plus-modal-overlay, .${codexPlusPageClass}, #${codexPlusSidebarNavId}, #${codexPlusRailNavId}, #${codexPlusRailExtensionsId}, #${codexPlusRailNavId} > button, #${codexPlusRailExtensionsId} > button, .${codexServiceTierBadgeClass}, .${sessionShareButtonClass}, .codex-zed-remote-button, .codex-zed-remote-toast, .${sessionCopyMenuItemClass}, #codex-plus-menu`)) {
+    if (node.closest(`.codex-delete-toast, .codex-delete-confirm-overlay, .codex-plus-modal-overlay, .${codexPlusPageClass}, #${codexPlusSidebarNavId}, #${codexPlusRailNavId}, #${codexPlusRailExtensionsId}, #${codexPlusRailNavId} > button, #${codexPlusRailExtensionsId} > button, .${codexServiceTierBadgeClass}, .${sessionShareButtonClass}, .${sessionCopyMenuItemClass}, #codex-plus-menu`)) {
       return true;
     }
     return isCodexPlusExtensionNode(node);
@@ -13213,8 +15108,8 @@
       selectors.archiveNav,
       selectors.pluginNavButton,
       'aside.app-shell-left-panel nav[role="navigation"]',
-      codexMenuLocalizationScopeSelector(),
-      ...(pluginPatchDisabledInRelayMode() ? [] : [selectors.disabledInstallButton]),
+      'nav[data-app-navigation-rail]',
+      ...(codexPluginMarketplacePatchEnabled() ? [selectors.disabledInstallButton] : []),
     ].join(", ");
   }
 
@@ -13267,7 +15162,6 @@
 
   function scheduleScan(mutations) {
     window.__codexSessionDeleteLastMutations = mutations;
-    scheduleZedRemoteMenuRefresh(mutations);
     if (!shouldScheduleScan(mutations)) return;
     if (window.__codexSessionDeleteScanPending) return;
     window.__codexSessionDeleteScanPending = true;
@@ -13307,12 +15201,13 @@
   }
 
   void loadBackendSettingsForStartup();
-  installUpstreamBranchDropdownAdapter();
-  installUpstreamWorktreeNativeAdapter();
   scan();
   syncOfficialUsagePolicy();
   scheduleSidebarNavStartupRetry();
   window.removeEventListener("resize", window.__codexPlusResizeHandler);
+  void restoreCodexPlusManagedLocale();
+  runScanStep(installCodexPlusTypingEffects);
+  runScanStep(syncCodexPlusWhaleWidget);
   let codexPlusResizeRafId = 0;
   window.__codexPlusResizeHandler = () => {
     cancelAnimationFrame(codexPlusResizeRafId);
@@ -13364,12 +15259,22 @@ if (window.__CODEX_PLUS_PASTE_FIX__ && window.__CODEX_PLUS_PASTE_FIX__.enabled =
 
     const TAG = '[PasteFix]';
 
+    // 超过这个长度就不再拦截，交回 Codex 原生的「超长文本转附件」逻辑。
+    // 否则整段长文本会被 insertText 直接塞进输入框，造成渲染层卡死（issue #1931）。
+    const MAX_INLINE_LENGTH = 20000;
+
     const handler = (e) => {
       const cd = e.clipboardData;
       if (!cd) return;
 
       const text = cd.getData('text/plain');
       if (typeof text !== 'string' || text.length === 0) return;
+
+      // 长文本放行：让 Codex 自己决定是否转成附件
+      if (text.length > MAX_INLINE_LENGTH) {
+        console.log(TAG, `text too long (${text.length} chars); letting Codex handle it`);
+        return;
+      }
 
       e.preventDefault();
       e.stopImmediatePropagation();

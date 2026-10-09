@@ -92,6 +92,90 @@ function installRendererStyle(renderer: string) {
 }
 
 describe("renderer injection header compatibility", () => {
+  it("does not supplement native plugin lists from retired snapshots and still refreshes after installation", async () => {
+    const [navigation, plugin] = await Promise.all([
+      readFile(new URL("../../../assets/inject/renderer-inject/50-navigation.js", import.meta.url), "utf8"),
+      readFile(new URL("../../../assets/inject/renderer-inject/60-plugin-marketplace.js", import.meta.url), "utf8"),
+    ]);
+    const displayStart = navigation.indexOf("  function displayNameForPluginMarketplaceName(");
+    const displayEnd = navigation.indexOf("  function restorePluginMarketplaceName(", displayStart);
+    const responseStart = plugin.indexOf("  function patchPluginMarketplaceResult(");
+    const responseEnd = plugin.indexOf("  if (window.__CODEX_PLUS_TEST_PLUGIN_MARKETPLACE__)", responseStart);
+    const refreshStart = plugin.indexOf("  function clearPluginMarketplaceQueryCache(");
+    const refreshEnd = plugin.indexOf("  function installPluginMarketplaceBridgePatch(", refreshStart);
+    assert.ok(displayStart >= 0 && displayEnd > displayStart && responseStart >= 0 && responseEnd > responseStart
+      && refreshStart >= 0 && refreshEnd > refreshStart);
+    const invalidations: unknown[] = [];
+    const window = {
+      __CODEX_PLUS_PLUGIN_MARKETPLACES__: [
+        { name: "native", plugins: [{ name: "cached-supplement" }] },
+        { name: "cached-marketplace", plugins: [{ name: "cached-plugin" }] },
+      ],
+      __REACT_QUERY_CLIENT__: { invalidateQueries: (filter: unknown) => invalidations.push(filter) },
+    };
+    const api = new Function("window", "sendCodexPlusDiagnostic", "appServerModelRequestMethod",
+      navigation.slice(displayStart, displayEnd) + plugin.slice(responseStart, responseEnd)
+        + plugin.slice(refreshStart, refreshEnd) + "\nreturn { patchResponseData: patchPluginMarketplaceResponseData };",
+    )(window, () => {}, (method: string) => method) as { patchResponseData: (data: unknown) => boolean };
+    const plugins = [{ name: "native-plugin" }];
+    const native = { marketplaces: [{ name: "native", displayName: "Native", plugins }] };
+    assert.equal(api.patchResponseData({ type: "mcp-response", message: { method: "list-plugins", result: native } }), true);
+    assert.equal(native.marketplaces.length, 1);
+    assert.equal(native.marketplaces[0].plugins, plugins);
+    assert.deepEqual(plugins.map(plugin => plugin.name), ["native-plugin"]);
+    const failed: { type: string; message: { error?: unknown; result?: { marketplaces: unknown[] } } } = {
+      type: "mcp-response",
+      message: { error: { message: "ChatGPT authentication required for remote plugin catalog; API key auth is not supported" } },
+    };
+    assert.equal(api.patchResponseData(failed), true);
+    assert.deepEqual(failed.message.result?.marketplaces, [], "authentication fallback must not recover cached catalogs");
+    api.patchResponseData({ type: "mcp-response", message: { method: "install-plugin", result: { installed: true } } });
+    assert.deepEqual(invalidations, [{ queryKey: ["plugins"] }]);
+    assert.doesNotMatch(navigation + plugin, /__CODEX_PLUS_PLUGIN_MARKETPLACES__|mergeLocalPluginMarketplaces|plugin_marketplace_local_merged/);
+    assert.match(navigation, /codexPluginFilterSourceCache = new WeakMap/);
+  });
+
+  it("uses the same plugin enhancement settings regardless of a legacy launch mode", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    const settingsStart = renderer.indexOf("  function defaultCodexPlusSettings()");
+    const settingsEnd = renderer.indexOf("  // Dream skin runtime", settingsStart);
+    const enabledStart = renderer.indexOf("  function codexPluginMarketplacePatchEnabled()");
+    const enabledEnd = renderer.indexOf("  let cachedSessionRows", enabledStart);
+    assert.ok(settingsStart >= 0 && settingsEnd > settingsStart && enabledStart >= 0 && enabledEnd > enabledStart);
+    const runtime = new Function(
+      "window", "localStorage", "codexPlusBackendSettings", "codexPlusBackendSettingsLoaded",
+      "conversationViewDefaultWidth", "codexPlusSettingsKey",
+      renderer.slice(settingsStart, settingsEnd) + renderer.slice(enabledStart, enabledEnd)
+        + "\nreturn { settings: codexPlusSettings(), patchEnabled: codexPluginMarketplacePatchEnabled() };",
+    );
+    for (const launchMode of [undefined, "relay", "patch"]) {
+      for (const enhancementsEnabled of [false, true]) {
+        for (const codexAppPluginMarketplaceUnlock of [false, true]) {
+          const settings = { launchMode, enhancementsEnabled, codexAppPluginMarketplaceUnlock };
+          const result = runtime({}, { getItem: () => "{}" }, settings, true, 900, "fixture");
+          const expected = enhancementsEnabled && codexAppPluginMarketplaceUnlock;
+          assert.equal(result.settings.pluginMarketplaceUnlock, expected);
+          assert.equal(result.patchEnabled, expected);
+          assert.equal(runtime({}, { getItem: () => "{}" }, settings, false, 900, "fixture").patchEnabled, false);
+        }
+      }
+    }
+    assert.doesNotMatch(renderer, /codexPlusBackendSettings\.launchMode|data-relay-unneeded|兼容增强|完整增强/);
+    assert.doesNotMatch(renderer, /codexMenuLocalizationScopeSelector\(\)/);
+    assert.match(renderer, /data-codex-backend-setting="enhancementsEnabled"/);
+    assert.match(renderer, /data-codex-plus-setting="pluginMarketplaceUnlock"/);
+  });
+
+  it("shows the next-step suggestion feature with its Chinese name", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    const generation = await readFile(new URL("../../../assets/inject/floating-panel/stepwise/generation.js", import.meta.url), "utf8");
+    assert.match(renderer, /悬浮球 · 下一步建议/);
+    assert.doesNotMatch(renderer, /悬浮球 · Stepwise/);
+    assert.match(generation, /window\.prompt\("复制下一步建议提示词", prompt\)/);
+    assert.doesNotMatch(generation, /Copy Stepwise prompt/);
+    assert.match(renderer, /stepwise: "codexAppStepwiseEnabled"/);
+  });
+
   it("纯 API 会话使用当前真实 provider，不强行改成 custom", async () => {
     const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
 
@@ -130,6 +214,8 @@ describe("renderer injection header compatibility", () => {
     assert.match(renderer, /function sessionImportMarkdown\(session\)/);
     assert.match(renderer, /codexpp-import-session/);
     assert.match(renderer, /nativeShare\?\.closest\?\.\("\.ms-auto"\)/);
+    assert.match(renderer, /function sessionSharePlacement\(\)/);
+    assert.match(renderer, /sessionShare: "codexAppSessionShare"/);
     assert.match(renderer, /#k=\$\{encrypted\.key\}/);
     assert.match(renderer, /navigator\.clipboard\.writeText\(shareUrl\)/);
     assert.match(renderer, /data-testid\*=\"message\"/);
@@ -301,7 +387,8 @@ describe("renderer injection header compatibility", () => {
     // 点左面板的行 = 选中（右侧看详情），不直接切开关——
     // 开关移到详情页，避免点行就误触发启停。
     assert.match(renderer, /data-codex-extensions-select="installed:\$\{escapeHtml\(entry\.key\)\}"/);
-    assert.match(renderer, /data-codex-extensions-select="market:\$\{escapeHtml\(entry\.key\)\}"/);
+    assert.match(renderer, /function renderCodexPlusExtensionsOverview\(\)/);
+    assert.match(renderer, /data-codex-extensions-browse="market"/);
     assert.match(renderer, /codex-plus-page-nav-item-state/);
     // 每个条目都有图标，没有自带图标的用默认字形。
     assert.match(renderer, /codex-plus-page-nav-item-icon/);
@@ -310,7 +397,7 @@ describe("renderer injection header compatibility", () => {
     assert.match(renderer, /if \(codexPlusActiveEntry\(\) === "extensions"\) refreshCodexPlusExtensionsView\(\);/);
   });
 
-  it("shows a VSCode-style detail pane for the selected 拓展", async () => {
+  it("shows a native-style detail pane for the selected 拓展", async () => {
     const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
 
     assert.match(renderer, /function renderCodexPlusExtensionsDetail\(\)/);
@@ -328,7 +415,7 @@ describe("renderer injection header compatibility", () => {
     assert.match(renderer, /data-active="\$\{String\(selected\)\}"/);
   });
 
-  it("gives 拓展 a searchable 已安装 / 市场 分组视图", async () => {
+  it("gives 拓展 searchable 已安装 / 市场 views while retaining the search input", async () => {
     const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
 
     assert.match(renderer, /data-codex-extensions-search="true"/);
@@ -338,12 +425,12 @@ describe("renderer injection header compatibility", () => {
     // 市场走 bridge 的两个新路由。
     assert.match(renderer, /postJson\("\/script-market\/list", \{\}\)/);
     assert.match(renderer, /postJson\("\/script-market\/install", \{ id \}\)/);
-    // 空分组要留着显示占位（加载中/加载失败），只在搜索无匹配时才省略——
-    // 否则「正在读取脚本市场…」和错误提示会被一起藏掉，面板全空。
-    assert.match(renderer, /if \(!entries\.length && searching\) return "";/);
-    assert.doesNotMatch(renderer, /if \(!entries\.length && \(searching \|\| !count\)\) return "";/);
-    // 搜索重绘后要把焦点放回输入框，否则每敲一个字就断。
-    assert.match(renderer, /next\.setSelectionRange\(next\.value\.length, next\.value\.length\)/);
+    assert.match(renderer, /data-codex-extensions-browse="installed"/);
+    const start = renderer.indexOf("  function refreshCodexPlusExtensionsView()");
+    const end = renderer.indexOf("  function codexPlusExtensionsSelectionDetail()", start);
+    assert.ok(start >= 0 && end > start);
+    // 搜索框留在主区标题栏，刷新只更新侧栏和结果，不重建输入框或抢焦点。
+    assert.doesNotMatch(renderer.slice(start, end), /data-codex-extensions-search|setSelectionRange/);
   });
 
   it("does not install Codex++ UI in embedded browser documents", async () => {
@@ -373,6 +460,228 @@ describe("renderer injection header compatibility", () => {
     assert.doesNotMatch(rootRule, /(?:^|;)\s*font(?:-family)?\s*:/);
     assert.doesNotMatch(rootRule, /(?:^|;)\s*color\s*:/);
     assert.match(css, /:where\([^)]*codex-plus-modal-overlay[^)]*\)\s*\{[^}]*font-family:\s*inherit;/s);
+  });
+
+  it("labels settings switches and keeps their checked state in sync while backend controls wait", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    const createButton = (key: string, title: string, relayUnneeded = false) => {
+      const attributes: Record<string, string> = { "data-codex-plus-setting": key };
+      return {
+        attributes,
+        dataset: { relayUnneeded: String(relayUnneeded) } as Record<string, string>,
+        disabled: false,
+        getAttribute: (name: string) => attributes[name] ?? null,
+        setAttribute: (name: string, value: string) => { attributes[name] = value; },
+        closest: () => ({ querySelector: () => ({ textContent: title }) }),
+      };
+    };
+    const mapped = createButton("pluginMarketplaceUnlock", "插件市场解锁");
+    const local = createButton("threadScrollRestore", "切换对话保留位置");
+    const unavailable = createButton("modelWhitelistUnlock", "模型白名单解锁", true);
+    const buttons = [mapped, local, unavailable];
+    const labelStart = renderer.indexOf('    overlay.querySelectorAll(".codex-plus-toggle[data-codex-plus-setting],');
+    const labelEnd = renderer.indexOf("    const closeButton", labelStart);
+    assert.ok(labelStart >= 0 && labelEnd > labelStart);
+    new Function("overlay", renderer.slice(labelStart, labelEnd))({ querySelectorAll: () => buttons });
+    for (const [button, label] of [[mapped, "插件市场解锁"], [local, "切换对话保留位置"], [unavailable, "模型白名单解锁"]] as const) {
+      assert.equal(button.attributes.role, "switch");
+      assert.equal(button.attributes["aria-label"], label);
+      assert.equal(button.attributes["aria-checked"], "false");
+    }
+
+    const renderStart = renderer.indexOf("  function renderCodexPlusMenu()");
+    const renderEnd = renderer.indexOf("\n  let codexPlusBackendSettings =", renderStart);
+    assert.ok(renderStart >= 0 && renderEnd > renderStart);
+    const settings: Record<string, boolean> = { pluginMarketplaceUnlock: true, threadScrollRestore: true, modelWhitelistUnlock: true };
+    const render = new Function("document", "codexPlusSettings", "codexPlusBackendMappedSettings", "refreshConversationViewControls", "refreshCodexServiceTierControls",
+      `let codexPlusBackendSettingsLoaded = false; const codexPlusBackendSettings = {};
+${renderer.slice(renderStart, renderEnd)}
+return (loaded) => { codexPlusBackendSettingsLoaded = loaded; renderCodexPlusMenu(); };`,
+    )(
+      { querySelectorAll: (selector: string) => selector === ".codex-plus-toggle[data-codex-plus-setting]" ? buttons : [] },
+      () => settings,
+      new Set(["pluginMarketplaceUnlock", "modelWhitelistUnlock"]),
+      () => {},
+      () => {},
+    ) as (loaded: boolean) => void;
+    render(false);
+    assert.equal(mapped.dataset.pending, "true");
+    assert.equal(mapped.disabled, true);
+    assert.equal(local.dataset.pending, "false");
+    assert.equal(local.disabled, false);
+    for (const button of buttons) assert.equal(button.attributes["aria-checked"], button.dataset.enabled);
+    assert.equal(mapped.attributes["aria-checked"], "true");
+
+    for (const key of Object.keys(settings)) settings[key] = false;
+    render(true);
+    for (const button of buttons) {
+      assert.equal(button.dataset.pending, "false");
+      assert.equal(button.dataset.enabled, "false");
+      assert.equal(button.attributes["aria-checked"], "false");
+    }
+    assert.equal(mapped.disabled, false);
+    assert.equal(local.disabled, false);
+    assert.equal(unavailable.disabled, true, "a relay-unavailable switch stays disabled after settings load");
+  });
+
+  it("refreshes backend switches from enabled to disabled without losing their accessible state", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    const start = renderer.indexOf("  function refreshCodexPlusBackendToggles()");
+    const end = renderer.indexOf("\n  let codexPlusUserScripts =", start);
+    assert.ok(start >= 0 && end > start);
+    const settings = { enhancementsEnabled: true };
+    const attributes: Record<string, string> = {};
+    const button = {
+      dataset: {} as Record<string, string>,
+      disabled: true,
+      getAttribute: () => "enhancementsEnabled",
+      setAttribute: (name: string, value: string) => { attributes[name] = value; },
+    };
+    let menuRefreshes = 0;
+    const refresh = new Function("document", "codexPlusBackendSettings", "syncStepwisePanel", "runScanStep", "syncCodexPlusTypingEffects", "renderCodexPlusMenu", "scan",
+      `${renderer.slice(start, end)}\nreturn refreshCodexPlusBackendToggles;`,
+    )(
+      { querySelectorAll: () => [button] }, settings, () => {}, () => {}, () => {},
+      () => { menuRefreshes += 1; }, () => {},
+    ) as () => void;
+    refresh();
+    assert.equal(button.dataset.enabled, "true");
+    assert.equal(attributes["aria-checked"], "true");
+    settings.enhancementsEnabled = false;
+    refresh();
+    assert.equal(button.dataset.enabled, "false");
+    assert.equal(attributes["aria-checked"], "false");
+    assert.equal(button.disabled, true, "backend refresh preserves the control's existing disabled state");
+    assert.equal(menuRefreshes, 2, "each backend refresh also synchronizes the other settings controls");
+  });
+
+  it("groups the settings homepage into labelled cards and keeps hidden service controls hidden", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    const homeStart = renderer.indexOf('data-codex-plus-panel="home"');
+    const homeEnd = renderer.indexOf("${renderCodexPlusExtensionMenuRows()}", homeStart);
+    assert.ok(homeStart >= 0 && homeEnd > homeStart);
+    const sections = Array.from(renderer.slice(homeStart, homeEnd).matchAll(/<section class="codex-plus-settings-section" aria-label="([^"]+)">([\s\S]*?)<\/section>/g));
+    assert.deepEqual(sections.map((match) => match[1]), ["常规", "模型与服务", "对话与输入", "外观与布局", "工具与关于"]);
+    for (const [, title, contents] of sections) {
+      assert.ok(contents.includes(`<h2 class="codex-plus-settings-section-title">${title}</h2>`));
+      assert.ok(contents.includes('class="codex-plus-settings-card"'));
+      assert.ok(contents.includes('class="codex-plus-row"'));
+    }
+    const layoutStart = renderer.indexOf("  function installCodexPlusPageLayout(");
+    const layoutEnd = renderer.indexOf("  function codexPlusPageTitle(", layoutStart);
+    assert.ok(layoutStart >= 0 && layoutEnd > layoutStart);
+    assert.match(renderer.slice(layoutStart, layoutEnd), /if \(tab === "home"\)\s*\{[\s\S]*?body\.querySelector\("\.codex-plus-settings"\)\?\.prepend\(header\)/);
+    const css = installRendererStyle(renderer)[0].textContent ?? "";
+    assert.match(css, /\.codex-plus-settings\s+\.codex-plus-row\[hidden\]\s*\{\s*display:\s*none\s*;/);
+  });
+
+  it("synchronizes the typing-effect dropdown label, selection and disabled state", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    const start = renderer.indexOf("  function syncCodexPlusTypingEffectDropdown(");
+    const end = renderer.indexOf("  function openCodexPlusTypingEffectDropdown(", start);
+    assert.ok(start >= 0 && end > start);
+    const label = { textContent: "" };
+    const triggerAttributes: Record<string, string> = { "aria-expanded": "true" };
+    const trigger = {
+      disabled: false,
+      querySelector: () => label,
+      setAttribute: (name: string, value: string) => { triggerAttributes[name] = value; },
+    };
+    const options = ["off", "rainbow", "fireworks", "stars"].map((value) => {
+      const attributes: Record<string, string> = {};
+      return {
+        attributes,
+        dataset: { codexPlusTypingEffectOption: value },
+        tabIndex: -1,
+        setAttribute: (name: string, next: string) => { attributes[name] = next; },
+      };
+    });
+    const overlay = { querySelector: () => trigger, querySelectorAll: () => options };
+    const menu = { hidden: false, parentElement: overlay };
+    const select = { value: "rainbow", disabled: false, selectedOptions: [{ textContent: "彩虹粒子" }], closest: () => overlay };
+    let cleanups = 0;
+    const sync = new Function("document", "cleanup",
+      `let codexPlusTypingEffectDropdownCleanup = cleanup;\n${renderer.slice(start, end)}\nreturn syncCodexPlusTypingEffectDropdown;`,
+    )({ querySelector: () => menu }, () => { cleanups += 1; }) as (control: typeof select) => void;
+    sync(select);
+    assert.equal(label.textContent, "彩虹粒子");
+    assert.equal(trigger.disabled, false);
+    assert.equal(menu.hidden, false);
+    for (const option of options) {
+      const selected = option.dataset.codexPlusTypingEffectOption === "rainbow";
+      assert.equal(option.attributes["aria-selected"], String(selected));
+      assert.equal(option.tabIndex, selected ? 0 : -1);
+    }
+    select.value = "off";
+    select.selectedOptions = [];
+    sync(select);
+    assert.equal(label.textContent, "关闭");
+    for (const option of options) {
+      const selected = option.dataset.codexPlusTypingEffectOption === "off";
+      assert.equal(option.attributes["aria-selected"], String(selected));
+      assert.equal(option.tabIndex, selected ? 0 : -1);
+    }
+    select.disabled = true;
+    sync(select);
+    assert.equal(trigger.disabled, true);
+    assert.equal(menu.hidden, true);
+    assert.equal(triggerAttributes["aria-expanded"], "false");
+    assert.equal(cleanups, 1, "disabling an open menu removes its document listeners");
+    sync(select);
+    assert.equal(cleanups, 1, "menu cleanup is consumed once");
+  });
+
+  it("saves dropdown selections through the existing hidden select change contract", async () => {
+    const renderer = await readFile(new URL("../../../assets/inject/renderer-inject.js", import.meta.url), "utf8");
+    const selectMarkup = renderer.match(/<select[^>]*data-codex-plus-typing-effect="true"[^>]*>[\s\S]*?<\/select>/)?.[0];
+    assert.ok(selectMarkup, "the select data attribute remains available to existing change handling");
+    assert.match(selectMarkup, /\bhidden\b/);
+    assert.match(selectMarkup, /aria-hidden="true"/);
+    assert.deepEqual(Array.from(selectMarkup.matchAll(/<option value="([^"]+)"/g), (match) => match[1]), ["off", "rainbow", "fireworks", "stars"]);
+    const changeStart = renderer.indexOf('      const typingEffectSelect = target?.closest("[data-codex-plus-typing-effect]");');
+    const changeEnd = renderer.indexOf("      const widthInput", changeStart);
+    const optionStart = renderer.indexOf('      const typingEffectOption = target?.closest("[data-codex-plus-typing-effect-option]");');
+    const optionEnd = renderer.indexOf("      // 左面板", optionStart);
+    assert.ok(changeStart >= 0 && changeEnd > changeStart && optionStart >= 0 && optionEnd > optionStart);
+    const saves: Array<{ key: string; value: string }> = [];
+    const events: Array<{ type: string; bubbles: boolean }> = [];
+    const onChange = new Function("target", "setCodexPlusSetting", renderer.slice(changeStart, changeEnd));
+    const select: { value: string; disabled: boolean; dispatchEvent: (event: { type: string; bubbles: boolean }) => void } = {
+      value: "off", disabled: false,
+      dispatchEvent(event) {
+        events.push(event);
+        onChange({ closest: () => select }, (key: string, value: string) => { saves.push({ key, value }); });
+      },
+    };
+    const option = { dataset: { codexPlusTypingEffectOption: "stars" } };
+    let focusRestores = 0;
+    const choose = new Function("target", "overlay", "Event", "closeCodexPlusTypingEffectDropdown", renderer.slice(optionStart, optionEnd));
+    const click = () => choose(
+      { closest: () => option }, { querySelector: () => select },
+      class {
+        type: string;
+        bubbles: boolean;
+        constructor(type: string, options: { bubbles: boolean }) {
+          this.type = type;
+          this.bubbles = options.bubbles;
+        }
+      },
+      (restore: boolean) => { if (restore) focusRestores += 1; },
+    );
+    click();
+    assert.equal(select.value, "stars");
+    assert.equal(events.length, 1);
+    assert.equal(events[0].type, "change");
+    assert.equal(events[0].bubbles, true);
+    assert.deepEqual(saves, [{ key: "typingEffect", value: "stars" }]);
+    click();
+    assert.equal(events.length, 1, "selecting the current value does not save again");
+    select.disabled = true;
+    option.dataset.codexPlusTypingEffectOption = "rainbow";
+    click();
+    assert.equal(select.value, "stars");
+    assert.equal(events.length, 1, "disabled selections cannot change the saved setting");
+    assert.equal(focusRestores, 3);
   });
 
   it("rewrites official usage status at the cache boundary instead of scanning alerts", async () => {
@@ -489,6 +798,151 @@ function mutation(addedNodes: unknown[] = [], removedNodes: unknown[] = []) {
   return { target: codexContainer, addedNodes, removedNodes };
 }
 
+describe("native-style extension and sponsor discovery", () => {
+  const rendererPath = new URL("../../../assets/inject/renderer-inject.js", import.meta.url);
+  function segment(source: string, from: string, to: string) {
+    const start = source.indexOf(from);
+    const end = source.indexOf(to, start);
+    assert.ok(start >= 0 && end > start, `missing renderer segment: ${from}`);
+    return source.slice(start, end);
+  }
+  function escapeSource(renderer: string) {
+    return segment(renderer, "  function escapeHtml(value)", "  function confirmDelete(");
+  }
+  function extensionRuntime(renderer: string) {
+    const icon = renderer.match(/^  const codexPlusDefaultExtensionIconPath = .+;$/m)?.[0];
+    assert.ok(icon);
+    return new Function(`${icon}\n${escapeSource(renderer)}
+let codexPlusUserScripts = { scripts: [] }, codexPlusUserScriptsLoaded = false;
+let codexPlusScriptMarket = { scripts: [], loaded: false, loading: false, message: "" };
+let codexPlusExtensionsQuery = "", codexPlusExtensionsFilter = "market", codexPlusExtensionsSelected = null;
+${segment(renderer, "  function userScriptStatusLabel(", "  async function uninstallUserScript(")}
+${segment(renderer, "  function codexPlusExtensionsEntries()", "  function selectCodexPlusTab(")}
+return {
+  nav: renderCodexPlusExtensionsNav, overview: renderCodexPlusExtensionsOverview, detail: renderCodexPlusExtensionsDetail,
+  configure(scripts, market, options = {}) {
+    codexPlusUserScripts = { scripts }; codexPlusUserScriptsLoaded = options.userLoaded ?? true;
+    codexPlusScriptMarket = { scripts: market, loaded: options.marketLoaded ?? true, loading: options.loading ?? false, message: options.message || "" };
+    codexPlusExtensionsQuery = options.query || ""; codexPlusExtensionsFilter = options.filter || "market";
+    codexPlusExtensionsSelected = options.selected || null;
+  }
+};`)() as {
+      nav: () => string; overview: () => string; detail: () => string;
+      configure: (scripts: Record<string, unknown>[], market: Record<string, unknown>[], options?: Record<string, unknown>) => void;
+    };
+  }
+
+  it("filters installed and market entries, escapes their data and keeps actions outside selection buttons", async () => {
+    const runtime = extensionRuntime(await readFile(rendererPath, "utf8"));
+    const scripts = [
+      { key: 'user"&', name: "Owned <user>", source: "user", market_id: "owned", enabled: true, status: "loaded" },
+      { key: "builtin.js", name: "Builtin", source: "builtin", enabled: false, status: "disabled" },
+    ];
+    const market = [
+      { id: "owned", name: "Owned market", description: "Owned-document", tags: ["owned-tag"], version: "2" },
+      { id: 'available"&', name: "Available <script>", description: 'Catalog <docs> & "more"', tags: ["catalog"], author: "Author", version: "1", icon: "https://example.test/logo.png?x=1&y=2" },
+    ];
+    runtime.configure(scripts, market);
+    const nav = runtime.nav();
+    assert.ok(nav.includes('data-codex-extensions-select="installed:user&quot;&amp;"'));
+    assert.ok(nav.includes('data-codex-extensions-select="installed:builtin.js"'));
+    assert.ok(nav.includes('data-codex-extensions-browse="market"'));
+    assert.doesNotMatch(nav, /data-codex-market-install|data-codex-extensions-search/);
+    const overview = runtime.overview();
+    assert.ok(overview.includes('data-codex-extensions-select="market:available&quot;&amp;"'));
+    assert.ok(overview.includes('data-codex-market-install="available&quot;&amp;"'));
+    assert.ok(overview.includes("Available &lt;script&gt;"));
+    assert.ok(overview.includes("Catalog &lt;docs&gt; &amp; &quot;more&quot;"));
+    assert.ok(overview.includes('src="https://example.test/logo.png?x=1&amp;y=2"'));
+    assert.doesNotMatch(overview, /<script>|data-codex-market-install="owned"|Owned market|Builtin/);
+    const cards = Array.from(overview.matchAll(/<article class="codex-plus-extension-card">([\s\S]*?)<\/article>/g));
+    assert.equal(cards.length, 1);
+    assert.match(cards[0][1], /<\/button>\s*<div class="codex-plus-extension-card-actions"><button/);
+    assert.equal(Array.from(cards[0][1].matchAll(/<button\b/g)).length, 2);
+    assert.doesNotMatch(cards[0][1], /<button\b(?:(?!<\/button>)[\s\S])*<button\b/);
+    assert.equal(runtime.detail(), overview, "opening extensions initially displays the browse results");
+
+    runtime.configure(scripts, market, { filter: "installed" });
+    const installed = runtime.overview();
+    assert.ok(installed.includes("Owned market"), "installed market scripts use their catalog display name");
+    assert.ok(installed.includes('data-codex-user-script-key="user&quot;&amp;"'));
+    assert.ok(installed.includes('role="switch" aria-checked="true"'));
+    assert.ok(installed.includes('role="switch" aria-checked="false"'));
+    assert.doesNotMatch(installed, /data-codex-market-install|Available/);
+    runtime.configure(scripts, market, { filter: "installed", query: "OWNED-DOCUMENT" });
+    assert.ok(runtime.overview().includes('data-codex-user-script-key="user&quot;&amp;"'));
+    assert.doesNotMatch(runtime.overview(), /Builtin/);
+    runtime.configure(scripts, market, { filter: "installed", query: "Owned <user>" });
+    assert.ok(runtime.overview().includes('data-codex-user-script-key="user&quot;&amp;"'), "the original local name remains searchable");
+    runtime.configure(scripts, market, { filter: "installed", query: 'user"&' });
+    assert.ok(runtime.overview().includes('data-codex-user-script-key="user&quot;&amp;"'), "the local script key remains searchable");
+    runtime.configure(scripts, market, { query: "CATALOG" });
+    assert.ok(runtime.overview().includes("Available &lt;script&gt;"));
+    runtime.configure(scripts, market, { selected: { kind: "installed", key: 'user"&' } });
+    assert.ok(runtime.detail().includes('data-codex-extensions-uninstall="user&quot;&amp;"'));
+    runtime.configure(scripts, market, { selected: { kind: "installed", key: "builtin.js" } });
+    assert.doesNotMatch(runtime.detail(), /data-codex-extensions-uninstall/);
+  });
+
+  it("retains loading, empty and escaped search/error states in extension browse results", async () => {
+    const runtime = extensionRuntime(await readFile(rendererPath, "utf8"));
+    runtime.configure([], [], { marketLoaded: false, loading: true, userLoaded: false });
+    assert.match(runtime.overview(), /role="status">正在读取拓展…/);
+    assert.match(runtime.nav(), /正在读取用户拓展…/);
+    runtime.configure([], [], { filter: "installed", userLoaded: false });
+    assert.match(runtime.overview(), /正在读取用户拓展…/);
+    runtime.configure([], [], { filter: "installed" });
+    assert.match(runtime.overview(), /未发现已安装的拓展。/);
+    runtime.configure([], []);
+    assert.match(runtime.overview(), /市场里没有可安装的拓展。/);
+    runtime.configure([], [], { message: "<backend> & unavailable" });
+    assert.ok(runtime.overview().includes("&lt;backend&gt; &amp; unavailable"));
+    runtime.configure([], [], { query: '<missing> "query"' });
+    assert.ok(runtime.overview().includes("没有匹配「&lt;missing&gt; &quot;query&quot;」的拓展。"));
+    runtime.configure([], [], { selected: { kind: "market", key: "removed" } });
+    assert.match(runtime.detail(), /市场里没有可安装的拓展。/);
+  });
+
+  it("updates extension results without replacing or refocusing the search input", async () => {
+    const renderer = await readFile(rendererPath, "utf8");
+    const input = { value: "query", selectionStart: 2, selectionEnd: 2 };
+    const nav = { innerHTML: "old nav" }, detail = { innerHTML: "old detail" };
+    const nodes: Record<string, object> = {
+      "[data-codex-plus-page-nav-body]": nav,
+      "[data-codex-plus-extensions-detail]": detail,
+      "[data-codex-extensions-search]": input,
+    };
+    const requested: string[] = [];
+    const renderedSelections: unknown[] = [];
+    const runtime = new Function("document", "codexPlusActiveEntry", "renderNav", "renderDetail", "codexPlusExtensionsSelectionDetail",
+      `let codexPlusExtensionsSelected = { kind: "market", key: "removed" };
+function renderCodexPlusExtensionsNav() { return renderNav(codexPlusExtensionsSelected); }
+function renderCodexPlusExtensionsDetail() { return renderDetail(codexPlusExtensionsSelected); }
+${segment(renderer, "  function refreshCodexPlusExtensionsView()", "  function codexPlusExtensionsSelectionDetail()")}
+return { refresh: refreshCodexPlusExtensionsView, selection: () => codexPlusExtensionsSelected };`,
+    )(
+      { querySelector(selector: string) { requested.push(selector); return nodes[selector]; } }, () => "extensions",
+      (selection: unknown) => { renderedSelections.push(selection); return "new nav"; },
+      (selection: unknown) => { renderedSelections.push(selection); return "new results"; },
+      () => null,
+    ) as { refresh: () => void; selection: () => unknown };
+    runtime.refresh();
+    assert.equal(runtime.selection(), null, "removed selections return to the browse list");
+    assert.deepEqual(renderedSelections, [null, null], "the sidebar and results render from the same normalized selection");
+    assert.equal(nav.innerHTML, "new nav");
+    assert.equal(detail.innerHTML, "new results");
+    assert.equal(nodes["[data-codex-extensions-search]"], input);
+    assert.deepEqual(input, { value: "query", selectionStart: 2, selectionEnd: 2 });
+    assert.deepEqual(requested, ["[data-codex-plus-page-nav-body]", "[data-codex-plus-extensions-detail]"]);
+  });
+
+  it("777 renderer does not expose sponsor rendering or network requests", async () => {
+    const renderer = await readFile(rendererPath, "utf8");
+    assert.doesNotMatch(renderer, /renderCodexPlusAds|directFetchCodexPlusAds|codexPlusAdsUrl|codexPlusRailSponsorId/);
+
+  });
+});
+
 describe("renderer injection scan scheduling", () => {
   const rendererPath = new URL("../../../assets/inject/renderer-inject.js", import.meta.url);
 
@@ -525,7 +979,7 @@ interface MarketplacePatchHarness {
 
 function marketplacePatchRuntime(renderer: string, patchSucceeds: boolean): MarketplacePatchHarness {
   const start = renderer.indexOf("  const pluginMarketplaceRequestPatchMaxMisses = ");
-  const end = renderer.indexOf("\n  function pluginPatchDisabledInRelayMode(", start);
+  const end = renderer.indexOf("\n  function codexPluginMarketplacePatchEnabled(", start);
   assert.ok(start >= 0 && end > start, "marketplace patch block not found in renderer-inject.js");
   const source = renderer.slice(start, end);
 
@@ -537,7 +991,7 @@ function marketplacePatchRuntime(renderer: string, patchSucceeds: boolean): Mark
   const factory = new Function(
     "window",
     "codexPluginMarketplaceUnlockVersion",
-    "pluginPatchDisabledInRelayMode",
+    "codexPluginMarketplacePatchEnabled",
     "codexPlusSettings",
     "loadAppServerRequestCandidates",
     "patchPluginMarketplaceRequestClient",
@@ -549,7 +1003,7 @@ function marketplacePatchRuntime(renderer: string, patchSucceeds: boolean): Mark
   const install = factory(
     fakeWindow,
     1,
-    () => false,
+    () => true,
     () => ({ pluginMarketplaceUnlock: true }),
     // 每轮 sweep 在真实实现里会 fetch 全部 app asset，这里只计数并挂起，
     // 好让测试能在「上一轮尚未结束」的时刻再次调用 install。
@@ -804,6 +1258,49 @@ describe("renderer injection plugin marketplace patch", () => {
     assert.equal(harness.sweeps(), 1);
     assert.deepEqual(harness.diagnostics(), ["plugin_marketplace_request_patch_installed"]);
   });
+
+  // 26.928.31416 起 Codex 又把过滤器里的标识符换了一轮名（!Mj(e.marketplaceName)||e.marketplaceName===n）。
+  // 过去按压缩字面量匹配，发版即失效：补丁照装，但 plugin_build_flavor_filter_bypassed 从不触发，
+  // 插件解锁静默失灵。现在改用结构正则，下面把历史形态与新形态一起钉住。
+  function extractFilterPattern(renderer: string, name: string): RegExp {
+    const match = renderer.match(new RegExp(`const ${name}\\s*=\\s*\\/([\\s\\S]*?)\\/;`));
+    assert.ok(match, `${name} 未在产物中找到`);
+    return new RegExp(match![1]);
+  }
+
+  it("matches build-flavor filter shapes across Codex builds", async () => {
+    const pattern = extractFilterPattern(await readFile(rendererPath, "utf8"), "codexPluginBuildFlavorFilterSourcePattern");
+    const shapes = [
+      "function EHr({buildFlavor:e,plugins:t}){let n=Gpt(e);return t.filter(e=>!Mj(e.marketplaceName)||e.marketplaceName===n)}", // 26.928.31416
+      "e.filter(e=>!u(e.marketplaceName)||e.marketplaceName===r)",
+      "e.filter(e=>!ne(e.marketplaceName)||e.marketplaceName===n)",
+      "e.filter(e=>!Eu(e.marketplaceName)||e.marketplaceName===n)",
+    ];
+    for (const source of shapes) assert.ok(pattern.test(source), `应命中: ${source}`);
+    assert.ok(!pattern.test("e.filter(x=>x.enabled&&x.name.length>3)"), "不应命中无关过滤器");
+  });
+
+  it("detects the featured plugin id filter separately", async () => {
+    const pattern = extractFilterPattern(await readFile(rendererPath, "utf8"), "codexPluginFeaturedFilterSourcePattern");
+    // featuredPluginIds 那条入参是字符串 id，形态与 build-flavor 不同，必须单独认。
+    assert.ok(pattern.test("function THr({buildFlavor:e,featuredPluginIds:t}){let n=Gpt(e);return t.filter(e=>{let t=Gj(e);return t==null||!Mj(t)||t===n})}"));
+    assert.ok(!pattern.test("e.filter(e=>!Mj(e.marketplaceName)||e.marketplaceName===n)"), "不应与 build-flavor 过滤器混淆");
+    // 真实 bundle 里存在这个形状相近的无关函数；右值 `SFe(t)` 是调用，
+    // 早期写法 `(?!\s*\()` 会被贪婪回溯绕过（SFe 退成 SF），实测踩过。
+    assert.ok(
+      !pattern.test("let r=bSe(e.path)?.pluginMarketplaceName??null;return t==null||r==null||!ds(r)||r===SFe(t)"),
+      "不应命中 bundle 里的无关 null-guard",
+    );
+  });
+
+  it("matches hidden-marketplace filter shapes structurally", async () => {
+    const pattern = extractFilterPattern(await readFile(rendererPath, "utf8"), "codexPluginHiddenFilterSourcePattern");
+    assert.ok(pattern.test("function hHr(e,t){return t.length===0?e:e.filter(e=>!t.includes(e.name))}"));
+    assert.ok(pattern.test("marketplaces:a.filter(e=>!n.includes(e.name)&&(!r.Po(e.name)||e.name===c))"));
+    assert.ok(!pattern.test("e.filter(e=>e.plugins.some(p=>p.name))"), "不应命中无关过滤器");
+    // 真实 bundle 里的无关守卫：不是 filter 箭头形态，必须排掉。
+    assert.ok(!pattern.test("if(n[t.name]=t,!w4.includes(t.name)&&typeof t.setupOnce==`function`"), "不应命中非 filter 守卫");
+  });
 });
 
 describe("relay pureApi provider resolution", () => {
@@ -909,8 +1406,29 @@ describe("relay pureApi provider resolution", () => {
   });
 });
 
+it("opens Stepwise configuration in the manager enhancement page", async () => {
+  const source = await readFile(new URL("../../../assets/inject/floating-panel/core/views.js", import.meta.url), "utf8");
+  const begin = source.indexOf("  async function openManager()");
+  assert.ok(begin >= 0);
+  const state = { runtimeGeneration: 3, settingsStatus: "" };
+  const requests: Array<{ route: string; payload: unknown }> = [];
+  let renders = 0;
+  const openManager = new Function("isCurrentRuntime", "state", "renderFloat", "bridgeCall",
+    source.slice(begin) + "\nreturn openManager;",
+  )(
+    (generation?: number) => generation === undefined || generation === state.runtimeGeneration,
+    state,
+    () => { renders += 1; },
+    async (route: string, payload: unknown) => { requests.push({ route, payload }); return { status: "ok" }; },
+  );
+  await openManager();
+  assert.deepEqual(requests, [{ route: "/manager/open-transient", payload: { page: "enhance", section: "stepwise" } }]);
+  assert.equal(state.settingsStatus, "已打开 Codex++");
+  assert.equal(renders, 2);
+});
+
 describe("Stepwise generation mode contracts", () => {
-  it("exposes automatic and manual generation in manager settings", async () => {
+  it("exposes automatic and manual generation in manager enhancements", async () => {
     const app = await readFile(new URL("./App.tsx", import.meta.url), "utf8");
     const renderer = await readFile(
       new URL("../../../assets/inject/renderer-inject.js", import.meta.url),
@@ -1256,7 +1774,7 @@ describe("renderer inject 分片与产物一致", () => {
     // 已安装条目要走 codexPlusExtensionMarketItem(entry) 按 market_id 回查。
     const { source } = await assembleFromFragments();
     const openingTag = source.indexOf("  function renderCodexPlusExtensionsNav()");
-    const closingTag = source.indexOf("\n  /** 左面板内容变了就整块重绘", openingTag);
+    const closingTag = source.indexOf("  function refreshCodexPlusExtensionsView()", openingTag);
     assert.ok(openingTag >= 0, "找不到 renderCodexPlusExtensionsNav");
     assert.ok(closingTag > openingTag, "找不到函数结束位置");
     const body = source.slice(openingTag, closingTag);
@@ -1495,10 +2013,13 @@ describe("拓展菜单项", () => {
     const source = await readFile(settingsPath, "utf8");
     const handler = source.indexOf('overlay.addEventListener("click"');
     assert.ok(handler > 0, "找不到点击委托");
-    const body = source.slice(handler, handler + 600);
+    const end = source.indexOf('overlay.addEventListener("keydown"', handler);
+    assert.ok(end > handler, "找不到点击委托之后的键盘委托");
+    const body = source.slice(handler, end);
     const extIdx = body.indexOf("handleCodexPlusExtensionMenuClick(target)");
     const devtoolsIdx = body.indexOf("data-codex-open-devtools");
     assert.ok(extIdx > 0, "点击委托应当调用拓展菜单处理器");
+    assert.ok(devtoolsIdx > 0, "点击委托应当包含内置 DevTools 分支");
     assert.ok(extIdx < devtoolsIdx, "拓展分支应排在内置分支之前");
   });
 
@@ -1520,5 +2041,342 @@ describe("拓展菜单项", () => {
     const body = source.slice(start, start + 1400);
     assert.match(body, /runCodexPlusExtensionCallback/, "回调必须经失败隔离包装");
     assert.ok(!/try\s*{[\s\S]*item\.onActivate\(/.test(body), "不应裸调 onActivate");
+  });
+});
+
+/**
+ * 会话视图对齐（issue #2258 / #2085）的夹具运行时。
+ *
+ * 这里跑的是产物里真实的目标查找与宽度计算函数，配一个极简 DOM 桩——
+ * 只实现查找链路真正用到的方法（querySelector/matches/closest/getBoundingClientRect）。
+ * 类名夹具直接取自 Codex 打包产物里的字符串，不手写臆造。
+ */
+function conversationViewRuntime(renderer: string) {
+  const start = renderer.indexOf("  // 旧版（26.9xx 之前）内容容器类名清单");
+  const end = renderer.indexOf("  function codexServiceTierBadgeVisibleElement(", start);
+  assert.ok(start >= 0 && end > start, "conversation view target finder block not found");
+  const finderSource = renderer.slice(start, end);
+  // 宽度计算与目标查找在文件里不相邻，单独切一段。
+  const widthStart = renderer.indexOf("  function conversationViewEffectiveWidth(");
+  const widthEnd = renderer.indexOf("  function conversationViewHtmlCenter(", widthStart);
+  assert.ok(widthStart >= 0 && widthEnd > widthStart, "conversation view width block not found");
+  const widthSource = renderer.slice(widthStart, widthEnd);
+  const source = `${finderSource}\n${widthSource}`;
+
+  const selectorStart = renderer.indexOf("  const selectors = {");
+  const selectorEnd = renderer.indexOf("  };", selectorStart) + 4;
+  assert.ok(selectorStart >= 0, "selectors table not found");
+  const selectorsTable = renderer.slice(selectorStart, selectorEnd);
+
+  type FakeEl = {
+    tagName: string;
+    className: string;
+    attrs: Record<string, string>;
+    children: FakeEl[];
+    parentElement: FakeEl | null;
+    style: Record<string, string>;
+    dataset: Record<string, string>;
+    rect: { left: number; width: number };
+    vars: Record<string, string>;
+    computedMaxWidth: string;
+    padding: { left: string; right: string };
+    querySelectorAll(selector: string): FakeEl[];
+    querySelector(selector: string): FakeEl | null;
+    matches(selector: string): boolean;
+    closest(selector: string): FakeEl | null;
+    contains(el: FakeEl): boolean;
+    getBoundingClientRect(): { left: number; width: number; right: number; top: number; bottom: number; height: number };
+  };
+
+  function matches(el: FakeEl, selector: string): boolean {
+    if (selector.includes(",")) return selector.split(",").some((part) => matches(el, part.trim()));
+    const taggedAttribute = selector.match(/^([a-z]+)(\[.*\])$/);
+    if (taggedAttribute) return el.tagName.toLowerCase() === taggedAttribute[1] && matches(el, taggedAttribute[2]);
+    if (selector === "div") return el.tagName === "DIV";
+    if (/^[a-z]+$/.test(selector)) return el.tagName.toLowerCase() === selector;
+    if (selector.startsWith("#")) return el.attrs.id === selector.slice(1);
+    if (selector.startsWith("[") && selector.endsWith("]")) {
+      const body = selector.slice(1, -1);
+      const eq = body.indexOf("=");
+      const name = eq === -1 ? body : body.slice(0, eq);
+      const value = eq === -1 ? null : body.slice(eq + 1).replace(/^["']|["']$/g, "");
+      const actual = el.attrs[name];
+      if (actual === undefined) return false;
+      return value === null ? true : actual === value;
+    }
+    if (selector.startsWith(".")) return el.className.split(/\s+/).includes(selector.slice(1));
+    throw new Error(`夹具未实现的选择器: ${selector}`);
+  }
+
+  function descendants(root: FakeEl, out: FakeEl[] = []): FakeEl[] {
+    for (const child of root.children) {
+      out.push(child);
+      descendants(child, out);
+    }
+    return out;
+  }
+
+  function query(root: FakeEl, selector: string): FakeEl[] {
+    const parts = selector.split(",").map((part) => part.trim());
+    return descendants(root).filter((el) => parts.some((part) => matches(el, part)));
+  }
+
+  function el(tag: string, className = "", attrs: Record<string, string> = {}): FakeEl {
+    const node: FakeEl = {
+      tagName: tag.toUpperCase(),
+      className,
+      attrs,
+      children: [],
+      parentElement: null,
+      style: {},
+      dataset: {},
+      rect: { left: 0, width: 0 },
+      vars: {},
+      computedMaxWidth: "none",
+      padding: { left: "", right: "" },
+      querySelectorAll: (selector: string) => query(node, selector),
+      querySelector: (selector: string) => query(node, selector)[0] ?? null,
+      matches: (selector) => matches(node, selector),
+      closest: (selector) => {
+        let current: FakeEl | null = node;
+        while (current) {
+          if (matches(current, selector)) return current;
+          current = current.parentElement;
+        }
+        return null;
+      },
+      contains: (el) => node === el || descendants(node).includes(el),
+      getBoundingClientRect: () => ({
+        left: node.rect.left,
+        width: node.rect.width,
+        right: node.rect.left + node.rect.width,
+        top: 0,
+        bottom: 0,
+        height: 0,
+      }),
+    };
+    return node;
+  }
+
+  function append(parent: FakeEl, child: FakeEl): FakeEl {
+    parent.children.push(child);
+    child.parentElement = parent;
+    return child;
+  }
+
+  const root = el("body");
+  const documentValue = {
+    querySelector: (selector: string) => query(root, selector)[0] ?? null,
+    querySelectorAll: (selector: string) => query(root, selector),
+    documentElement: { getBoundingClientRect: () => ({ left: 0, width: 1440, right: 1440, top: 0, bottom: 0, height: 0 }) },
+  };
+  const factory = new Function(
+    "document",
+    "getComputedStyle",
+    "sendCodexPlusDiagnostic",
+    "codexPlusSettings",
+    "localStorage",
+    `${selectorsTable}
+const conversationViewMinWidth = 320;
+const conversationViewMaxAllowedWidth = 4000;
+const conversationViewDefaultWidth = 900;
+const conversationViewLegacyWidthKey = "codexPlus.threadCenter.maxWidth";
+// 夹具只需要观察 style 写入结果，原始值记录这一步用空实现顶掉。
+function conversationViewRememberOriginals() {}
+function normalizeConversationViewWidth(value) {
+  if (value === null || value === undefined || String(value).trim() === "") return null;
+  const number = Number(value);
+  if (!Number.isFinite(number)) return null;
+  return Math.max(320, Math.min(4000, Math.round(number)));
+}
+function conversationViewWidth() {
+  const settingsWidth = normalizeConversationViewWidth(codexPlusSettings().conversationViewMaxWidth);
+  if (settingsWidth) return settingsWidth;
+  const legacyWidth = normalizeConversationViewWidth(localStorage.getItem(conversationViewLegacyWidthKey));
+  return legacyWidth || 900;
+}
+${source}
+return {
+  findContent: conversationViewFindContentEl,
+  findComposer: conversationViewFindComposerEl,
+  effective: conversationViewEffectiveWidth,
+  available: conversationViewAvailableWidth,
+  apply: conversationViewApplyNativeWidth,
+};`,
+  );
+
+  const api = factory(
+    documentValue,
+    (node: FakeEl) => {
+      // 同时充当 padding 来源与 CSSStyleDeclaration：兜底的变量反查会读索引属性。
+      const style: Record<string, unknown> = {
+        paddingLeft: node.padding.left,
+        paddingRight: node.padding.right,
+        maxWidth: node.computedMaxWidth,
+        length: Object.keys(node.vars).length,
+        getPropertyValue: (name: string) => node.vars[name] ?? "",
+      };
+      Object.keys(node.vars).forEach((name, index) => { style[index] = name; });
+      return style;
+    },
+    () => undefined,
+    () => ({ conversationView: true, conversationViewMaxWidth: 900 }),
+    { getItem: () => null },
+  ) as {
+    findContent(): FakeEl | null;
+    findComposer(): FakeEl | null;
+    effective(containerWidth: number): number;
+    available(el: FakeEl): number;
+    apply(el: FakeEl, effectiveWidth: number): void;
+  };
+
+  return { root, el, append, api };
+}
+
+describe("renderer injection conversation view alignment", () => {
+  const rendererPath = new URL("../../../assets/inject/renderer-inject.js", import.meta.url);
+
+  // 夹具类名取自真实产物：
+  //   旧版内容容器 "… flex shrink-0 flex-col pb-8"
+  //   新版内容容器 "relative flex flex-1 shrink-0 flex-col"
+  //   页脚包裹层   "relative z-10 flex flex-col mx-auto w-full max-w-(--thread-content-max-width) px-toolbar"
+  const legacyContentClass = "mx-auto w-full max-w-(--thread-content-max-width) px-toolbar relative flex shrink-0 flex-col pb-8";
+  const newContentClass = "relative flex flex-1 shrink-0 flex-col";
+
+  async function buildFixture(mode: "legacy" | "modern") {
+    const runtime = conversationViewRuntime(await readFile(rendererPath, "utf8"));
+    const scroller = runtime.append(runtime.root, runtime.el("div", "thread-scroll-container"));
+    const host = runtime.append(scroller, runtime.el("div", "h-full flex"));
+    if (mode === "legacy") {
+      runtime.append(host, runtime.el("div", legacyContentClass));
+    } else {
+      // 新版：结构上只剩居中 + 满宽 + thread 宽度工具类，pb-8 已并入条件组合。
+      runtime.append(host, runtime.el(
+        "div",
+        "relative flex flex-1 shrink-0 flex-col",
+        { "data-thread-user-message-navigation-content": "" },
+      ));
+    }
+    // 页脚包裹层带同样的宽度工具类，是最容易被误认成内容容器的节点。
+    const footer = runtime.append(host, runtime.el(
+      "div",
+      "relative z-10 flex flex-col mx-auto w-full max-w-(--thread-content-max-width) px-toolbar",
+      { "data-thread-scroll-footer": "true" },
+    ));
+    runtime.append(footer, runtime.el(
+      "div",
+      "mx-auto flex w-full max-w-(--thread-body-max-width) flex-col gap-8",
+    ));
+    return { runtime, scroller, host, footer };
+  }
+
+  it("旧版类名容器仍然命中", async () => {
+    const { runtime } = await buildFixture("legacy");
+    const found = runtime.api.findContent();
+    assert.ok(found, "旧版类名应命中");
+    assert.match(found.className, /pb-8/);
+  });
+
+  // 回归点：新版 Codex 把 max-w-(--thread-content-max-width) 换成
+  // max-w-(--thread-body-max-width)、pb-8 消失后，全等匹配归零、居中宽度规则整体失效（#2258）。
+  it("新版容器结构变化后仍能命中内容容器", async () => {
+    const { runtime, footer } = await buildFixture("modern");
+    const found = runtime.api.findContent();
+    assert.ok(found, "新版类名变化后必须仍有降级路径，不能返回 null");
+    assert.notEqual(found, footer, "不能把页脚包裹层当成内容容器");
+    assert.equal(found.attrs["data-thread-user-message-navigation-content"], "");
+  });
+
+  it("作曲器优先落在页脚结构内，而不是内容容器", async () => {
+    const { runtime, footer } = await buildFixture("modern");
+    const found = runtime.api.findComposer();
+    assert.ok(found, "作曲器应命中");
+    assert.ok(found.closest("[data-thread-scroll-footer]"), "作曲器应在页脚包裹层内");
+    assert.notEqual(found, footer);
+  });
+
+  // 用途词换过好几轮（content → body），所以按形状而不是字面量识别；
+  // 与 50-navigation.js 的 ...FilterSourcePattern 同一套做法。
+  it("宽度工具类按形状识别，换用途词也认", async () => {
+    const renderer = await readFile(rendererPath, "utf8");
+    const match = renderer.match(/const conversationViewThreadWidthTokenPattern\s*=\s*\/([\s\S]*?)\/;/);
+    assert.ok(match, "未找到 conversationViewThreadWidthTokenPattern");
+    const pattern = new RegExp(match![1]);
+    for (const token of [
+      "max-w-(--thread-content-max-width)", // 旧版
+      "max-w-(--thread-body-max-width)", // 26.9xx 起
+      "max-w-(--thread-content-responsive-max-width)",
+      "md:max-w-(--thread-content-max-width)", // 带断点前缀
+    ]) {
+      assert.ok(pattern.test(token), `应命中: ${token}`);
+    }
+    // 哈希类名与无关工具类必须排掉；尤其不能把 max-w-2xl 这类固定宽度也算进来。
+    for (const token of ["max-w-2xl", "_shell_151xi_3", "max-w-full", "w-full"]) {
+      assert.ok(!pattern.test(token), `不应命中: ${token}`);
+    }
+  });
+
+  it("两处类名都不对时按 CSS 变量反查宿主节点", async () => {
+    const runtime = conversationViewRuntime(await readFile(rendererPath, "utf8"));
+    const scroller = runtime.append(runtime.root, runtime.el("div", "thread-scroll-container"));
+    const host = runtime.append(scroller, runtime.el("div", "h-full flex"));
+    // 既没有新版类名工具类，也没有 data-* 锚点，只剩 Codex 注入的 CSS 变量。
+    const bare = runtime.append(host, runtime.el("div", "some-renamed-class"));
+    bare.vars["--thread-body-max-width"] = "calc(900px + 0px)";
+    bare.computedMaxWidth = "900px";
+    const found = runtime.api.findContent();
+    assert.ok(found, "兜底候选应能反查到宿主节点");
+    assert.equal(found, bare);
+  });
+
+  it("目标全部缺失时上报诊断，不再静默 return", async () => {
+    const renderer = await readFile(rendererPath, "utf8");
+    const start = renderer.indexOf("  function conversationViewAlignNow()");
+    const end = renderer.indexOf("  function conversationViewHasRoomForHtmlCenterAt(", start);
+    assert.ok(start >= 0 && end > start);
+    const body = renderer.slice(start, end);
+    assert.match(body, /conversationViewReportMissingTargets\(\)/, "归零路径必须上报诊断");
+    assert.match(renderer, /"conversation_view_target_not_found"/);
+  });
+
+  // #2085：设置值是上限，实际宽度按容器可用宽度收敛。
+  it("容器窄于设置上限时按容器宽度收敛，宽于上限时用上限", async () => {
+    const { runtime } = await buildFixture("modern");
+    // 设置 900（夹具里 conversationViewMaxWidth = 900）。
+    assert.equal(runtime.api.effective(1400), 900, "宽容器应按设置上限");
+    assert.equal(runtime.api.effective(600), 600, "窄容器应按容器可用宽度");
+    assert.equal(runtime.api.effective(0), 900, "拿不到几何时回落设置上限");
+    assert.equal(runtime.api.effective(Number.NaN), 900);
+    // 硬下限仍是既有边界，不因自适应而改变。
+    assert.equal(runtime.api.effective(100), 320);
+  });
+
+  it("可用宽度取宿主内容盒（扣掉左右内边距）", async () => {
+    const { runtime, host } = await buildFixture("modern");
+    host.rect.width = 1000;
+    host.padding.left = "16px";
+    host.padding.right = "16px";
+    const target = runtime.api.findContent()!;
+    assert.equal(runtime.api.available(target), 968);
+    // 写进 style 的是收敛后的值，不是写死设置值。
+    runtime.api.apply(target, runtime.api.effective(runtime.api.available(target)));
+    assert.equal(target.style.maxWidth, "900px");
+    host.rect.width = 500;
+    runtime.api.apply(target, runtime.api.effective(runtime.api.available(target)));
+    assert.equal(target.style.maxWidth, "468px");
+  });
+
+  // 自适应计算必须留在既有的「先统一写 style、再统一读几何」两阶段里，
+  // 否则退回 commit 82fb0924 修掉的读-写交替强制重排。
+  it("自适应计算不引入逐元素读-写交替", async () => {
+    const renderer = await readFile(rendererPath, "utf8");
+    const start = renderer.indexOf("  function conversationViewAlignNow()");
+    const end = renderer.indexOf("  function conversationViewReportMissingTargets(", start);
+    const body = renderer.slice(start, end);
+    // 宽度读取必须集中在写之前，且是一次 map 批量读取。
+    const readIndex = body.indexOf("conversationViewAvailableWidth(el)");
+    const writeIndex = body.indexOf("conversationViewApplyNativeWidth(el");
+    assert.ok(readIndex >= 0 && writeIndex > readIndex, "读取必须在写入之前");
+    assert.match(body, /targets\.map\(\(el\) => conversationViewAvailableWidth\(el\)\)/);
   });
 });

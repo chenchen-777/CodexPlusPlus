@@ -4,6 +4,8 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::VecDeque;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -13,6 +15,99 @@ use crate::relay_rotation::{RotationContext, RotationEvent};
 use crate::settings::{RelayProtocol, SettingsStore};
 
 pub const DEFAULT_PROTOCOL_PROXY_PORT: u16 = 57321;
+
+/// 工具调用上需要跨 turn 原样带回的供应商附带数据，按 `call_id` 索引。
+///
+/// Gemini 3 系在 functionCall 上要求回传 `thought_signature`（OpenAI 兼容层放在
+/// tool_call 的 `extra_content.google.thought_signature`），缺失时整轮 400
+/// （issue #332 / #1012）。这类字段由上游产生、本仓不理解其语义，因此不硬编码
+/// 任何字段名，而是把整个 `extra_content` 原样记住，下一轮构造请求时挂回对应
+/// tool_call。只做透传，解析失败/无该字段时行为与改动前完全一致。
+///
+/// 键是 call_id：上游保证同一次调用内唯一，跨 turn 也由客户端原样回传。
+fn tool_call_extra_content_cache() -> &'static Mutex<ExtraContentCache> {
+    static CACHE: OnceLock<Mutex<ExtraContentCache>> = OnceLock::new();
+    // 缓存上限：一次会话里同时活跃的工具调用远小于此数；超出后按插入序淘汰最旧的，
+    // 避免长时间运行时无界增长。
+    CACHE.get_or_init(|| Mutex::new(ExtraContentCache::new(256)))
+}
+
+#[derive(Debug)]
+struct ExtraContentCache {
+    entries: BTreeMap<String, Value>,
+    order: VecDeque<String>,
+    capacity: usize,
+}
+
+impl ExtraContentCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            order: VecDeque::new(),
+            capacity,
+        }
+    }
+
+    fn remember(&mut self, call_id: &str, extra_content: Value) {
+        if call_id.is_empty() {
+            return;
+        }
+        if self.entries.insert(call_id.to_string(), extra_content).is_none() {
+            self.order.push_back(call_id.to_string());
+        }
+        while self.order.len() > self.capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                // 只有仍是最旧那一条时才删，避免把刚更新过的键误删。
+                if !self.order.contains(&oldest) {
+                    self.entries.remove(&oldest);
+                }
+            }
+        }
+    }
+
+    fn recall(&self, call_id: &str) -> Option<Value> {
+        self.entries.get(call_id).cloned()
+    }
+}
+
+/// 从 chat 侧的 tool_call 里取出需要透传的附带数据。
+///
+/// `extra_content` 是 OpenAI 兼容层的通用扩展位（Gemini 的 thought_signature 在此）；
+/// 部分供应商也会用 `thought_signature` / `thoughtSignature` 直接挂在 tool_call 上，
+/// 两种形态都收。
+fn tool_call_extra_content(tool_call: &Value) -> Option<Value> {
+    if let Some(value) = tool_call.get("extra_content") {
+        if value.is_object() && !value.as_object().is_some_and(Map::is_empty) {
+            return Some(value.clone());
+        }
+    }
+    for key in ["thought_signature", "thoughtSignature"] {
+        if let Some(value) = tool_call.get(key) {
+            if !value.is_null() {
+                return Some(json!({ "google": { "thought_signature": value } }));
+            }
+        }
+    }
+    None
+}
+
+/// 记住本次上游返回的工具调用附带数据（按 call_id）。
+fn remember_tool_call_extra_content(call_id: &str, tool_call: &Value) {
+    let Some(extra) = tool_call_extra_content(tool_call) else {
+        return;
+    };
+    if let Ok(mut cache) = tool_call_extra_content_cache().lock() {
+        cache.remember(call_id, extra);
+    }
+}
+
+/// 取回该 call_id 之前记住的附带数据，用于下一轮请求回传。
+fn recall_tool_call_extra_content(call_id: &str) -> Option<Value> {
+    tool_call_extra_content_cache()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.recall(call_id))
+}
 
 /// 协议代理的实际生效端口，默认 [`DEFAULT_PROTOCOL_PROXY_PORT`]，
 /// 可用环境变量 `CODEX_PLUS_PROTOCOL_PROXY_PORT` 覆盖。
@@ -197,6 +292,16 @@ impl CodexToolContext {
             == Some(CodexCustomToolKind::ToolSearch)
     }
 
+    /// 上游把 codex 的原生 `web_search` 工具当成普通自定义工具回传时，中转层
+    /// 此前一律产出 `custom_tool_call`，而客户端只认 `web_search_call`
+    /// （issue #1209 / #586：web_search 被错译成 custom_tool_call 后，客户端
+    /// 拿不到搜索结果，表现为「工具调用后无反应」或上游报 tool 名不识别）。
+    fn is_builtin_web_search_proxy(&self, upstream_name: &str) -> bool {
+        self.custom_tools.get(upstream_name).is_some_and(|spec| {
+            spec.kind == CodexCustomToolKind::BuiltIn && spec.openai_name == "web_search"
+        })
+    }
+
     fn original_custom_tool_name(&self, upstream_name: &str) -> String {
         self.custom_tools
             .get(upstream_name)
@@ -221,6 +326,46 @@ pub fn local_responses_proxy_base_url(port: u16) -> String {
     format!("http://127.0.0.1:{port}/v1")
 }
 
+#[derive(Debug)]
+pub(crate) struct UnsupportedEncryptedAgentContent;
+
+impl std::fmt::Display for UnsupportedEncryptedAgentContent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "unsupported_encrypted_agent_content: Chat Completions 上游无法处理加密的 agent 消息内容，请使用支持该协议的 Responses 上游")
+    }
+}
+
+impl std::error::Error for UnsupportedEncryptedAgentContent {}
+
+impl UnsupportedEncryptedAgentContent {
+    pub(crate) fn response_body(&self) -> Value {
+        json!({"error":{
+            "type":"invalid_request_error",
+            "code":"unsupported_encrypted_agent_content",
+            "param":"input",
+            "message":self.to_string()
+        }})
+    }
+}
+
+fn input_has_encrypted_agent_content(input: &Value) -> bool {
+    fn item_has_encrypted_content(item: &Value) -> bool {
+        item.get("type").and_then(Value::as_str) == Some("encrypted_content")
+            || item.get("content").is_some_and(|content| match content {
+                Value::Array(parts) => parts.iter().any(|part| {
+                    part.get("type").and_then(Value::as_str) == Some("encrypted_content")
+                }),
+                Value::Object(_) => content.get("type").and_then(Value::as_str) == Some("encrypted_content"),
+                _ => false,
+            })
+    }
+    match input {
+        Value::Array(items) => items.iter().any(item_has_encrypted_content),
+        Value::Object(_) => item_has_encrypted_content(input),
+        _ => false,
+    }
+}
+
 pub fn responses_to_chat_completions(body: Value) -> anyhow::Result<Value> {
     responses_to_chat_completions_with_options(body, false)
 }
@@ -229,6 +374,11 @@ pub fn responses_to_chat_completions_with_options(
     body: Value,
     standard: bool,
 ) -> anyhow::Result<Value> {
+    // agent 加密内容没有 Chat 文本映射。发送前明确拒绝；不按字段名猜测明文，
+    // 也不遍历工具参数/输出里的用户 JSON。reasoning 和 compaction 保持原契约。
+    if body.get("input").is_some_and(input_has_encrypted_agent_content) {
+        return Err(UnsupportedEncryptedAgentContent.into());
+    }
     let mut result = json!({});
 
     if let Some(model) = body.get("model") {
@@ -246,16 +396,20 @@ pub fn responses_to_chat_completions_with_options(
     if let Some(input) = body.get("input") {
         append_responses_input(input, &mut messages);
     }
+    // 必须在 enforce_tool_call_pairing 之前：配对一旦被错误摘除就无法恢复。
+    relocate_interleaved_non_tool_messages(&mut messages);
     enforce_tool_call_pairing(&mut messages);
+    // 配对判定之后仍有无主 tool 消息（上游会直接 400），降级成 user 保住内容。
+    degrade_unpaired_tool_messages(&mut messages);
     // 必须在 enforce_tool_call_pairing 之后：它依赖 tool 消息的连续性，
     // 而这一步会往中间插入 user 消息。
     relocate_tool_output_images(&mut messages);
     ensure_tool_call_reasoning_content(&mut messages);
     normalize_chat_messages(&mut messages);
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("");
+    normalize_image_data_urls_for_model(&mut messages, model);
     let messages = collapse_system_messages_to_head(messages);
     result["messages"] = json!(messages);
-
-    let model = body.get("model").and_then(Value::as_str).unwrap_or("");
     if let Some(value) = body.get("max_output_tokens") {
         if is_openai_o_series(model) {
             result["max_completion_tokens"] = value.clone();
@@ -415,6 +569,14 @@ pub struct UpstreamProxyResponse {
     pub(crate) _channel_permit: Option<crate::channel_protection::ChannelPermit>,
 }
 
+/// 客户端会话头白名单；不接受鉴权或任意其他客户端请求头。
+#[derive(Clone, Copy, Default)]
+pub struct ProxySessionHeaders<'a> {
+    pub session_id: Option<&'a str>,
+    pub thread_id: Option<&'a str>,
+    pub opencode_session: Option<&'a str>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum UpstreamWireApi {
     Responses,
@@ -487,6 +649,137 @@ pub struct ChatSseToResponsesConverter {
     utf8_remainder: Vec<u8>,
     state: ChatSseState,
     failed: bool,
+}
+
+/// 原生 Responses 只旁路观察终止事件，不改写任何响应字节，也不保存诊断正文。
+/// 只保留每个事件的有限前缀，避免图片等大 payload 令诊断缓冲无界增长。
+#[derive(Default)]
+pub(crate) struct NativeResponsesSseObserver {
+    event_prefix: Vec<u8>,
+    event_tail: [u8; 4],
+    event_too_large: bool,
+    unclassified_large_event: bool,
+    completed: bool,
+    failure: Option<&'static str>,
+}
+
+const NATIVE_SSE_DIAGNOSTIC_PREFIX_LIMIT: usize = 64 * 1024;
+
+impl NativeResponsesSseObserver {
+    pub(crate) fn push_bytes(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            if self.event_prefix.len() < NATIVE_SSE_DIAGNOSTIC_PREFIX_LIMIT {
+                self.event_prefix.push(*byte);
+            } else {
+                self.event_too_large = true;
+            }
+            self.event_tail.rotate_left(1);
+            self.event_tail[3] = *byte;
+            if self.event_tail.ends_with(b"\n\n") || self.event_tail == *b"\r\n\r\n" {
+                self.observe_event();
+                self.event_prefix.clear();
+                self.event_tail = [0; 4];
+                self.event_too_large = false;
+            }
+        }
+    }
+
+    fn observe_event(&mut self) {
+        let prefix = String::from_utf8_lossy(&self.event_prefix);
+        let event_name = prefix.lines().find_map(|line| strip_sse_field(line, "event"));
+        let data = prefix.lines().filter_map(|line| strip_sse_field(line, "data"))
+            .collect::<Vec<_>>().join("\n");
+        // 只观察已完整解析的顶层 type；后续大 payload 超过前缀上限时，
+        // 忽略其解析错误，保留此前读到的类型。它不是原生响应的有效性校验器。
+        struct EventType<'a>(&'a mut Option<String>);
+        impl<'de> serde::de::Visitor<'de> for EventType<'_> {
+            type Value = ();
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an SSE event object")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(self, mut map: M) -> Result<Self::Value, M::Error> {
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "type" {
+                        *self.0 = Some(map.next_value::<String>()?);
+                    } else {
+                        map.next_value::<serde::de::IgnoredAny>()?;
+                    }
+                }
+                Ok(())
+            }
+        }
+        let mut deserializer = serde_json::Deserializer::from_str(&data);
+        let mut event_type = None;
+        let _ = serde::Deserializer::deserialize_map(&mut deserializer, EventType(&mut event_type));
+        match event_type.as_deref().or(event_name.map(str::trim)) {
+            Some("response.completed") => self.completed = true,
+            Some("response.failed") => self.failure = Some("原生 Responses 上游返回 response.failed"),
+            Some("response.incomplete") => self.failure = Some("原生 Responses 上游返回 response.incomplete"),
+            Some("error") => self.failure = Some("原生 Responses 上游返回 error 事件"),
+            None if self.event_too_large => self.unclassified_large_event = true,
+            _ => {}
+        }
+    }
+
+    pub(crate) fn finish(self) -> Option<String> {
+        // failed/incomplete 优先于 completed；[DONE] 或 HTTP EOF 都不能证明成功。
+        self.failure.or_else(|| {
+            if self.completed {
+                None
+            } else if self.unclassified_large_event {
+                Some("原生 Responses 流终止状态未知（诊断事件超限），未观察到完成事件")
+            } else {
+                Some("原生 Responses 上游在完成事件前结束了响应流")
+            }
+        }).map(str::to_string)
+    }
+}
+
+#[cfg(test)]
+mod native_responses_observer_tests {
+    use super::{NativeResponsesSseObserver, NATIVE_SSE_DIAGNOSTIC_PREFIX_LIMIT};
+
+    #[test]
+    fn fragmented_crlf_and_data_only_terminal_events_are_observed() {
+        for payload in [
+            "event: response.completed\r\ndata: {\"type\":\"response.completed\",\"text\":\"摘要\"}\r\n\r\n",
+            "data: {\"response\":{},\"type\":\"response.completed\"}\n\n",
+        ] {
+            let mut observer = NativeResponsesSseObserver::default();
+            for byte in payload.as_bytes().chunks(1) {
+                observer.push_bytes(byte);
+            }
+            assert!(observer.finish().is_none());
+        }
+    }
+
+    #[test]
+    fn large_payloads_keep_diagnostic_memory_bounded_and_allow_terminal_observation() {
+        for prefix in ["event: response.completed\ndata: {\"output\":\"", "data: {\"type\":\"response.completed\",\"output\":\""] {
+            let mut observer = NativeResponsesSseObserver::default();
+            observer.push_bytes(prefix.as_bytes());
+            observer.push_bytes(&vec![b'x'; NATIVE_SSE_DIAGNOSTIC_PREFIX_LIMIT * 2]);
+            assert!(observer.event_prefix.len() <= NATIVE_SSE_DIAGNOSTIC_PREFIX_LIMIT);
+            observer.push_bytes(b"\"}\n\n");
+            assert!(observer.finish().is_none());
+        }
+    }
+
+    #[test]
+    fn failed_event_after_completed_still_reports_fixed_failure_without_payload() {
+        let mut observer = NativeResponsesSseObserver::default();
+        observer.push_bytes(b"data: {\"type\":\"response.completed\"}\n\ndata: {\"type\":\"response.failed\",\"error\":\"private-payload\"}\n\n");
+        assert_eq!(observer.finish().as_deref(), Some("原生 Responses 上游返回 response.failed"));
+    }
+
+    #[test]
+    fn unclassified_large_event_reports_unknown_state_without_payload() {
+        let mut observer = NativeResponsesSseObserver::default();
+        observer.push_bytes(b"data: {\"output\":\"");
+        observer.push_bytes(&vec![b'x'; NATIVE_SSE_DIAGNOSTIC_PREFIX_LIMIT * 2]);
+        observer.push_bytes(b"\",\"type\":\"response.completed\"}\n\n");
+        assert!(observer.finish().unwrap().contains("状态未知"));
+    }
 }
 
 /// codex v2 远程压缩的响应包装器：把上游摘要文本（无论 Responses 还是
@@ -866,6 +1159,14 @@ impl Default for ChatSseToResponsesConverter {
 }
 
 impl ChatSseToResponsesConverter {
+    pub fn has_failed(&self) -> bool {
+        self.failed
+    }
+
+    pub fn has_terminal_event(&self) -> bool {
+        self.failed || self.state.completed || self.state.finish_reason.is_some()
+    }
+
     pub fn with_request(original_request: &Value) -> Self {
         Self {
             state: ChatSseState::with_request(original_request),
@@ -1041,6 +1342,23 @@ pub async fn open_responses_proxy_request_for_path_with_beta(
     request_path: &str,
     beta_features: Option<&str>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
+    open_responses_proxy_request_for_path_with_session_headers(
+        body,
+        original_user_agent,
+        request_path,
+        beta_features,
+        ProxySessionHeaders::default(),
+    )
+    .await
+}
+
+pub async fn open_responses_proxy_request_for_path_with_session_headers(
+    body: &str,
+    original_user_agent: Option<&str>,
+    request_path: &str,
+    beta_features: Option<&str>,
+    session_headers: ProxySessionHeaders<'_>,
+) -> anyhow::Result<UpstreamProxyResponse> {
     let settings = SettingsStore::default().load().unwrap_or_default();
     open_responses_proxy_request_with_settings_and_user_agent(
         body,
@@ -1048,6 +1366,7 @@ pub async fn open_responses_proxy_request_for_path_with_beta(
         original_user_agent,
         request_path,
         beta_features,
+        session_headers,
     )
     .await
 }
@@ -1062,6 +1381,7 @@ pub async fn open_responses_proxy_request_with_settings(
         None,
         "/responses",
         None,
+        ProxySessionHeaders::default(),
     )
     .await
 }
@@ -1077,6 +1397,7 @@ pub async fn open_responses_proxy_request_with_settings_for_path(
         None,
         request_path,
         None,
+        ProxySessionHeaders::default(),
     )
     .await
 }
@@ -1087,12 +1408,30 @@ pub async fn open_responses_proxy_request_with_settings_for_path_and_beta(
     request_path: &str,
     beta_features: Option<&str>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
+    open_responses_proxy_request_with_settings_for_path_and_session_headers(
+        body,
+        settings,
+        request_path,
+        beta_features,
+        ProxySessionHeaders::default(),
+    )
+    .await
+}
+
+pub async fn open_responses_proxy_request_with_settings_for_path_and_session_headers(
+    body: &str,
+    settings: crate::settings::BackendSettings,
+    request_path: &str,
+    beta_features: Option<&str>,
+    session_headers: ProxySessionHeaders<'_>,
+) -> anyhow::Result<UpstreamProxyResponse> {
     open_responses_proxy_request_with_settings_and_user_agent(
         body,
         settings,
         None,
         request_path,
         beta_features,
+        session_headers,
     )
     .await
 }
@@ -1103,6 +1442,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
     original_user_agent: Option<&str>,
     request_path: &str,
     beta_features: Option<&str>,
+    session_headers: ProxySessionHeaders<'_>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
     let mut request_json: Value = serde_json::from_str(body)?;
     let is_stream = request_json
@@ -1188,6 +1528,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
             is_stream,
             &upstream_body,
         );
+        builder = with_client_session_headers(builder, &relay, session_headers);
         if wire_api == UpstreamWireApi::Responses {
             if let Some(value) = beta_features.filter(|value| !value.is_empty()) {
                 builder = builder.header("x-codex-beta-features", value);
@@ -1832,6 +2173,34 @@ fn with_relay_auth(
 ) -> reqwest::RequestBuilder {
     // 认证（API Key / 无认证）+ 供应商自定义请求头，统一在 relay_headers 里决定优先级。
     crate::relay_headers::apply(request, relay)
+}
+
+fn with_client_session_headers(
+    mut builder: reqwest::RequestBuilder,
+    relay: &crate::settings::RelayProfile,
+    headers: ProxySessionHeaders<'_>,
+) -> reqwest::RequestBuilder {
+    for (name, value) in [
+        ("session-id", headers.session_id),
+        ("thread-id", headers.thread_id),
+        ("x-opencode-session", headers.opencode_session),
+    ] {
+        // 显式供应商配置优先，避免 reqwest 追加出两个同名头。
+        if relay
+            .custom_headers
+            .iter()
+            .any(|header| header.key.trim().eq_ignore_ascii_case(name))
+        {
+            continue;
+        }
+        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        if let Ok(value) = reqwest::header::HeaderValue::from_str(value) {
+            builder = builder.header(name, value);
+        }
+    }
+    builder
 }
 
 fn conversation_id_from_responses_request(body: &Value) -> Option<String> {
@@ -2531,6 +2900,11 @@ impl ChatSseState {
             if let Some(id) = id_delta {
                 state.call_id = id;
             }
+            // 流式场景下 thought_signature/extra_content 通常随首个分片到达，
+            // 此时 call_id 已就位；按 call_id 记住，供下一轮回传（issue #332/#1012）。
+            if !state.call_id.is_empty() {
+                remember_tool_call_extra_content(&state.call_id, tool_call);
+            }
             if let Some(name) = name_delta {
                 if !name.is_empty() {
                     state.name = name;
@@ -3147,6 +3521,13 @@ fn append_responses_item(
                     "arguments": responses_arguments_to_chat(item.get("arguments").unwrap_or(&json!({})))
                 }
             }));
+            // 把上一轮上游附带的透传数据挂回（Gemini thought_signature 等）。
+            // 缺失时保持原样，不影响其它供应商。
+            if let Some(extra) = recall_tool_call_extra_content(call_id) {
+                if let Some(last) = pending_tool_calls.last_mut() {
+                    last["extra_content"] = extra;
+                }
+            }
         }
         Some("function_call_output") => {
             let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
@@ -3374,6 +3755,114 @@ fn orphan_tool_output_message(call_id: &str, output: &Value) -> Value {
 ///
 /// 这里把没有配对 output 的 tool_call 从消息里摘掉，降级成文本保留在历史中，
 /// 避免丢失「模型曾试图调用某工具」这一信息。
+/// 把插在「连续 tool 结果」之间的非 tool 消息整体搬到该 tool 区之后
+/// （issue #2275 / #2257）。
+///
+/// 上游 codex 会把 `<image_resize_notice>` 这类提示以 developer（映射成 system）
+/// 或 user 消息的形式插在两条 tool 结果之间，形成夹心结构：
+/// `assistant(tool_calls=[a,b]) → tool(a) → developer → tool(b)`。
+/// `enforce_tool_call_pairing` 用 `take_while` 只收集「role 连续为 tool」的后续消息，
+/// 数到夹心就停，于是 followers 只有 1 条、`b` 被误判 orphaned 并从 `tool_calls`
+/// 摘掉，但 `b` 的 tool 消息还留在原地 —— 这正是「role 'tool' 无前置 tool_calls」
+/// 与「No tool output found for tool call」的来源。
+///
+/// 这里在配对判定**之前**把夹心消息移到 tool 区之后，使 tool 结果重新连续。
+/// system 形态的夹心会被后续的 `collapse_system_messages_to_head` 带到头部（合法），
+/// user 形态的则留在 tool 区之后（同样合法）。
+fn relocate_interleaved_non_tool_messages(messages: &mut Vec<Value>) {
+    let mut index = 0;
+    while index < messages.len() {
+        let Some(tool_calls) = messages[index].get("tool_calls").and_then(Value::as_array) else {
+            index += 1;
+            continue;
+        };
+        let mut unanswered: BTreeSet<String> = tool_calls
+            .iter()
+            .filter_map(|tool_call| tool_call.get("id").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect();
+        if unanswered.is_empty() {
+            index += 1;
+            continue;
+        }
+
+        // 从本条 assistant 往后扫，收集本轮的所有 tool 结果与夹在其中的非 tool 消息，
+        // 直到 tool_call 集合配齐、撞上下一条 assistant（新轮次，不能越界）、或到底。
+        let mut tool_messages: Vec<Value> = Vec::new();
+        let mut interleaved: Vec<Value> = Vec::new();
+        let mut scan = index + 1;
+        while scan < messages.len() {
+            let role = messages[scan].get("role").and_then(Value::as_str);
+            if role == Some("assistant") {
+                break;
+            }
+            if role == Some("tool") {
+                if let Some(id) = messages[scan].get("tool_call_id").and_then(Value::as_str) {
+                    unanswered.remove(id);
+                }
+                tool_messages.push(messages[scan].clone());
+            } else if !tool_messages.is_empty() {
+                // 只有已经收到过 tool 结果之后的夹心才值得搬：
+                // 本条 assistant 尚未收到任何结果时，中间的消息是正常历史，不是夹心。
+                interleaved.push(messages[scan].clone());
+            }
+            scan += 1;
+            if unanswered.is_empty() {
+                break;
+            }
+        }
+
+        if interleaved.is_empty() {
+            index += 1;
+            continue;
+        }
+
+        // 重建这段区间：tool 结果。配齐时）在前、夹心消息在后。
+        let rebuilt: Vec<Value> = tool_messages.into_iter().chain(interleaved).collect();
+        let rebuilt_len = rebuilt.len();
+        messages.splice(index + 1..scan, rebuilt);
+        // 跳过刚重建的区间，避免在搬动过的消息上重复扫描导致死循环。
+        index += 1 + rebuilt_len;
+    }
+}
+
+/// 把没有前置 `tool_calls` 的 tool 消息降级成 user（issue #2275 / #2257 的防线）。
+///
+/// `enforce_tool_call_pairing` 目前只清理 assistant 侧（把 orphaned 的 tool_call
+/// 从 `tool_calls` 摘掉），被摘掉的那些 tool 消息本身仍留在原位，上游会直接
+/// 400「No tool output found for tool call」。这里把它们降级成 user，保住内容
+/// 且不再触发协议错误。
+fn degrade_unpaired_tool_messages(messages: &mut [Value]) {
+    let mut known: BTreeSet<String> = BTreeSet::new();
+    for message in messages.iter() {
+        if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+            for tool_call in tool_calls {
+                if let Some(id) = tool_call.get("id").and_then(Value::as_str) {
+                    known.insert(id.to_string());
+                }
+            }
+        }
+    }
+
+    for message in messages.iter_mut() {
+        if message.get("role").and_then(Value::as_str) != Some("tool") {
+            continue;
+        }
+        let paired = message
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| known.contains(id));
+        if paired {
+            continue;
+        }
+        let content = message.get("content").cloned().unwrap_or(Value::Null);
+        *message = json!({
+            "role": "user",
+            "content": content
+        });
+    }
+}
+
 fn enforce_tool_call_pairing(messages: &mut [Value]) {
     let mut index = 0;
     while index < messages.len() {
@@ -3598,18 +4087,42 @@ fn normalize_chat_messages(messages: &mut [Value]) {
     }
 }
 
+/// 把所有 system 消息折叠成一条、前置到数组头部。
+///
+/// 之前只处理 content 是字符串的 system 消息：数组形态（content parts）与 null
+/// 的会原样留在**原位**，于是出现「system 不在最前」——MiniMax 这类上游会直接
+/// 拒绝（issue #1394 / #410）；空内容的 system 也照样发出去。
+/// 现在无论 content 是什么形态都统一收拢，空的直接丢弃。
+/// 取出 system 消息的纯文本：字符串直接返回，content parts 数组把 text 段拼起来，
+/// 其余形态（null / 对象）按空处理。
+fn system_message_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| {
+                part.get("text")
+                    .and_then(Value::as_str)
+                    .or_else(|| part.as_str())
+            })
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        _ => String::new(),
+    }
+}
+
 fn collapse_system_messages_to_head(messages: Vec<Value>) -> Vec<Value> {
     let mut system_chunks = Vec::new();
     let mut rest = Vec::with_capacity(messages.len());
 
     for message in messages {
         if message.get("role").and_then(Value::as_str) == Some("system") {
-            if let Some(text) = message.get("content").and_then(Value::as_str) {
-                if !text.trim().is_empty() {
-                    system_chunks.push(text.to_string());
-                }
-                continue;
+            let text = system_message_text(message.get("content"));
+            if !text.trim().is_empty() {
+                system_chunks.push(text);
             }
+            continue;
         }
         rest.push(message);
     }
@@ -3648,6 +4161,19 @@ fn flush_tool_calls(
     if let Some(last) = messages.last_mut() {
         if last.get("role").and_then(Value::as_str) == Some("assistant") {
             merge_tool_calls_into_message(last, std::mem::take(pending_tool_calls));
+            // 合并路径同样要消费 pending_reasoning（issue #2210）。
+            // 触发时序：reasoning item → 不带 tool_calls 的 assistant 文本消息
+            // （pending_tool_calls 为空，reasoning 被附加到该文本消息并 take）→
+            // function_call。此时最后一条已是 assistant，走本分支提前 return，
+            // 若这里不追加，随后的 reasoning 就随函数返回被静默丢弃；
+            // 而 ensure_tool_call_reasoning_content 只补 content 与
+            // reasoning_content 同时为空的占位，content 非空时补不上。
+            if !pending_reasoning.is_empty() {
+                append_reasoning_to_assistant_message(
+                    last,
+                    &std::mem::take(pending_reasoning).join("\n"),
+                );
+            }
             return;
         }
     }
@@ -4191,7 +4717,187 @@ fn normalize_chat_tool_parameters(parameters: &Value) -> Value {
             normalized["required"] = json!([]);
         }
     }
-    inline_ref_siblings(&normalized)
+    let normalized = inline_ref_siblings(&normalized);
+    // 必须先内联再摊平：合并分支时 $defs 已摊开才拿得到真实属性（issue #2367）。
+    flatten_top_level_combinators(normalized)
+}
+
+/// JSON Schema 的顶层组合器（`oneOf` / `anyOf` / `allOf`）。
+const SCHEMA_COMBINATOR_KEYS: [&str; 3] = ["oneOf", "anyOf", "allOf"];
+
+/// 摊平工具 schema **顶层**的组合器（issue #2367）。
+///
+/// zod-to-json-schema 会生成形如
+/// `{type:"object", properties:{}, oneOf:[{$ref:"#/$defs/__schema0"},…], $defs:{…}}`
+/// 的 schema。部分上游（Anthropic 系）拒绝顶层 `oneOf`，直接整轮 400、模型完全不可用。
+/// 全仓原本对 `oneOf` 零处理。
+///
+/// 策略（保守优先，绝不让整轮失败）：
+/// 1. 顶层有组合器时，逐分支归一化后再摊平；
+/// 2. `properties` 取各分支并集，同名属性都是 object 时递归合并其 properties；
+///    `required` 取交集（只有所有分支都要求才算必须）；
+/// 3. 剥掉组合器键，补回 `type:"object"`；
+/// 4. 无法摊平（分支不是对象、合并后 properties 为空）时把各分支塞进一个带
+///    description 的私有字段，保住信息且 schema 仍合法；
+/// 5. 结果仍不是合法对象 schema 时原样返回——宁可交给上游判断，也不静默丢掉工具。
+fn flatten_top_level_combinators(schema: Value) -> Value {
+    let Some(object) = schema.as_object() else {
+        return schema;
+    };
+    let Some((key, branches)) = SCHEMA_COMBINATOR_KEYS
+        .iter()
+        .find_map(|key| object.get(*key).and_then(Value::as_array).map(|a| (*key, a)))
+    else {
+        return schema;
+    };
+    if branches.is_empty() {
+        return schema;
+    }
+
+    // 分支常是裸 `$ref`（`{ "$ref": "#/$defs/__schema0" }`），它自己不带 `$defs`，
+    // 所以必须拿**父级**的 $defs 来解析——只对分支单独调 inline_ref_siblings
+    // 永远解析不出来（实测：分支落进降级路径，properties 为空）。
+    let defs = object.get("$defs").and_then(Value::as_object);
+
+    let mut properties = Map::new();
+    let mut required: Option<BTreeSet<String>> = None;
+    let mut flattenable = true;
+
+    for branch in branches {
+        let normalized = match resolve_local_definition(
+            branch
+                .get("$ref")
+                .and_then(Value::as_str)
+                .and_then(local_definition_name)
+                .unwrap_or(""),
+            defs,
+            &mut Vec::new(),
+        ) {
+            // 分支是裸 $ref：用父级 $defs 解析出真实 schema。
+            Ok(Some(resolved)) if branch.as_object().is_some_and(|o| o.len() == 1) => {
+                normalize_schema_value(&resolved, defs, &mut Vec::new()).unwrap_or(resolved)
+            }
+            _ => inline_ref_siblings(branch),
+        };
+        let Some(branch_object) = normalized.as_object() else {
+            flattenable = false;
+            break;
+        };
+        let branch_properties = branch_object.get("properties").and_then(Value::as_object);
+        let branch_required: BTreeSet<String> = branch_object
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // 分支没有 properties 时（例如 type:"string"）无法并入对象 schema。
+        if branch_properties.is_none() && !branch_required.is_empty() {
+            flattenable = false;
+            break;
+        }
+        for (name, value) in branch_properties.into_iter().flatten() {
+            merge_schema_property(&mut properties, name, value);
+        }
+        required = Some(match required {
+            None => branch_required,
+            Some(current) => current.intersection(&branch_required).cloned().collect(),
+        });
+    }
+
+    if !flattenable || properties.is_empty() {
+        // 降级：把分支原样塞进一个带说明的字段，schema 依然合法。
+        let mut fallback = object.clone();
+        fallback.insert(
+            "type".to_string(),
+            json!("object"),
+        );
+        fallback.insert("properties".to_string(), json!({}));
+        let mut description: Vec<String> = Vec::new();
+        for branch in branches {
+            if let Some(text) = branch.get("description").and_then(Value::as_str) {
+                if !text.trim().is_empty() {
+                    description.push(text.trim().to_string());
+                }
+            }
+        }
+        fallback.insert(
+            "x-merged-combinator".to_string(),
+            json!({
+                "kind": key,
+                "branches": branches,
+                "description": description.join("\n")
+            }),
+        );
+        for combinator in SCHEMA_COMBINATOR_KEYS {
+            fallback.remove(combinator);
+        }
+        return Value::Object(fallback);
+    }
+
+    let mut flattened = object.clone();
+    for combinator in SCHEMA_COMBINATOR_KEYS {
+        flattened.remove(combinator);
+    }
+    flattened.insert("type".to_string(), json!("object"));
+    flattened.insert("properties".to_string(), Value::Object(properties));
+    flattened.insert(
+        "required".to_string(),
+        json!(required
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<Vec<_>>()),
+    );
+    Value::Object(flattened)
+}
+
+/// 把分支属性并入目标 properties；同名且两侧都是 object schema 时递归合并
+/// （properties 并集、required 取交集），否则保留先到的一方（非破坏性）。
+fn merge_schema_property(properties: &mut Map<String, Value>, name: &str, value: &Value) {
+    let Some(existing) = properties.get_mut(name) else {
+        properties.insert(name.to_string(), value.clone());
+        return;
+    };
+    let (Some(left), Some(right)) = (existing.as_object(), value.as_object()) else {
+        return;
+    };
+    if left.get("properties").is_none() || right.get("properties").is_none() {
+        return;
+    }
+    let mut merged = left.clone();
+    let mut merged_properties = left
+        .get("properties")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    for (child_name, child_value) in right.get("properties").and_then(Value::as_object).into_iter().flatten() {
+        merge_schema_property(&mut merged_properties, child_name, child_value);
+    }
+    merged.insert("properties".to_string(), Value::Object(merged_properties));
+
+    let left_required: BTreeSet<String> = left
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default();
+    let right_required: BTreeSet<String> = right
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default();
+    merged.insert(
+        "required".to_string(),
+        json!(left_required
+            .intersection(&right_required)
+            .cloned()
+            .collect::<Vec<_>>()),
+    );
+    *existing = Value::Object(merged);
 }
 
 fn inline_ref_siblings(root: &Value) -> Value {
@@ -4754,6 +5460,9 @@ fn chat_tool_call_to_response_item(
     let function = tool_call.get("function").unwrap_or(&Value::Null);
     let name = function.get("name").and_then(Value::as_str).unwrap_or("");
     let arguments = responses_arguments_to_chat(function.get("arguments").unwrap_or(&json!({})));
+    // 记住供应商在本轮工具调用上附带的透传数据（Gemini thought_signature 等），
+    // 下一轮构造请求时挂回，否则整轮 400（issue #332 / #1012）。
+    remember_tool_call_extra_content(&call_id, tool_call);
     response_tool_call_item(&call_id, name, &arguments, tool_context)
 }
 
@@ -4780,6 +5489,21 @@ fn tool_call_added_item(
     output_index: u32,
     tool_context: &CodexToolContext,
 ) -> Value {
+    if tool_context.is_builtin_web_search_proxy(&state.name) {
+        // 客户端只认 web_search_call；用 custom_tool_call 会被当作未知工具丢弃，
+        // 上游那轮的搜索结果就再也回不到会话里（issue #1209 / #586）。
+        return json!({
+            "type": "response.output_item.added",
+            "output_index": output_index,
+            "item": {
+                "id": web_search_item_id(&state.call_id),
+                "type": "web_search_call",
+                "status": "in_progress",
+                "call_id": state.call_id,
+                "action": web_search_action_from_arguments(&state.arguments)
+            }
+        });
+    }
     if tool_context.is_custom_tool_proxy(&state.name) {
         if tool_context.is_tool_search_proxy(&state.name) {
             return json!({
@@ -4834,8 +5558,11 @@ fn push_tool_call_delta_sse(
     delta: &str,
     tool_context: &CodexToolContext,
 ) {
-    if tool_context.is_tool_search_proxy(&state.name) {
-        // tool_search 走 function 参数流，客户端按 tool_search_call.arguments 聚合。
+    if tool_context.is_tool_search_proxy(&state.name)
+        || tool_context.is_builtin_web_search_proxy(&state.name)
+    {
+        // tool_search 与原生 web_search 都走 function 参数流，客户端按
+        // tool_search_call.arguments / web_search_call 聚合。
         push_sse(
             output,
             "response.function_call_arguments.delta",
@@ -4921,6 +5648,16 @@ fn response_tool_call_item(
     arguments: &str,
     tool_context: &CodexToolContext,
 ) -> Value {
+    if tool_context.is_builtin_web_search_proxy(name) {
+        // 客户端只认 web_search_call，custom_tool_call 会被当作未知工具丢弃。
+        return json!({
+            "id": web_search_item_id(call_id),
+            "type": "web_search_call",
+            "status": "completed",
+            "call_id": call_id,
+            "action": web_search_action_from_arguments(arguments)
+        });
+    }
     if tool_context.is_custom_tool_proxy(name) {
         if tool_context.is_tool_search_proxy(name) {
             // 官方客户端的 tool_search handler 只接受 tool_search_call item，
@@ -4959,7 +5696,61 @@ fn response_tool_call_item(
     item
 }
 
+/// 官方客户端给 `web_search_call` 分配的 item id 前缀（见 codex id_prefix）。
+fn web_search_item_id(call_id: &str) -> String {
+    format!("ws_{call_id}")
+}
+
+/// 把上游 web_search 工具调用的 arguments 映射成客户端 action 结构。
+///
+/// 客户端 rollout 里的形态是 `{"type":"search","query":…,"queries":[…]}` 或
+/// `{"type":"open_page","url":…}`。上游各家字段名不一（query / queries / url），
+/// 这里按存在性择一，都取不到就退化成 `{"type":"search"}`，让客户端自己判空。
+fn web_search_action_from_arguments(arguments: &str) -> Value {
+    let parsed = responses_arguments_to_chat_parse(arguments);
+    let query = parsed
+        .get("query")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let url = parsed
+        .get("url")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    if let Some(url) = url {
+        return json!({ "type": "open_page", "url": url });
+    }
+    let queries = parsed
+        .get("queries")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|value| json!(value))
+                .collect::<Vec<_>>()
+        })
+        .filter(|items| !items.is_empty());
+    match (query, queries) {
+        (Some(query), Some(queries)) => {
+            json!({ "type": "search", "query": query, "queries": queries })
+        }
+        (Some(query), None) => json!({ "type": "search", "query": query }),
+        (None, Some(queries)) => {
+            let first = queries
+                .first()
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            json!({ "type": "search", "query": first, "queries": queries })
+        }
+        (None, None) => json!({ "type": "search" }),
+    }
+}
+
 fn tool_call_item_id(call_id: &str, name: &str, tool_context: &CodexToolContext) -> String {
+    if tool_context.is_builtin_web_search_proxy(name) {
+        return web_search_item_id(call_id);
+    }
     let prefix = if tool_context.is_custom_tool_proxy(name) {
         if tool_context.is_tool_search_proxy(name) {
             // 官方客户端给 tool_search_call 分配的 item id 前缀（见 codex id_prefix）。
@@ -5271,6 +6062,60 @@ fn response_output_text(value: &Value) -> String {
 }
 
 const IMAGE_DATA_URL_PREFIX: &str = "data:image/";
+
+/// 这些上游只接受**纯 base64**，不认 `data:image/png;base64,` 前缀，收到就 400
+/// （issue #2031：GLM-5.3-Flash 的本地图片被拒）。只对这类供应商剥离前缀，
+/// 标准 data URL 上游（OpenAI 等）保持原样，免得把能用的改坏。
+fn upstream_needs_bare_base64(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.starts_with("glm-") || model.starts_with("zhipu") || model.contains("/glm-")
+}
+
+/// 就地改写 messages 里 `image_url` 的 url：对需要纯 base64 的模型剥掉 data URL 前缀。
+fn normalize_image_data_urls_for_model(messages: &mut [Value], model: &str) {
+    if !upstream_needs_bare_base64(model) {
+        return;
+    }
+    for message in messages.iter_mut() {
+        let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for part in parts.iter_mut() {
+            if !is_image_part(part) {
+                continue;
+            }
+            let Some(url) = part
+                .get_mut("image_url")
+                .and_then(|value| {
+                    if value.is_object() {
+                        value.get_mut("url")
+                    } else {
+                        Some(value)
+                    }
+                })
+                .and_then(|value| value.as_str().map(str::to_string))
+            else {
+                continue;
+            };
+            let Some(bare) = strip_data_url_prefix(&url) else {
+                continue;
+            };
+            let target = part.get_mut("image_url").expect("checked above");
+            if target.is_object() {
+                target["url"] = json!(bare);
+            } else {
+                *target = json!(bare);
+            }
+        }
+    }
+}
+
+/// `data:image/png;base64,AAAA` → `AAAA`；不是 data URL 则返回 `None`。
+fn strip_data_url_prefix(url: &str) -> Option<String> {
+    let rest = url.strip_prefix(IMAGE_DATA_URL_PREFIX)?;
+    let (_, payload) = rest.split_once(";base64,")?;
+    Some(payload.to_string())
+}
 
 /// 若 `text` 含 base64 图片 data URL，返回替换成占位符后的文本；否则 `None`。
 fn redact_image_data_urls(text: &str) -> Option<String> {

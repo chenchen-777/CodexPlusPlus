@@ -1,7 +1,10 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
+
+#[cfg(any(target_os = "macos", test))]
+pub mod macos;
 
 pub const DEFAULT_REPOSITORY: &str = "chenchen-777/CodexPlusPlus";
 pub const DEFAULT_LATEST_JSON_URL: &str =
@@ -243,8 +246,69 @@ pub async fn perform_update(
                 })?
         }
     };
-    let installer_path = download_asset_to(release, &bytes, download_dir)?;
-    launch_installer(&installer_path)?;
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "update.download.completed",
+        json!({
+            "version": release.version,
+            "assetName": release.asset_name,
+            "bytes": bytes.len()
+        }),
+    );
+    let installer_path = match download_asset_to(release, &bytes, download_dir) {
+        Ok(path) => path,
+        Err(error) => {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "update.write.failed",
+                json!({
+                    "version": release.version,
+                    "assetName": release.asset_name,
+                    "downloadDir": download_dir.to_string_lossy(),
+                    "bytes": bytes.len(),
+                    "error": error.to_string()
+                }),
+            );
+            return Err(error);
+        }
+    };
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "update.write.completed",
+        json!({
+            "version": release.version,
+            "assetName": release.asset_name,
+            "installerPath": installer_path.to_string_lossy(),
+            "bytes": bytes.len()
+        }),
+    );
+    #[cfg(target_os = "macos")]
+    let launch_result = {
+        let path = installer_path.clone();
+        let version = release.version.clone();
+        tokio::task::spawn_blocking(move || macos::launch_update(&path, &version))
+            .await
+            .map_err(|error| anyhow::anyhow!("准备 macOS 自动更新失败：{error}"))?
+    };
+    #[cfg(not(target_os = "macos"))]
+    let launch_result = launch_installer(&installer_path);
+    if let Err(error) = launch_result {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "update.launch.failed",
+            json!({
+                "version": release.version,
+                "assetName": release.asset_name,
+                "installerPath": installer_path.to_string_lossy(),
+                "error": error.to_string()
+            }),
+        );
+        return Err(error);
+    }
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "update.launch.completed",
+        json!({
+            "version": release.version,
+            "assetName": release.asset_name,
+            "installerPath": installer_path.to_string_lossy()
+        }),
+    );
     Ok(UpdateInstall {
         release: release.clone(),
         installer_path,

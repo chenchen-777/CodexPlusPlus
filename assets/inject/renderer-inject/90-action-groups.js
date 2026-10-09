@@ -383,6 +383,9 @@
     return document.querySelector(".thread-scroll-container") || document.scrollingElement || document.documentElement;
   }
 
+  // 旧版（26.9xx 之前）内容容器类名清单。保留它当候选之一，但**不再当唯一判据**：
+  // 新版 Codex 把 `max-w-(--thread-content-max-width)` 换成了 `max-w-(--thread-body-max-width)`，
+  // `pb-8` 也并入 `has-[[…]]:pb-0` 的条件组合，全等匹配必然归零（issue #2258）。
   const conversationViewContentClasses = [
     "mx-auto",
     "w-full",
@@ -404,6 +407,22 @@
     "max-w-(--thread-content-max-width)",
     "px-toolbar",
   ];
+  // Codex 把中间栏宽度的工具类写成 `max-w-(--thread-<用途>-max-width)`，用途词换过好几轮
+  // （content → body、content-responsive…）。所以只钉住「结构」——`max-w-(--thread-*-max-width)`
+  // 这个形状本身——而不是某个具体用途词。哈希类名（`_shell_151xi_3` 那类）一律不写死。
+  const conversationViewThreadWidthTokenPattern = /^(?:[a-z-]+:)*max-w-\(--thread-[a-z-]+-max-width\)$/;
+  // 内容容器的新版稳定锚点。它是虚拟列表宿主（data-mcp-app-portal-target 同节点），
+  // 由 Codex 自己维护在滚动容器内部，比类名抗改。选择器统一登记在 00-prelude.js 的
+  // selectors 表里，不在这里另起一份。
+  const conversationViewContentAnchorSelector = selectors.conversationViewContentAnchor;
+  const conversationViewScrollContainerSelector = selectors.conversationViewScrollContainer;
+  // 页脚包裹层同样带 `max-w-(--thread-…-max-width)`，会被结构候选误当成内容容器。
+  // 用 Codex 自己的页脚标记把它排掉。
+  const conversationViewFooterSelector = selectors.conversationViewFooter;
+  const conversationViewPaneBoundarySelector = "#app-shell-sidebar, .app-shell-left-panel, .sidebar-navigation, nav[data-app-navigation-rail], [data-summary-panel-variant]";
+  // 两侧留白：Codex 的 `--padding-toolbar` 是 `calc(var(--spacing) * 2)`（= 8px * 2）。
+  // 仅在拿不到父节点 computed style 时作为回落的单侧留白。
+  const conversationViewSideInset = 8;
   const conversationViewState = {
     contentEl: null,
     composerEl: null,
@@ -414,6 +433,7 @@
     pollId: 0,
     runtimeStarted: false,
     moObserved: false,
+    targetsReported: false,
     observed: new WeakSet(),
     elements: new Set(),
   };
@@ -427,16 +447,202 @@
     return classes.every((cls) => set.has(cls));
   }
 
-  function conversationViewFindByClasses(classes) {
-    return Array.from(document.querySelectorAll("div")).find((el) => conversationViewHasAllClasses(el, classes)) || null;
+  function conversationViewFindByClasses(classes, root, accept) {
+    return Array.from(root?.querySelectorAll("div") || [])
+      .find((el) => conversationViewHasAllClasses(el, classes) && accept(el)) || null;
   }
 
+  function conversationViewHasThreadWidthToken(el) {
+    for (const token of conversationViewTokenSet(el)) {
+      if (conversationViewThreadWidthTokenPattern.test(token)) return true;
+    }
+    return false;
+  }
+
+  // 结构性判定：居中 + 满宽 + 线程宽度工具类。不依赖任何具体用途词或哈希类名。
+  function conversationViewLooksLikeThreadWidthBox(el) {
+    if (el?.tagName !== "DIV") return false;
+    const set = conversationViewTokenSet(el);
+    if (!set.has("mx-auto") || !set.has("w-full")) return false;
+    return conversationViewHasThreadWidthToken(el);
+  }
+
+  // 页脚包裹层**自身**也带宽度工具类，所以这里不仅要排掉它的后代，还要排掉它本身。
+  function conversationViewIsInsideFooter(el) {
+    if (!el) return false;
+    try {
+      return el.matches?.(conversationViewFooterSelector) === true
+        || el.closest?.(conversationViewFooterSelector) != null;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function conversationViewScrollContainer() {
+    const scrollers = Array.from(document.querySelectorAll(conversationViewScrollContainerSelector))
+      .filter((el) => typeof visibleElement !== "function" || visibleElement(el));
+    // 多个可见会话没有可靠的当前目标，不把任一 pane 当成整页正文。
+    return scrollers.length === 1 ? scrollers[0] : null;
+  }
+
+  function conversationViewSafeWidthTarget(el, scope) {
+    if (!el || !scope || el === scope || !scope.contains?.(el)) return false;
+    if (scope.matches?.(conversationViewScrollContainerSelector)
+        && el.closest?.(conversationViewScrollContainerSelector) !== scope) return false;
+    return conversationViewSafeWidthNode(el);
+  }
+
+  function conversationViewSafeWidthNode(el) {
+    if (!el) return false;
+    if (["MAIN", "ASIDE", "NAV", "HEADER", "BODY", "HTML"].includes(el.tagName)) return false;
+    if (el.closest?.(`${conversationViewPaneBoundarySelector}, [data-codex-plus-ext]`)) return false;
+    // CSS 变量可继承给整棵布局树；包含其他 pane 的祖先不能改 width/margin/left。
+    // composer 内的状态提示也会用 aside，不能仅按语义标签把它误判为侧栏。
+    return !el.querySelector?.(`${conversationViewPaneBoundarySelector}, .thread-scroll-container`);
+  }
+
+  function conversationViewSamePane(scroller, el) {
+    if (scroller.contains?.(el)) return el.closest?.(conversationViewScrollContainerSelector) === scroller;
+    if (el.closest?.(conversationViewScrollContainerSelector)) return false;
+    if (el.parentElement === scroller.parentElement && el.parentElement !== document.body) return true;
+    for (let pane = scroller.parentElement; pane && pane !== document.body; pane = pane.parentElement) {
+      if (!pane.contains?.(el)) continue;
+      return !pane.querySelector?.(conversationViewPaneBoundarySelector);
+    }
+    return false;
+  }
+
+  function conversationViewFootersFor(scroller) {
+    return Array.from(document.querySelectorAll(conversationViewFooterSelector)).filter((footer) => {
+      if (typeof visibleElement === "function" && !visibleElement(footer)) return false;
+      return !footer.closest?.(`${conversationViewPaneBoundarySelector}, [data-codex-plus-ext]`) && conversationViewSamePane(scroller, footer);
+    });
+  }
+
+  function conversationViewFindNativeComposer(scroller) {
+    const roots = Array.from(document.querySelectorAll("[data-codex-composer-root]"))
+      .filter((el) => (typeof visibleElement !== "function" || visibleElement(el))
+        && !el.closest?.(`${conversationViewPaneBoundarySelector}, [data-codex-plus-ext]`) && (!scroller || conversationViewSamePane(scroller, el)));
+    if (roots.length !== 1) return null;
+    const root = roots[0];
+    const accept = (el) => conversationViewLooksLikeThreadWidthBox(el) && conversationViewSafeWidthNode(el)
+      && !el.matches?.(conversationViewFooterSelector) && !el.querySelector?.(conversationViewContentAnchorSelector);
+    const inside = [root, ...root.querySelectorAll("div")].find(accept);
+    if (inside) return inside;
+    // 原生 composer 锚点可能在宽度宿主内部；只爬到局部宿主，不收窄含正文的布局。
+    for (let host = root.parentElement; host && host !== document.body; host = host.parentElement) {
+      if (accept(host)) return host;
+      if (host.matches?.(conversationViewScrollContainerSelector) || host.querySelector?.(conversationViewScrollContainerSelector)) break;
+    }
+    return null;
+  }
+
+  function conversationViewCollectThreadWidthBoxes(root) {
+    if (!root?.querySelectorAll) return [];
+    return Array.from(root.querySelectorAll("div")).filter(conversationViewLooksLikeThreadWidthBox);
+  }
+
+  /**
+   * 按候选顺序找内容容器，任一候选命中即返回。
+   *
+   * 候选链刻意从「最精确」排到「最宽松」：
+   * 所有候选都必须在唯一的会话滚动区内，并排除布局祖先：
+   *   1. 旧版类名全等（老版本 Codex 上仍然最准）；
+   *   2. Codex 自己的 data-* 锚点（当前版本）；
+   *   3. 结构判定（滚动容器内、居中满宽、带 thread 宽度工具类）；
+   *   4. #2085 报告里提到的兜底：两处类名都没命中时，按 CSS 变量反查宿主节点。
+   *
+   * 顺序不能反：结构判定会把页脚包裹层也算进来，而它和内容容器在同一棵子树里。
+   */
   function conversationViewFindContentEl() {
-    return conversationViewFindByClasses(conversationViewContentClasses);
+    const scroller = conversationViewScrollContainer();
+    if (!scroller) return null;
+    const accept = (el) => conversationViewSafeWidthTarget(el, scroller) && !conversationViewIsInsideFooter(el)
+      && !el.querySelector?.(conversationViewFooterSelector);
+    const legacy = conversationViewFindByClasses(conversationViewContentClasses, scroller, accept);
+    if (legacy) return legacy;
+    const anchored = Array.from(scroller.querySelectorAll(conversationViewContentAnchorSelector)).find(accept);
+    if (anchored) return anchored;
+    const structural = conversationViewCollectThreadWidthBoxes(scroller)
+      // 页脚包裹层（data-thread-scroll-footer）也带同样的宽度工具类，必须排掉。
+      .find(accept);
+    if (structural) return structural;
+    return conversationViewFindByThreadWidthVariable(scroller, accept);
   }
 
   function conversationViewFindComposerEl() {
-    return conversationViewFindByClasses(conversationViewComposerClasses);
+    const scroller = conversationViewScrollContainer();
+    if (!scroller) {
+      // 首页没有消息 scroller；只用明确的原生 composer 锚点，不能全页猜宽度变量。
+      if (Array.from(document.querySelectorAll(conversationViewScrollContainerSelector))
+          .some((el) => typeof visibleElement !== "function" || visibleElement(el))) return null;
+      const native = conversationViewFindNativeComposer(null);
+      if (native) return native;
+      const legacy = Array.from(document.querySelectorAll("div")).filter((el) =>
+        conversationViewHasAllClasses(el, conversationViewComposerClasses) && conversationViewSafeWidthNode(el)
+        && !conversationViewIsInsideFooter(el) && el.querySelector?.('textarea, [contenteditable="true"]'));
+      return legacy.length === 1 ? legacy[0] : null;
+    }
+    // 页脚包裹层带的是和作曲器同一套工具类，会被旧清单全等命中，所以要排除它。
+    const footers = conversationViewFootersFor(scroller);
+    if (footers.length > 1) return null;
+    const footer = footers[0];
+    const accept = (el) => conversationViewSafeWidthTarget(el, footer || scroller)
+      && !el.matches?.(conversationViewFooterSelector) && !conversationViewIsContentCandidate(el);
+    // 新版作曲器在页脚包裹层内部——页脚自身也是 max-w 盒子，得往里再找一层。
+    const insideFooter = conversationViewCollectThreadWidthBoxes(footer).find(accept);
+    if (insideFooter) return insideFooter;
+    if (footer) return conversationViewFindByThreadWidthVariable(footer, (el) => el !== footer && accept(el));
+    const native = conversationViewFindNativeComposer(scroller);
+    if (native) return native;
+    // 保留同一会话内的旧类名；无 footer 的新版结构还必须包含明确编辑器。
+    const legacy = conversationViewFindByClasses(conversationViewComposerClasses, scroller, (el) => accept(el) && !conversationViewIsInsideFooter(el));
+    if (legacy) return legacy;
+    return conversationViewCollectThreadWidthBoxes(scroller).find((el) => accept(el)
+      && !conversationViewIsInsideFooter(el) && !el.querySelector?.(conversationViewContentAnchorSelector)
+      && el.querySelector?.('textarea, [contenteditable="true"]')) || null;
+  }
+
+  // 内容容器的判定（锚点或全等类名），供作曲器查找排除同形节点用。
+  function conversationViewIsContentCandidate(el) {
+    if (!el) return false;
+    if (el.matches?.(conversationViewContentAnchorSelector)) return true;
+    return conversationViewHasAllClasses(el, conversationViewContentClasses);
+  }
+
+  // 兜底：类名全不对时，看计算样式里 Codex 是否在该节点上定义了线程宽度变量。
+  // 变量名只按 `--thread-*-max-width` 这个形状匹配，同样不绑具体用途词。
+  // accept 为 null 时默认排除页脚内部节点（内容容器的用法）；作曲器查找会传自己的判定。
+  function conversationViewFindByThreadWidthVariable(root, accept = null) {
+    if (!root?.querySelectorAll) return null;
+    const candidates = Array.from(root.querySelectorAll("div"));
+    return candidates.find((el) => {
+      if (accept ? !accept(el) : conversationViewIsInsideFooter(el)) return false;
+      try {
+        const style = getComputedStyle(el);
+        // --thread-* 在后代继承，不代表该节点自身受 max-width 约束（#2414）。
+        if (!style.maxWidth || style.maxWidth === "none") return false;
+        for (const name of conversationViewThreadWidthCustomProperties(style)) {
+          if (String(style.getPropertyValue(name) || "").trim()) return true;
+        }
+      } catch (_) {
+        return false;
+      }
+      return false;
+    }) || null;
+  }
+
+  function conversationViewThreadWidthCustomProperties(style) {
+    // CSSStyleDeclaration 的索引属性在 Chromium 里可用；拿不到时退回固定候选名，
+    // 保证兜底在受限环境（测试夹具）里也不会抛。
+    const names = [];
+    const length = Number(style?.length) || 0;
+    for (let index = 0; index < length; index += 1) {
+      const name = style[index];
+      if (typeof name === "string" && name.startsWith("--thread-") && name.endsWith("-max-width")) names.push(name);
+    }
+    if (!names.length) names.push("--thread-body-max-width", "--thread-content-max-width");
+    return names;
   }
 
   function codexServiceTierBadgeVisibleElement(element) {
@@ -700,9 +906,19 @@
     }
   }
 
-  function conversationViewApplyNativeWidth(el) {
+  // #2085：设置值是**上限**，不是必须写死的宽度。容器比上限窄时按容器可用宽度
+  // 收敛，否则 900px 会让内容溢出滚动容器、两侧被裁。
+  // 容器宽度已由调用方在读取阶段量好，这里只做纯计算，不读几何——见 conversationViewAlignNow。
+  function conversationViewEffectiveWidth(containerWidth) {
+    const configured = conversationViewWidth();
+    if (!Number.isFinite(containerWidth) || containerWidth <= 0) return configured;
+    return Math.max(conversationViewMinWidth, Math.min(configured, Math.round(containerWidth)));
+  }
+
+  function conversationViewApplyNativeWidth(el, effectiveWidth) {
     conversationViewRememberOriginals(el);
-    const maxWidth = `${conversationViewWidth()}px`;
+    const width = Number.isFinite(effectiveWidth) ? effectiveWidth : conversationViewWidth();
+    const maxWidth = `${width}px`;
     if (el.style.boxSizing !== "border-box") el.style.boxSizing = "border-box";
     if (el.style.width !== "100%") el.style.width = "100%";
     if (el.style.maxWidth !== maxWidth) el.style.maxWidth = maxWidth;
@@ -712,6 +928,22 @@
 
   function conversationViewSessionRectFor(el) {
     return el?.parentElement?.getBoundingClientRect() || null;
+  }
+
+  // 容器可用宽度：取宿主节点的内容盒宽（rect.width 含内边距，减掉左右 padding 才是可用空间）。
+  // 拿不到几何（离屏、display:none、父节点缺失）时返回 0，由 effectiveWidth 回落设置上限。
+  function conversationViewAvailableWidth(el) {
+    const host = el?.parentElement;
+    const rect = conversationViewSessionRectFor(el);
+    if (!host || !rect || !(rect.width > 0)) return 0;
+    let inlinePadding = conversationViewSideInset * 2;
+    try {
+      const style = getComputedStyle(host);
+      inlinePadding = (Number.parseFloat(style.paddingLeft) || 0) + (Number.parseFloat(style.paddingRight) || 0);
+    } catch (_) {
+      inlinePadding = conversationViewSideInset * 2;
+    }
+    return Math.max(0, rect.width - inlinePadding);
   }
 
   function conversationViewHtmlCenter() {
@@ -726,8 +958,22 @@
   }
 
   function conversationViewResolveTargets() {
-    if (!conversationViewState.contentEl?.isConnected) conversationViewState.contentEl = conversationViewFindContentEl();
-    if (!conversationViewState.composerEl?.isConnected) conversationViewState.composerEl = conversationViewFindComposerEl();
+    for (const [key, next] of [
+      ["contentEl", conversationViewFindContentEl()],
+      ["composerEl", conversationViewFindComposerEl()],
+    ]) {
+      const previous = conversationViewState[key];
+      if (previous && previous !== next) {
+        conversationViewRestoreElement(previous);
+        conversationViewState.elements.delete(previous);
+        [previous, previous.parentElement, previous.parentElement?.parentElement].forEach((el) => {
+          if (!el) return;
+          conversationViewState.ro?.unobserve?.(el);
+          conversationViewState.observed.delete(el);
+        });
+      }
+      conversationViewState[key] = next;
+    }
     [
       document.documentElement,
       document.body,
@@ -743,15 +989,24 @@
   function conversationViewAlignNow() {
     if (!codexPlusSettings().conversationView) return;
     conversationViewResolveTargets();
-    // 两阶段批量对齐：先对全部目标应用宽度/复位（写 style），
-    // 再统一读取几何并决定是否写入 left，避免写-读-写交替触发强制重排。
     const targets = [
       conversationViewState.contentEl,
       conversationViewState.composerEl,
     ].filter((el) => el?.isConnected);
-    if (!targets.length) return;
-    targets.forEach((el) => {
-      conversationViewApplyNativeWidth(el);
+    if (!targets.length) {
+      conversationViewReportMissingTargets();
+      return;
+    }
+    conversationViewState.targetsReported = false;
+    // 三阶段批量对齐，全程不出现读-写交替（否则退回 commit 82fb0924 修掉的强制重排）：
+    //   ① 读：一次性量完全部目标的宿主可用宽度，算出各自的有效上限；
+    //   ② 写：按算好的宽度统一写 style（宽度 + 复位自身偏移）；
+    //   ③ 读 + 写 left：统一读几何，决定是否需要再写 left。
+    // #2085 的自适应计算落在 ①，写动作仍集中在 ②，与原有两阶段结构一致。
+    const availableWidths = targets.map((el) => conversationViewAvailableWidth(el));
+    const effectiveWidths = availableWidths.map((width) => conversationViewEffectiveWidth(width));
+    targets.forEach((el, index) => {
+      conversationViewApplyNativeWidth(el, effectiveWidths[index]);
       conversationViewResetOwnOffset(el);
     });
     const htmlCenter = conversationViewHtmlCenter();
@@ -765,6 +1020,24 @@
         const nextLeft = `${delta.toFixed(2)}px`;
         if (el.style.left !== nextLeft) el.style.left = nextLeft;
       }
+    });
+  }
+
+  /**
+   * #2258 最贵的地方是「静默」：类名变化导致目标归零时，对齐整段直接 return，
+   * 用户只看到居中失效，日志里什么都没有。这里每个会话只上报一次，
+   * 并在下一次成功命中时重置，避免长时间运行时刷屏。
+   */
+  function conversationViewReportMissingTargets() {
+    if (conversationViewState.targetsReported) return;
+    conversationViewState.targetsReported = true;
+    const scroller = conversationViewScrollContainer();
+    sendCodexPlusDiagnostic("conversation_view_target_not_found", {
+      hasScrollContainer: !!scroller,
+      hasContentAnchor: !!document.querySelector(conversationViewContentAnchorSelector),
+      hasFooter: !!document.querySelector(conversationViewFooterSelector),
+      threadWidthBoxes: conversationViewCollectThreadWidthBoxes(scroller || document).length,
+      configuredWidth: conversationViewWidth(),
     });
   }
 
@@ -808,4 +1081,3 @@
   }
 
   window.__codexPlusConversationViewCleanup = cleanupConversationView;
-
