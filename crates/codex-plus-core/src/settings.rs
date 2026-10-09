@@ -2546,7 +2546,7 @@ mod tests {
 
         assert!(settings.codex_app_plugin_marketplace_unlock);
         let saved = serde_json::to_value(&settings).unwrap();
-        assert!(saved.get("codexAppPluginAutoExpand").is_some());
+        assert_eq!(saved["codexAppPluginAutoExpand"], json!(false));
 
         let legacy_settings: BackendSettings = serde_json::from_str(
             r#"{
@@ -3921,7 +3921,7 @@ experimental_bearer_token = "sk-existing""#
             .unwrap();
         let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
 
-        assert!(saved.get("codexAppPluginAutoExpand").is_none());
+        assert_eq!(saved["codexAppPluginAutoExpand"], json!(true));
         assert!(saved.get("computerUseGuardEnabled").is_none());
         assert_eq!(saved["customField"], json!(1));
     }
