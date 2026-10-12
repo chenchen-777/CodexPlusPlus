@@ -42,7 +42,7 @@ jobs:
         run: npm run vite:build
 
       - name: Test core and custom update behavior
-        run: cargo test -p codex-plus-core --lib --test ads --test updater --test cdp_bridge
+        run: cargo test -p codex-plus-core --lib --test ads --test updater --test cdp_bridge --test installers --test launcher
 
       - name: Build binaries
         run: cargo build --locked --release
@@ -52,7 +52,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist/windows/app | Out-Null
           Copy-Item target/release/codex-plus-plus.exe dist/windows/app/
-          Copy-Item target/release/codex-plus-plus-manager.exe dist/windows/app/
+          if ((Get-ChildItem dist/windows/app -Filter *.exe).Count -ne 1) { throw "Windows package must contain one unified application." }
 
       - name: Build Windows zip asset
         shell: pwsh
@@ -140,7 +140,7 @@ jobs:
           VERSION="${VERSION#V}"
           mkdir -p dist/macos/app-${{ matrix.arch }}
           cp "target/${{ matrix.target }}/release/codex-plus-plus" "dist/macos/app-${{ matrix.arch }}/"
-          cp "target/${{ matrix.target }}/release/codex-plus-plus-manager" "dist/macos/app-${{ matrix.arch }}/"
+          cp "target/${{ matrix.target }}/release/codex-plus-legacy-shim" "dist/macos/app-${{ matrix.arch }}/"
           (cd dist/macos && zip -r "CodexPlusPlus-${VERSION}-macos-${{ matrix.arch }}.zip" "app-${{ matrix.arch }}")
 
       - name: Verify macOS bundle structure
