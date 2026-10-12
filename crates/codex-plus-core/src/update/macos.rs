@@ -32,9 +32,8 @@ fn installed_root_from_executable(executable: &Path) -> anyhow::Result<PathBuf> 
         .join("Contents/MacOS")
         .join(BUNDLES[0].executable);
     // Finder 可能保留目录大小写；是否为新版界面由 CodexPlusUnifiedApp 标记校验。
-    if !expected
-        .to_string_lossy()
-        .eq_ignore_ascii_case(&executable.to_string_lossy())
+    if !expected.components().map(|part| part.as_os_str().to_string_lossy().to_ascii_lowercase())
+        .eq(executable.components().map(|part| part.as_os_str().to_string_lossy().to_ascii_lowercase()))
     {
         let app_name = executable
             .parent()
